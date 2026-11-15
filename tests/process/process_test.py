@@ -22,14 +22,14 @@ import urllib.error
 import urllib.request
 
 SECRET = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+API_KEY = "test-process-key-0001"  # an obviously fake fixture key, written to the work dir per run
 GATEWAY_REQUIRED = ["GATEWAY_DRIVER_MODE", "GATEWAY_CORE_INGRESS", "GATEWAY_CORE_INGRESS_CHANNEL",
                     "GATEWAY_CORE_RESPONSE_CHANNEL", "CORE_AUTH_CREDENTIAL", "GATEWAY_INSTANCE_ID", "GATEWAY_HTTP_BIND",
                     "GATEWAY_ADMIN_BIND", "GATEWAY_AUTH_MODES"]
 STREAM_REQUIRED = ["STREAM_DRIVER_MODE", "STREAM_CORE_INGRESS", "STREAM_CORE_INGRESS_CHANNEL",
                    "STREAM_CORE_RESPONSE_CHANNEL", "CORE_AUTH_CREDENTIAL", "STREAM_INSTANCE_ID", "STREAM_WS_BIND",
                    "STREAM_ADMIN_BIND", "STREAM_AUTH_MODES"]
-GATEWAY_NOT_READY = ["session_connected", "session_registered", "config_loaded", "gate_open", "keepalive_fresh",
-                     "public_listener"]
+GATEWAY_NOT_READY = ["session_connected", "session_registered", "config_loaded", "gate_open", "keepalive_fresh"]
 STREAM_NOT_READY = ["session_registered", "head_probe_fresh", "ws_listener"]
 
 
@@ -53,6 +53,9 @@ class Ctx:
         self.bin_dir = bin_dir
         self.work = work
         self.procs = []
+        self.api_keys = os.path.join(work, "api-keys")
+        with open(self.api_keys, "w") as f:
+            f.write(f"# test fixture\n{API_KEY}:1001\n")
 
     def binary(self, name):
         path = os.path.join(self.bin_dir, name)
@@ -70,10 +73,10 @@ class Ctx:
             f"{p}_CORE_RESPONSE_CHANNEL": "aeron:udp?endpoint=127.0.0.1:0|term-length=64k|mtu=8192",
             "CORE_AUTH_CREDENTIAL": f"7:GATEWAY:{SECRET}",
             f"{p}_INSTANCE_ID": str(instance),
-            ("GATEWAY_HTTP_BIND" if role == "gateway" else "STREAM_WS_BIND"): "127.0.0.1:0",
+            ("GATEWAY_HTTP_BIND" if role == "gateway" else "STREAM_WS_BIND"): f"127.0.0.1:{free_port()}",
             f"{p}_ADMIN_BIND": f"127.0.0.1:{free_port()}",
             f"{p}_AUTH_MODES": "api-key",
-            "GATEWAY_API_KEYS_FILE": "/nonexistent/api-keys",
+            "GATEWAY_API_KEYS_FILE": self.api_keys,
             f"{p}_DUTY_WATCHDOG_MS": "2000",
         })
         if mode == "embedded":
@@ -122,8 +125,8 @@ def wait_exit(proc, timeout):
         return None
 
 
-def http(port, path, method="GET"):
-    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method)
+def http(port, path, method="GET", headers=None):
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method, headers=headers or {})
     try:
         with urllib.request.urlopen(req, timeout=3) as resp:
             return resp.status, resp.read().decode()
@@ -197,7 +200,18 @@ def expect_serving(ctx, role, proc, env, mode):
     status, _ = http(port, "/health", "POST")
     check(status == 405, f"POST /health {status}")
     names = thread_names(proc.pid)
-    for name in (f"{prefix}-duty", f"{prefix}-admin"):
+    expected = [f"{prefix}-duty", f"{prefix}-admin"]
+    if role == "gateway":
+        # the public listener serves while the session is not connected: auth needs no core
+        public = int(env["GATEWAY_HTTP_BIND"].rsplit(":", 1)[1])
+        status, body = http(public, "/api/v2/auth/me", headers={"X-API-Key": API_KEY})
+        check(status == 200 and json.loads(body) == {"userId": "1001", "username": None}, f"/api/v2/auth/me {status} {body}")
+        status, body = http(public, "/api/v2/auth/me")
+        check(status == 401 and json.loads(body)["code"] == "UNAUTHORIZED", f"/api/v2/auth/me without a key {status}")
+        status, body = http(public, "/health")
+        check(status == 404, f"the admin endpoints must not be on the public listener: /health {status}")
+        expected += ["gw-io-0", "gw-io-1", "gw-done"]
+    for name in expected:
         check(name in names, f"thread {name} missing: {names}")
     # idle past the driver timeout (3 s here): the liveness checks must not read an idle process as dead
     time.sleep(4.5)
@@ -251,6 +265,56 @@ def case_config_bad_values(ctx, role):
         check(needle in out, f"missing '{needle}':\n{out}")
     check(f"refusing to start: {len(needles)} configuration problems (exit 78)" in out, f"refusal line:\n{out}")
     check("admin listening" not in out, "the admin listener bound before the configuration was accepted")
+    shutil.rmtree(parent, ignore_errors=True)
+
+
+def case_config_auth_files(ctx, role):
+    """The credential files of the enabled modes are read at boot, in the same pass as the settings: 78, all named."""
+    p = "GATEWAY" if role == "gateway" else "STREAM"
+    parent = tmpfs_parent(ctx, f"authfiles-{role}")
+    short_secret = os.path.join(ctx.work, "jwt-secret-short")
+    with open(short_secret, "w") as f:
+        f.write("too-short-test-secret\n")
+    missing_keys = os.path.join(ctx.work, "no-such-api-keys")
+    extra = {f"{p}_AUTH_MODES": "api-key,jwt", "GATEWAY_API_KEYS_FILE": missing_keys,
+             "GATEWAY_JWT_SECRET_FILE": short_secret, f"{p}_IDLE": "spin"}
+    needles = [f"GATEWAY_API_KEYS_FILE: cannot read {missing_keys}", "needs at least 32",
+               f"{p}_IDLE must be exactly backoff or busy"]
+    env = ctx.env(role, "embedded", driver_dir=parent, extra=extra)
+    proc = ctx.start([ctx.binary("oe-gateway" if role == "gateway" else "oe-stream")], env, f"auth-files-{role}.log")
+    code = wait_exit(proc, 10)
+    out = text_of(proc)
+    check(code == 78, f"exit {code}, expected 78:\n{out}")
+    for needle in needles:
+        check(needle in out, f"missing '{needle}':\n{out}")
+    check(f"refusing to start: {len(needles)} configuration problems (exit 78)" in out, f"refusal line:\n{out}")
+    check("too-short-test-secret" not in out, "a secret file's content reached the log")
+    check("admin listening" not in out, "the admin listener bound before the configuration was accepted")
+    # each mode alone: the jwt secret file missing is 78 too
+    env = ctx.env(role, "embedded", driver_dir=parent, extra={f"{p}_AUTH_MODES": "jwt",
+                                                               "GATEWAY_JWT_SECRET_FILE": missing_keys + "-jwt"})
+    env.pop("GATEWAY_API_KEYS_FILE")
+    proc = ctx.start([ctx.binary("oe-gateway" if role == "gateway" else "oe-stream")], env, f"auth-files-jwt-{role}.log")
+    code = wait_exit(proc, 10)
+    out = text_of(proc)
+    check(code == 78 and f"GATEWAY_JWT_SECRET_FILE: cannot read {missing_keys}-jwt" in out, f"exit {code}:\n{out}")
+    shutil.rmtree(parent, ignore_errors=True)
+
+
+def case_public_bind_in_use(ctx, role):
+    parent = tmpfs_parent(ctx, f"pubbind-{role}")
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen(1)
+    port = blocker.getsockname()[1]
+    env = ctx.env(role, "embedded", driver_dir=parent, extra={"GATEWAY_HTTP_BIND": f"127.0.0.1:{port}"})
+    proc = ctx.start([ctx.binary("oe-gateway")], env, f"public-bind-in-use-{role}.log")
+    code = wait_exit(proc, 10)
+    blocker.close()
+    out = text_of(proc)
+    check(code == 78, f"exit {code} with the public port taken, expected 78:\n{out}")
+    check("GATEWAY_HTTP_BIND" in out, f"the bind failure does not name the setting:\n{out}")
+    check("embedded media driver at" not in out, "the driver started before the public bind failed")
     shutil.rmtree(parent, ignore_errors=True)
 
 
@@ -452,8 +516,10 @@ for _role in ("gateway", "stream"):
                        ("external_aeron_dir_missing", case_external_aeron_dir_missing),
                        ("external_driver_killed", case_external_driver_killed),
                        ("embedded_same_instance_refused", case_embedded_same_instance_refused),
-                       ("admin_bind_in_use", case_admin_bind_in_use), ("duty_stall", case_duty_stall)):
+                       ("admin_bind_in_use", case_admin_bind_in_use), ("duty_stall", case_duty_stall),
+                       ("config_auth_files", case_config_auth_files)):
         CASES[f"{_role}.{_name}"] = (lambda fn, role: (lambda ctx: fn(ctx, role)))(_fn, _role)
+CASES["gateway.public_bind_in_use"] = lambda ctx: case_public_bind_in_use(ctx, "gateway")
 
 
 def main():

@@ -1,6 +1,7 @@
 # Build and test on every push to main and every pull request. No secrets and no signing keys: every input is public
 # and pinned by sha256 in dependencies.lock (cluster-tools by commit and source tarball, the money schema by core
-# commit), and scripts/fetch-cluster-tools.sh refuses anything else before it is built.
+# commit, Boost, OpenSSL and libpq by source tarball), and scripts/fetch-cluster-tools.sh and scripts/build-deps.sh
+# refuse anything else before it is built.
 name: ci
 
 on:
@@ -47,11 +48,23 @@ jobs:
         if: steps.ct-cache.outputs.cache-hit != 'true'
         run: JOBS="$(nproc)" scripts/build-cluster-tools.sh "${RUNNER_TEMP}/ct-cache" "${RUNNER_TEMP}/ct-prefix"
 
+      - name: Restore the Boost, OpenSSL and libpq prefix built from the lock
+        id: deps-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/deps-prefix
+          key: gateway-deps-${{ runner.os }}-${{ hashFiles('dependencies.lock', 'scripts/build-deps.sh') }}
+
+      - name: Build Boost, OpenSSL and libpq from the pinned tarballs
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        run: JOBS="$(nproc)" scripts/build-deps.sh "${RUNNER_TEMP}/deps-cache" "${RUNNER_TEMP}/deps-prefix"
+
       - name: Configure
-        # the configure checks the package against the lock again (source sha, money schema sha256 and version)
+        # the configure checks the package against the lock again (source sha, money schema sha256 and version), and
+        # the deps prefix (its stamp and version headers); the users-store tests run PostgreSQL in docker
         run: >-
           cmake -S . -B build -G Ninja -DCMAKE_PREFIX_PATH="${RUNNER_TEMP}/ct-prefix" -DGW_TEST_BUILDS=ON
-          -DGW_CLUSTER_TOOLS_SOURCE_DIR="${CT_SOURCE_DIR}"
+          -DGW_CLUSTER_TOOLS_SOURCE_DIR="${CT_SOURCE_DIR}" -DGW_DEPS_PREFIX="${RUNNER_TEMP}/deps-prefix" -DGW_PG_TESTS=ON
 
       - name: Build
         run: cmake --build build
@@ -100,11 +113,22 @@ jobs:
         if: steps.ct-cache.outputs.cache-hit != 'true'
         run: JOBS="$(nproc)" scripts/build-cluster-tools.sh "${RUNNER_TEMP}/ct-cache" "${RUNNER_TEMP}/ct-prefix"
 
+      - name: Restore the Boost, OpenSSL and libpq prefix built from the lock
+        id: deps-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/deps-prefix
+          key: gateway-deps-${{ runner.os }}-${{ hashFiles('dependencies.lock', 'scripts/build-deps.sh') }}
+
+      - name: Build Boost, OpenSSL and libpq from the pinned tarballs
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        run: JOBS="$(nproc)" scripts/build-deps.sh "${RUNNER_TEMP}/deps-cache" "${RUNNER_TEMP}/deps-prefix"
+
       - name: Configure (ASan + UBSan)
         run: >-
           cmake -S . -B build-san -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
           -DCMAKE_PREFIX_PATH="${RUNNER_TEMP}/ct-prefix" -DGW_TEST_BUILDS=OFF
-          -DGW_CLUSTER_TOOLS_SOURCE_DIR="${CT_SOURCE_DIR}"
+          -DGW_CLUSTER_TOOLS_SOURCE_DIR="${CT_SOURCE_DIR}" -DGW_DEPS_PREFIX="${RUNNER_TEMP}/deps-prefix"
           -DCMAKE_C_FLAGS="${SAN_FLAGS}" -DCMAKE_CXX_FLAGS="${SAN_FLAGS}"
           -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
 

@@ -1,7 +1,9 @@
 #!/bin/bash
 # Lock verification: scripts/fetch-cluster-tools.sh accepts only the tarball the lock pins (sha256, top directory,
 # the commit in the URL, the same money schema as the tree's own lock), and the configure-time package check refuses
-# a package built from another commit or carrying another money schema. Offline: fake trees, no network.
+# a package built from another commit or carrying another money schema; the Boost, OpenSSL and libpq prefix must carry
+# the stamp and version headers of the lock, and scripts/build-deps.sh refuses a tarball of another sha256. Offline:
+# fake trees, no network.
 #
 # usage: lock_test.sh <repo-root> <cmake> <work-dir>
 set -uo pipefail
@@ -132,6 +134,10 @@ assert lock["cluster_tools_ref"] in lock["cluster_tools_tarball_url"], "url name
 assert re.fullmatch(r"[0-9a-f]{40}", lock["money_schema_ref"]), "money_schema_ref"
 assert re.fullmatch(r"[0-9a-f]{64}", lock["money_schema_sha256"]), "money_schema_sha256"
 assert isinstance(lock["money_schema_version"], int) and isinstance(lock["money_schema_id"], int)
+for dep in ("boost", "openssl", "libpq"):
+    assert re.fullmatch(r"[0-9]+(\.[0-9]+)+", lock[dep + "_version"]), dep + "_version"
+    assert re.fullmatch(r"[0-9a-f]{64}", lock[dep + "_sha256"]), dep + "_sha256"
+    assert lock[dep + "_url"].startswith("https://") and lock[dep + "_version"] in lock[dep + "_url"].replace("_", "."), dep + "_url"
 PY
 then
     pass lock.repository_lock_is_well_formed
@@ -206,6 +212,58 @@ if pin_check_headers "$WORK/inc-empty"; then
 elif tr '\n' ' ' < "$WORK/pin.out" | tr -s ' ' | grep -q "carries no money codec"; then
     pass package.refuses_a_package_without_money_codecs
 else fail package.refuses_a_package_without_money_codecs "$(cat "$WORK/pin.out")"; fi
+
+# 9. the Boost, OpenSSL and libpq prefix: the pinned set passes; a stamp naming another tarball, a header of another
+# version, and a prefix without the stamp are refused by name; scripts/build-deps.sh refuses a tarball of another sha256
+# and deletes it
+# fake_deps <prefix> <openssl-sha256> <boost BOOST_VERSION>: a prefix with the stamp, the version headers and the libs
+fake_deps() {
+    mkdir -p "$1/share/gateway-deps" "$1/include/boost" "$1/include/openssl" "$1/lib"
+    python3 -I - "$LOCK" "$1/share/gateway-deps/deps.json" "$2" <<'PY'
+import json, sys
+lock = json.load(open(sys.argv[1]))
+stamp = {k: lock[k] for k in ["boost_version", "boost_sha256", "openssl_version", "openssl_sha256", "libpq_version",
+                              "libpq_sha256"]}
+stamp["openssl_sha256"] = sys.argv[3]
+json.dump(stamp, open(sys.argv[2], "w"))
+PY
+    printf '#define BOOST_VERSION %s\n' "$3" > "$1/include/boost/version.hpp"
+    printf '# define OPENSSL_VERSION_STR "%s"\n' "$(lockv openssl_version)" > "$1/include/openssl/opensslv.h"
+    printf '#define PG_VERSION "%s"\n' "$(lockv libpq_version)" > "$1/include/pg_config.h"
+    for lib in libcrypto.a libssl.a libpq.a libpgcommon.a libpgport.a; do : > "$1/lib/$lib"; done
+}
+deps_check() { "$CMAKE" -DLOCK="$LOCK" -DPREFIX="$1" -P "$ROOT/tests/lock/deps_check.cmake" > "$WORK/deps.out" 2>&1; }
+BV=$(lockv boost_version)
+BOOST_NUM=$(python3 -I -c 'import sys; a, b, c = map(int, sys.argv[1].split(".")); print(a * 100000 + b * 100 + c)' "$BV")
+fake_deps "$WORK/deps-good" "$(lockv openssl_sha256)" "$BOOST_NUM"
+if deps_check "$WORK/deps-good"; then pass deps.accepts_the_pinned_set
+else fail deps.accepts_the_pinned_set "$(cat "$WORK/deps.out")"; fi
+fake_deps "$WORK/deps-stamp" "$MONEY_SHA" "$BOOST_NUM"
+if deps_check "$WORK/deps-stamp"; then
+    fail deps.refuses_another_tarball "accepted"
+elif tr '\n' ' ' < "$WORK/deps.out" | tr -s ' ' | grep -q "names openssl_sha256 '$MONEY_SHA'; dependencies.lock pins"; then
+    pass deps.refuses_another_tarball
+else fail deps.refuses_another_tarball "$(cat "$WORK/deps.out")"; fi
+fake_deps "$WORK/deps-header" "$(lockv openssl_sha256)" "$((BOOST_NUM - 100))"
+if deps_check "$WORK/deps-header"; then
+    fail deps.refuses_a_header_of_another_version "accepted"
+elif tr '\n' ' ' < "$WORK/deps.out" | tr -s ' ' | grep -q "BOOST_VERSION '$((BOOST_NUM - 100))'"; then
+    pass deps.refuses_a_header_of_another_version
+else fail deps.refuses_a_header_of_another_version "$(cat "$WORK/deps.out")"; fi
+mkdir -p "$WORK/deps-none"
+if deps_check "$WORK/deps-none"; then
+    fail deps.refuses_a_prefix_without_the_stamp "accepted"
+elif tr '\n' ' ' < "$WORK/deps.out" | tr -s ' ' | grep -q "deps.json not found"; then
+    pass deps.refuses_a_prefix_without_the_stamp
+else fail deps.refuses_a_prefix_without_the_stamp "$(cat "$WORK/deps.out")"; fi
+mkdir -p "$WORK/deps-cache"
+BOOST_FILE="$WORK/deps-cache/$(basename "$(lockv boost_url)")"
+printf 'not the pinned tarball' > "$BOOST_FILE"
+if GW_LOCK="$LOCK" FETCH_OFFLINE=1 "$ROOT/scripts/build-deps.sh" "$WORK/deps-cache" "$WORK/deps-out" > /dev/null 2> "$WORK/fetch.err"; then
+    fail deps.fetch_refuses_a_wrong_sha256 "accepted"
+elif grep -q "dependencies.lock pins $(lockv boost_sha256) (deleted)" "$WORK/fetch.err" && [ ! -e "$BOOST_FILE" ]; then
+    pass deps.fetch_refuses_a_wrong_sha256
+else fail deps.fetch_refuses_a_wrong_sha256 "$(cat "$WORK/fetch.err")"; fi
 
 if [ "$FAILURES" -ne 0 ]; then
     echo "lock_test: $FAILURES failure(s)"

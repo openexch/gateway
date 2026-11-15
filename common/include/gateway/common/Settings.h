@@ -145,6 +145,11 @@ struct GatewaySettings
     Rate loginRate;
     std::int64_t loginBurst = 20;
     Rate authSourceRate;
+    std::int64_t authSourceBurst = 10;
+    std::int64_t sourceV6PrefixBits = 64; // IPv6 sources share a budget per this prefix
+    std::int64_t pbkdf2Iterations = 50'000;
+    std::int64_t maxHeaderBytes = 8192;
+    std::int64_t httpIdleTimeoutMs = 60'000;
     std::vector<std::string> trustedProxies;
     std::string clientIpHeader = "X-Forwarded-For";
     std::vector<std::string> corsOrigins;
@@ -152,6 +157,10 @@ struct GatewaySettings
     std::int64_t pgAuthPool = 2;
     std::int64_t pgStatementTimeoutMs = 2000;
     std::int64_t pgQueue = 64;
+    std::int64_t pgRetryMs = 1000;
+    Rate tokenLookupRate;                 // per source: lookups of demo tokens the cache does not hold
+    std::int64_t tokenLookupBurst = 20;
+    std::int64_t tokenLookupInflight = 0; // in force after parsing: set, or half of pgQueue (at least 1)
     std::int64_t historyLimitDefault = 100;
     std::int64_t historyLimitMax = 1000;
     std::vector<FaucetCap> faucetMaxAmount;

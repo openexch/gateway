@@ -49,8 +49,10 @@ struct AdminView
     Status status;
     GatewayReadyBounds gatewayBounds;
     StreamReadyBounds streamBounds;
-    std::string treasuryLane;  // oe-gateway: "off", or "on (no session yet)"
+    std::string treasuryLane;  // oe-gateway: "off" or "on"
     const std::vector<SettingRecord> *settings = nullptr;
+    std::string frontHealth;   // members the public side adds to /health (",\"auth\":{...}")
+    std::string frontMetrics;  // Prometheus lines the public side adds to /metrics
 };
 
 cluster_tools::runtime::HttpResponse adminRoute(const cluster_tools::runtime::HttpRequest &request, const AdminView &view);

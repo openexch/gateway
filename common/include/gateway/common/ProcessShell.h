@@ -69,6 +69,24 @@ struct ProcessIdentity
     const char *dirPrefix = "oe-gateway-";    // the embedded driver dir <parent>/<dirPrefix><instance id>
     const char *instanceKey = "GATEWAY_INSTANCE_ID";
     const char *adminBindKey = "GATEWAY_ADMIN_BIND";
+    const char *frontBindKey = "GATEWAY_HTTP_BIND";
+};
+
+// The public side of a binary (oe-gateway: the REST listener and its worker pools), run by the shell around the duty
+// thread: created and bound right after the admin bind (a bind failure is 78, naming ProcessIdentity::frontBindKey),
+// started once the driver is connected (its threads start just before the duty thread), stopped on the stop path
+// before the admin listener closes (bounded by <P>_STOP_TIMEOUT_MS; a thread that does not stop is 70). The admin thread
+// reads accepting(), healthJson() and metrics() at request time, so all three are thread-safe.
+class FrontWork
+{
+public:
+    virtual ~FrontWork() = default;
+    virtual bool bind(std::string &error) = 0;
+    virtual void start() = 0;
+    virtual bool stop(std::int64_t boundMs) = 0;
+    virtual bool accepting() const = 0;
+    virtual std::string healthJson() const = 0;                    // members appended to /health: ,"name":value...
+    virtual std::string metrics(const std::string &prefix) const = 0; // Prometheus text, each name starting with prefix
 };
 
 // Test builds only (never set by the production binaries).
@@ -86,6 +104,7 @@ struct ProcessInputs
     std::string treasuryLane = "off";
     ProcessHooks hooks;
     std::function<std::unique_ptr<DutyWork>(const DutyContext &)> makeDuty; // empty = no duty work (no session)
+    std::function<std::unique_ptr<FrontWork>()> makeFront;                  // empty = no public listener in this build
 };
 
 // Runs the process and exits it (std::_Exit with the code); does not return.

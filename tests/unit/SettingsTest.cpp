@@ -387,6 +387,14 @@ TEST(treasury_lane_needs_flag_credential_and_caps_together)
     CHECK_MSG(on.ok(), joined(on.errors));
     CHECK(on.settings.allowTreasuryLane && on.settings.treasuryCredentials.has_value());
     CHECK(2 == on.settings.faucetMaxAmount.size());
+    // asset 0 is a real asset id (the core's validAsset accepts it): a cap can name it
+    const auto zero = gw(with(gatewayEnv(), { { "GATEWAY_ALLOW_TREASURY_LANE", "1" }, { "GATEWAY_TREASURY_CREDENTIAL", cred },
+        { "GATEWAY_FAUCET_MAX_AMOUNT", "0:1000,1:5" } }));
+    CHECK_MSG(zero.ok() && 2 == zero.settings.faucetMaxAmount.size() && 0 == zero.settings.faucetMaxAmount[0].assetId,
+        "asset 0 refused in GATEWAY_FAUCET_MAX_AMOUNT: " + joined(zero.errors));
+    onlyProblem(gw(with(gatewayEnv(), { { "GATEWAY_ALLOW_TREASURY_LANE", "1" }, { "GATEWAY_TREASURY_CREDENTIAL", cred },
+                    { "GATEWAY_FAUCET_MAX_AMOUNT", "-1:5" } })),
+        "GATEWAY_FAUCET_MAX_AMOUNT");
 }
 
 TEST(binds_admin_is_ipv4_and_never_the_public_listener)
@@ -467,6 +475,17 @@ TEST(unknown_names_with_the_own_prefix_are_refused)
     CHECK_MSG(g.ok(), joined(g.errors));
 }
 
+TEST(token_stale_key_is_never_silently_ignored)
+{
+    // GATEWAY_TOKEN_CACHE_STALE_MS is a second spelling of GATEWAY_TOKEN_STALE_MS: both binaries refuse it by name
+    onlyProblem(gw(with(gatewayEnv(), { { "GATEWAY_TOKEN_CACHE_STALE_MS", "1000" } })), "GATEWAY_TOKEN_CACHE_STALE_MS",
+        "use GATEWAY_TOKEN_STALE_MS");
+    onlyProblem(st(with(streamEnv(), { { "GATEWAY_TOKEN_CACHE_STALE_MS", "1000" } })), "GATEWAY_TOKEN_CACHE_STALE_MS",
+        "use GATEWAY_TOKEN_STALE_MS");
+    const auto ok = st(with(streamEnv(), { { "GATEWAY_TOKEN_STALE_MS", "1000" } }));
+    CHECK_MSG(ok.ok() && 1000 == ok.settings.common.tokenStaleMs, joined(ok.errors));
+}
+
 TEST(cors_star_is_refused)
 {
     onlyProblem(gw(with(gatewayEnv(), { { "GATEWAY_CORS_ORIGINS", "https://a.example,*" } })), "GATEWAY_CORS_ORIGINS",
@@ -501,7 +520,8 @@ TEST(every_setting_is_recorded_with_its_source)
         "GATEWAY_PG_HISTORY_POOL", "GATEWAY_PG_AUTH_POOL", "GATEWAY_PG_STATEMENT_TIMEOUT_MS", "GATEWAY_PG_QUEUE",
         "GATEWAY_HISTORY_LIMIT_DEFAULT", "GATEWAY_HISTORY_LIMIT_MAX", "GATEWAY_FAUCET_MAX_AMOUNT", "GATEWAY_FAUCET_RATE",
         "GATEWAY_DUTY_WATCHDOG_MS", "GATEWAY_STOP_TIMEOUT_MS", "GATEWAY_STATUS_INTERVAL_MS", "GATEWAY_EMBEDDED_RETRY_MS",
-        "GATEWAY_RECONNECT_DELAY_MS", "GATEWAY_REGISTER_RESEND_MS" };
+        "GATEWAY_RECONNECT_DELAY_MS", "GATEWAY_REGISTER_RESEND_MS", "GATEWAY_TOKEN_LOOKUP_RATE", "GATEWAY_TOKEN_LOOKUP_BURST",
+        "GATEWAY_TOKEN_LOOKUP_INFLIGHT", "GATEWAY_PG_RETRY_MS", "GATEWAY_SOURCE_IPV6_PREFIX" };
     for (const std::string &key : gatewayKeys)
     {
         CHECK_MSG(nullptr != recordOf(r, key), key + " is not recorded");

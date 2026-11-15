@@ -135,6 +135,7 @@ std::string renderHealth(const AdminView &v, int &status)
         out += ",\"events\":{\"gapOpen\":" + std::string(b(s.gapOpen)) + ",\"headProbeAgeMs\":" +
             ageMs(s.lastHeadProbeNs, v.nowNs) + "}";
     }
+    out += v.frontHealth;
     out += ",\"ready\":" + std::string(b(failing(conditions).empty())) + ",\"conditions\":" + conditionsJson(conditions);
     out += ",\"aeronErrors\":" + std::to_string(s.aeronErrors) + ",\"logDropped\":" + std::to_string(v.logDropped);
     out += ",\"settings\":{";
@@ -213,6 +214,7 @@ std::string renderMetrics(const AdminView &v)
         std::to_string(v.conductorHeartbeatAgeMs));
     counter("aeron_errors", "Errors reported by the Aeron client conductor.", std::to_string(s.aeronErrors));
     counter("log_dropped_total", "Log records dropped because the log ring was full.", std::to_string(v.logDropped));
+    out += v.frontMetrics;
     return out;
 }
 
