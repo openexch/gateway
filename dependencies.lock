@@ -2,13 +2,13 @@
   "cpp_standard": 20,
   "cmake_minimum_version": "3.30",
   "cluster_tools_repo": "openexch/cluster-tools",
-  "cluster_tools_ref": "f0e93f38b2e67a31789503f51db29353ca9fb24e",
-  "cluster_tools_tarball_url": "https://codeload.github.com/openexch/cluster-tools/tar.gz/f0e93f38b2e67a31789503f51db29353ca9fb24e",
-  "cluster_tools_tarball_sha256": "d5e6752ccb28afd4f5d8890c9f1f6a0f15e7c88821add3ccd853136a886c6280",
+  "cluster_tools_ref": "5397d79525080b492b67c1fcab0fcd19cee223ba",
+  "cluster_tools_tarball_url": "https://codeload.github.com/openexch/cluster-tools/tar.gz/5397d79525080b492b67c1fcab0fcd19cee223ba",
+  "cluster_tools_tarball_sha256": "98e19eccd08dd296897ae9d73b5384bb3cb7d7eb0f112caca24d9d2ca99a8585",
   "money_schema_repo": "openexch/core",
-  "money_schema_ref": "d8f51c32ab33dc5b7a9b514efd89bfb4395b6c8d",
+  "money_schema_ref": "3030a2ed3881628d6824e1047040ce9e3e9e4ba2",
   "money_schema_path": "core-common/src/main/resources/sbe/money-schema.xml",
-  "money_schema_sha256": "a2227b0c110a1ec1d38c6cbe8bb9eacf55a08508a7fe33d80e30495f3e1a088e",
+  "money_schema_sha256": "b78c244ddf391b77bad38fe5f4faffae100780a83a2c7dde2af82b6f86323d81",
   "money_schema_id": 2,
-  "money_schema_version": 7
+  "money_schema_version": 8
 }
