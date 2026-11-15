@@ -5,6 +5,8 @@
 #   scripts/build-cluster-tools.sh <cache-dir> <prefix>     (fetches, verifies and installs the pinned cluster-tools)
 #   cmake -S . -B build -DCMAKE_PREFIX_PATH=<prefix> && cmake --build build && ctest --test-dir build
 # Options:
+#   GW_CLUSTER_TOOLS_SOURCE_DIR  the verified cluster-tools source tree (scripts/fetch-cluster-tools.sh prints it as
+#                    -DCLUSTER_TOOLS_SOURCE_DIR); required with tests: the codec tests read its golden corpus
 #   GW_TEST_BUILDS   the never-published test binaries (duty-stall builds, the test media driver); ON for ctest
 #   GW_BUILD_SOURCE_SHA  the commit of a build from a source tarball (no .git); /health "build"
 cmake_minimum_required(VERSION 3.30)
@@ -54,11 +56,17 @@ add_library(gw_common STATIC
     common/src/ProcessShell.cpp
     common/src/Readiness.cpp
     common/src/Settings.cpp
-    common/src/SettingsReader.cpp)
+    common/src/SessionParts.cpp
+    common/src/SettingsReader.cpp
+    common/src/Wire.cpp)
 target_include_directories(gw_common PUBLIC common/include "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(gw_common PUBLIC cluster_tools::runtime_aeron cluster_tools::client_aeron cluster_tools::client
     cluster_tools::client_core cluster_tools::runtime cluster_tools::sbe_codecs Threads::Threads)
 target_compile_options(gw_common PRIVATE ${GW_WARNINGS})
+# the money schema of dependencies.lock: Wire.cpp asserts that the exported codecs carry exactly this id and version
+set(GW_MONEY_SCHEMA_DEFINITIONS GW_MONEY_SCHEMA_ID=${GW_LOCK_money_schema_id}
+    GW_MONEY_SCHEMA_VERSION=${GW_LOCK_money_schema_version})
+target_compile_definitions(gw_common PRIVATE ${GW_MONEY_SCHEMA_DEFINITIONS})
 
 add_library(oe_gateway_app STATIC gateway/GatewayApp.cpp)
 target_include_directories(oe_gateway_app PUBLIC gateway)

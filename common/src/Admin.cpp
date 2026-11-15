@@ -2,6 +2,8 @@
 
 #include <cstdio>
 
+#include "gateway/common/Wire.h"
+
 namespace openexchange { namespace gateway {
 
 namespace rt = cluster_tools::runtime;
@@ -124,6 +126,8 @@ std::string renderHealth(const AdminView &v, int &status)
     {
         out += ",\"config\":{\"loaded\":" + std::string(b(s.configLoaded)) + ",\"gateOpen\":" + b(s.gateOpen) +
             ",\"timeoutStreak\":" + std::to_string(s.timeoutStreak) + "}";
+        out += ",\"storage\":{\"starved\":" + std::string(b(s.storageStarved)) + ",\"starvedSeconds\":" +
+            std::to_string(s.storageStarvedSeconds) + "}";
         out += ",\"treasuryLane\":" + q(v.treasuryLane);
     }
     else
@@ -177,6 +181,32 @@ std::string renderMetrics(const AdminView &v)
     gauge("session_connected", "1 while a session to a leader is open.", s.connected ? "1" : "0");
     gauge("session_registered", "1 after the registration ack of the current session.", s.registered ? "1" : "0");
     counter("session_epoch", "Sessions opened since start.", std::to_string(s.sessionEpoch));
+    if (Role::GATEWAY == v.role)
+    {
+        counter("session_registrations_total", "Registration rounds that reached REGISTERED (the AdminAck arrived).",
+            std::to_string(s.registrations));
+        gauge("inflight", "Requests the core session holds, offered or waiting to be offered.", std::to_string(s.inflight));
+        counter("reoffers_total", "Successful offers of a request after its first (re-offers after a new session or leader).",
+            std::to_string(s.reoffers));
+        counter("late_replies_total", "Replies for a correlation id no longer held (answered or expired), dropped.",
+            std::to_string(s.lateReplies));
+        counter("outcome_unknown_total", "Requests that reached their deadline offered and unanswered (504).",
+            std::to_string(s.outcomeUnknown));
+        counter("query_budget_wait_seconds", "Total time core queries waited for a query budget token.",
+            std::to_string(static_cast<double>(s.queryBudgetWaitNs) / 1e9));
+        counter("decode_refused_total", "Egress frames the money-frame decoder refused.", std::to_string(s.decodeRefused));
+        out += "# HELP " + p + "wire_ignored_total Egress frames of a template the core sends on a subscribed channel " +
+            "and the gateway does not read (counted, not refused, not logged).\n# TYPE " + p +
+            "wire_ignored_total counter\n";
+        for (std::size_t k = 0; k < wire::IGNORED_TEMPLATES.size(); ++k)
+        {
+            out += p + "wire_ignored_total{template=\"" + std::to_string(wire::IGNORED_TEMPLATES[k]) + "\"} " +
+                std::to_string(s.wireIgnored[k]) + "\n";
+        }
+        counter("storage_starved_seconds_total",
+            "Seconds the core session's connect attempts were refused for storage space (exit 70 once one episode lasts 30 s).",
+            std::to_string(s.storageStarvedSeconds));
+    }
     gauge("duty_max_cycle_us", "The longest duty iteration since start, idle excluded.", std::to_string(s.dutyMaxCycleUs));
     gauge("duty_heartbeat_age_ms", "Age of the duty heartbeat at scrape time.", std::to_string(v.heartbeatAgeMs));
     gauge("conductor_heartbeat_age_ms", "Age of the Aeron client conductor heartbeat at the last check (-1 = not found yet).",

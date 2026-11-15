@@ -37,7 +37,11 @@ jobs:
           key: cluster-tools-${{ runner.os }}-${{ hashFiles('dependencies.lock', 'scripts/build-cluster-tools.sh', 'scripts/fetch-cluster-tools.sh') }}
 
       - name: Fetch and verify cluster-tools by the lock
-        run: scripts/fetch-cluster-tools.sh "${RUNNER_TEMP}/ct-cache" --verify-only
+        # the verified tree also carries the golden corpus the codec tests read (GW_CLUSTER_TOOLS_SOURCE_DIR)
+        run: |
+          set -euo pipefail
+          scripts/fetch-cluster-tools.sh "${RUNNER_TEMP}/ct-cache" --verify-only > "${RUNNER_TEMP}/ct-args"
+          echo "CT_SOURCE_DIR=$(sed -n 's/^-DCLUSTER_TOOLS_SOURCE_DIR=//p' "${RUNNER_TEMP}/ct-args")" >> "$GITHUB_ENV"
 
       - name: Build and install the pinned cluster-tools package
         if: steps.ct-cache.outputs.cache-hit != 'true'
@@ -45,7 +49,9 @@ jobs:
 
       - name: Configure
         # the configure checks the package against the lock again (source sha, money schema sha256 and version)
-        run: cmake -S . -B build -G Ninja -DCMAKE_PREFIX_PATH="${RUNNER_TEMP}/ct-prefix" -DGW_TEST_BUILDS=ON
+        run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_PREFIX_PATH="${RUNNER_TEMP}/ct-prefix" -DGW_TEST_BUILDS=ON
+          -DGW_CLUSTER_TOOLS_SOURCE_DIR="${CT_SOURCE_DIR}"
 
       - name: Build
         run: cmake --build build
@@ -55,3 +61,58 @@ jobs:
 
       - name: Footprint at idle (reported, not asserted)
         run: python3 -I tests/process/process_test.py --bin-dir build/bin --work build/footprint footprint
+
+  # The unit tests (the wire codec cases and its fuzz case included) under AddressSanitizer and UndefinedBehavior
+  # Sanitizer. The cluster-tools package comes from the same lock, cache and verified tree as build-test.
+  sanitizers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SAN_FLAGS: -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends uuid-dev ninja-build
+
+      - name: Restore the cluster-tools package built from the lock
+        id: ct-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ct-prefix
+          key: cluster-tools-${{ runner.os }}-${{ hashFiles('dependencies.lock', 'scripts/build-cluster-tools.sh', 'scripts/fetch-cluster-tools.sh') }}
+
+      - name: Fetch and verify cluster-tools by the lock
+        run: |
+          set -euo pipefail
+          scripts/fetch-cluster-tools.sh "${RUNNER_TEMP}/ct-cache" --verify-only > "${RUNNER_TEMP}/ct-args"
+          echo "CT_SOURCE_DIR=$(sed -n 's/^-DCLUSTER_TOOLS_SOURCE_DIR=//p' "${RUNNER_TEMP}/ct-args")" >> "$GITHUB_ENV"
+
+      - name: Build and install the pinned cluster-tools package
+        if: steps.ct-cache.outputs.cache-hit != 'true'
+        run: JOBS="$(nproc)" scripts/build-cluster-tools.sh "${RUNNER_TEMP}/ct-cache" "${RUNNER_TEMP}/ct-prefix"
+
+      - name: Configure (ASan + UBSan)
+        run: >-
+          cmake -S . -B build-san -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_PREFIX_PATH="${RUNNER_TEMP}/ct-prefix" -DGW_TEST_BUILDS=OFF
+          -DGW_CLUSTER_TOOLS_SOURCE_DIR="${CT_SOURCE_DIR}"
+          -DCMAKE_C_FLAGS="${SAN_FLAGS}" -DCMAKE_CXX_FLAGS="${SAN_FLAGS}"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+
+      - name: Build the unit tests
+        run: cmake --build build-san --target gw_unit_tests
+
+      - name: Unit tests under the sanitizers (wire codec and fuzz included)
+        env:
+          ASAN_OPTIONS: abort_on_error=1:detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: build-san/bin/gw_unit_tests

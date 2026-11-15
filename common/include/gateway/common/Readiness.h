@@ -13,6 +13,8 @@
 // oe-gateway /ready, all of:
 //   driver_connected    the Aeron client is connected to its media driver and the process counter registered (false
 //                       through the driver wait and the embedded start retries)
+//   storage_space       the session's connect attempts are not refused for storage space (a starved session reads not
+//                       ready while the episode lasts and exits 70 once it lasted the runtime's bound)
 //   session_connected   a session to a leader (no leader = not ready)
 //   session_registered  the registration ack arrived
 //   config_loaded       a config report is loaded
@@ -33,6 +35,7 @@ namespace openexchange { namespace gateway {
 
 namespace condition {
 inline constexpr const char *DRIVER_CONNECTED = "driver_connected";
+inline constexpr const char *STORAGE_SPACE = "storage_space";
 inline constexpr const char *SESSION_CONNECTED = "session_connected";
 inline constexpr const char *SESSION_REGISTERED = "session_registered";
 inline constexpr const char *CONFIG_LOADED = "config_loaded";

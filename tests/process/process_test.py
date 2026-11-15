@@ -230,20 +230,26 @@ def case_config_refused(ctx, role):
 def case_config_bad_values(ctx, role):
     p = "GATEWAY" if role == "gateway" else "STREAM"
     parent = tmpfs_parent(ctx, f"bad-{role}")
-    env = ctx.env(role, "embedded", driver_dir=parent, extra={
+    extra = {
         f"{p}_INSTANCE_ID": "gw-1",
         f"{p}_CORE_INGRESS_CHANNEL": "aeron:udp?term-length=4m",
         f"{p}_IDLE": "spin",
         f"{p}_TYPO_SETTING": "1",
-    })
+    }
+    needles = [f"{p}_INSTANCE_ID must be a positive integer", f"{p}_CORE_INGRESS_CHANNEL must name term-length and mtu",
+               f"{p}_IDLE must be exactly backoff or busy", f"{p}_TYPO_SETTING is not a setting"]
+    if role == "gateway":
+        # a value only the session's own check refuses (above the client's 1 h bound) is listed in the same pass
+        extra["GATEWAY_REQUEST_TIMEOUT_MS"] = "4000000"
+        needles.append("GATEWAY_REQUEST_TIMEOUT_MS: session: requestTimeoutMs must be in 1..3600000")
+    env = ctx.env(role, "embedded", driver_dir=parent, extra=extra)
     proc = ctx.start([ctx.binary("oe-gateway" if role == "gateway" else "oe-stream")], env, f"config-bad-{role}.log")
     code = wait_exit(proc, 10)
     out = text_of(proc)
     check(code == 78, f"exit {code}, expected 78:\n{out}")
-    for needle in (f"{p}_INSTANCE_ID must be a positive integer", f"{p}_CORE_INGRESS_CHANNEL must name term-length and mtu",
-                   f"{p}_IDLE must be exactly backoff or busy", f"{p}_TYPO_SETTING is not a setting"):
+    for needle in needles:
         check(needle in out, f"missing '{needle}':\n{out}")
-    check("refusing to start: 4 configuration problems (exit 78)" in out, f"refusal line:\n{out}")
+    check(f"refusing to start: {len(needles)} configuration problems (exit 78)" in out, f"refusal line:\n{out}")
     check("admin listening" not in out, "the admin listener bound before the configuration was accepted")
     shutil.rmtree(parent, ignore_errors=True)
 

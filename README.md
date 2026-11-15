@@ -4,8 +4,8 @@
 Open Exchange core. Each has its own cluster session and no shared state; run N copies of each. They share
 one static library, `gw_common`.
 
-This version is the process shell: settings, both media driver modes, the supervisor and the admin
-endpoints. Sessions, REST routes, auth and streams come next.
+This version has the process shell (settings, both media driver modes, the supervisor, the admin
+endpoints), the wire codec and `oe-gateway`'s core session. REST routes, auth and streams come next.
 
 ## Build
 
@@ -44,6 +44,8 @@ binaries (`<P>` is `GATEWAY` or `STREAM`):
 Sizes, timeouts and cadences are settings with defaults, not limits; `/health` shows the value in force.
 `<P>_DRIVER_TIMEOUT_MS` (default 10000) must be 3000 to 60000: below that a driver hiccup reads as a
 dead driver.
+`<P>_RECONNECT_DELAY_MS` (default 1000) spaces session reconnects; `<P>_REGISTER_RESEND_MS` (default 5000)
+resends an unanswered registration.
 
 In external mode a missing `AERON_DIR` means the driver is not up yet: the process exits 70 after the
 driver timeout so the service manager retries it. Order the unit after `aeronmd` anyway.
@@ -51,6 +53,36 @@ driver timeout so the service manager retries it. Order the unit after `aeronmd`
 Admin endpoints are served on the admin bind only, from the moment the process binds: `/health`, `/ready`
 (503 lists the failing conditions by name, `driver_connected` first), `/ready/session` (oe-gateway) and
 `/metrics` (Prometheus).
+
+`/ready` conditions, each failing one listed by name: `driver_connected`, `storage_space`,
+`session_connected`, `session_registered`, `config_loaded`, `gate_open`, `keepalive_fresh`, `timeout_streak`,
+`public_listener`. `/ready/session` checks only the driver and the session. `config_loaded` needs a core
+that has applied a configuration (config version above 0).
+
+## Core session
+
+`oe-gateway` holds one GATEWAY cluster session. It counts as registered only after the core's AdminAck
+arrives at the exact money schema version, and it registers again on every new session and every new
+leader; nothing is offered before that. Requests in flight are offered once more after a new leader, with
+the same correlation id and request id, so a keyed command replays its stored decision. Reads share a query
+budget; above it the gateway answers overloaded instead of queueing.
+
+A session whose connect attempts the media driver refuses for storage space reads not ready
+(`storage_space`) and counts `gateway_storage_starved_seconds_total`. After 30 s of continuous refusal it
+exits 70, so the service manager restarts it.
+
+## Wire
+
+Both binaries speak exactly the money schema `dependencies.lock` pins (id 2, version 8), through the
+cluster-tools codecs. Every egress frame is checked before any field is read. A wrong schema, any other
+version, an unknown template, wrong lengths, trailing bytes and unnamed enum values are refused. Refusals
+are counted in `gateway_decode_refused_total` and logged rate-limited (the first, then every 1000th, with
+the count). Frames the core sends on a subscribed channel that the gateway does not read (`OrderFault`, a
+CONTROL broadcast) are counted in `gateway_wire_ignored_total{template}` and never logged. A frame reaches
+its handler only after it decoded completely.
+
+`tests/golden/regen.sh <core-cluster.jar>` regenerates the golden corpus. It accepts only a jar whose
+Build-Sha and `sbe/money-schema.xml` sha256 match the lock.
 
 Exit codes: 0 clean stop; 70 process health (driver death or timeout, conductor heartbeat, duty watchdog, a
 stop bound hit); 75 temporary; 78 configuration (set `RestartPreventExitStatus=78`).
