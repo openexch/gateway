@@ -40,6 +40,8 @@
 //   <P>_DUTY_WATCHDOG_MS 5000 (duty heartbeat bound: /health 503 and exit 70), <P>_STOP_TIMEOUT_MS 2000 (every join
 //   and close on the stop path), <P>_STATUS_INTERVAL_MS 100 (the duty thread's Status publish interval),
 //   <P>_EMBEDDED_RETRY_MS 1000 (embedded only, refused with external: the retry spacing of a start starved of storage).
+//   <P>_RECONNECT_DELAY_MS 1000 (a core session the cluster closed, or a connect cycle that failed, is replaced after
+//   this), <P>_REGISTER_RESEND_MS 5000 (a RegisterSession whose AdminAck did not arrive is sent again after this).
 //   <P>_AUTH_MODES         required: a list of demo, api-key, jwt, dev (no repeats). dev needs GATEWAY_ALLOW_DEV_AUTH=1;
 //                          api-key needs GATEWAY_API_KEYS_FILE; jwt needs GATEWAY_JWT_SECRET_FILE; demo needs
 //                          GATEWAY_PG_URL. Those four and GATEWAY_TOKEN_CACHE_TTL_MS / _STALE_MS are read by both
@@ -103,6 +105,8 @@ struct CommonSettings
     std::int64_t stopTimeoutMs = 2000;
     std::int64_t statusIntervalMs = 100;  // the duty thread publishes its Status at most this often
     std::int64_t embeddedRetryMs = 1000;  // an embedded start starved of storage is retried this far apart
+    std::int64_t reconnectDelayMs = 1000; // a closed or failed core session is replaced after this
+    std::int64_t registerResendMs = 5000; // a RegisterSession without its AdminAck is re-sent after this
     unsigned authModes = 0;
     bool allowDevAuth = false;
     std::optional<std::string> apiKeysFile;

@@ -15,6 +15,7 @@ std::vector<Condition> gatewayReadyConditions(const Status &s, std::int64_t nowN
 {
     return {
         { condition::DRIVER_CONNECTED, s.driverConnected },
+        { condition::STORAGE_SPACE, !s.storageStarved },
         { condition::SESSION_CONNECTED, s.connected },
         { condition::SESSION_REGISTERED, s.registered },
         { condition::CONFIG_LOADED, s.configLoaded },

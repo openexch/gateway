@@ -113,6 +113,7 @@ TEST(each_gateway_condition_fails_alone)
     };
     const Variant variants[] = {
         { "driver_connected", [](Status &s, std::int64_t) { s.driverConnected = false; } },
+        { "storage_space", [](Status &s, std::int64_t) { s.storageStarved = true; } },
         { "session_connected", [](Status &s, std::int64_t) { s.connected = false; } },
         { "session_registered", [](Status &s, std::int64_t) { s.registered = false; } },
         { "config_loaded", [](Status &s, std::int64_t) { s.configLoaded = false; } },
@@ -239,6 +240,13 @@ TEST(metrics_carry_the_binary_prefix_and_every_condition)
     CHECK(has(g.body, "\ngateway_session_registered 0\n"));
     CHECK(has(g.body, "gateway_build_info{version=\"dev\""));
     CHECK(!has(g.body, "\nstream_"));
+    // ignored egress templates are their own counter, by template id, apart from decode_refused_total
+    AdminView ignoring = view(Role::GATEWAY, &settings);
+    ignoring.status.decodeRefused = 2;
+    ignoring.status.wireIgnored[0] = 5;
+    const auto i = get(ignoring, "/metrics");
+    CHECK(has(i.body, "\ngateway_decode_refused_total 2\n"));
+    CHECK(has(i.body, "\n# TYPE gateway_wire_ignored_total counter\ngateway_wire_ignored_total{template=\"113\"} 5\n"));
     const auto s = get(view(Role::STREAM, &settings), "/metrics");
     CHECK(has(s.body, "\nstream_ready 0\n"));
     CHECK(has(s.body, "stream_ready_condition{name=\"event_gap\"} 1\n"));

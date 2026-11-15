@@ -408,6 +408,8 @@ void parseCommon(SettingsReader &r, Role role, const rt::DirProbe &probe, Common
     c.dutyWatchdogMs = r.positive(P + "_DUTY_WATCHDOG_MS", c.dutyWatchdogMs);
     c.stopTimeoutMs = r.positive(P + "_STOP_TIMEOUT_MS", c.stopTimeoutMs);
     c.statusIntervalMs = r.positive(P + "_STATUS_INTERVAL_MS", c.statusIntervalMs);
+    c.reconnectDelayMs = r.positive(P + "_RECONNECT_DELAY_MS", c.reconnectDelayMs);
+    c.registerResendMs = r.positive(P + "_REGISTER_RESEND_MS", c.registerResendMs);
     {
         const std::string key = P + "_EMBEDDED_RETRY_MS";
         if (DriverMode::EXTERNAL == c.driverMode && r.isSet(key))

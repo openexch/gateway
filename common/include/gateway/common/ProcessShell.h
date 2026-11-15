@@ -2,11 +2,13 @@
 #define GATEWAY_COMMON_PROCESS_SHELL_H
 
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "gateway/common/Readiness.h"
 #include "gateway/common/Settings.h"
+#include "gateway/common/Status.h"
 
 // ProcessShell - the process both binaries are, around their duty work, built from the cluster-tools runtime:
 //   1. every setting in force is written to stderr (the boot record; /health shows the same list);
@@ -28,9 +30,36 @@
 //      <P>_STOP_TIMEOUT_MS (a bound hit is 70), then the process exits with the duty's code (0 on a clean stop). An
 //      admin thread that does not stop inside the bound is detached and the process exits 70 at once, tearing down
 //      nothing that thread can still reach.
-// No cluster session is opened here: the session wrapper plugs into the duty loop.
+// The cluster session plugs into the duty loop through ProcessInputs::makeDuty: built on the duty thread once the
+// Aeron client exists, driven every iteration, its Status fields published with the shell's, destroyed on the duty
+// thread before the Aeron client closes. A duty whose exitCode() turns nonzero stops the process with that code.
+
+namespace aeron {
+class Aeron;
+}
+
+namespace cluster_tools { namespace runtime {
+class LogRing;
+}}
 
 namespace openexchange { namespace gateway {
+
+// The work of the duty thread (the core session and what hangs off it). Called on the duty thread only.
+class DutyWork
+{
+public:
+    virtual ~DutyWork() = default;
+    virtual int doWork() = 0;                    // one iteration; the work done (0 = idle)
+    virtual void fillStatus(Status &status) const = 0;
+    virtual int exitCode() const = 0;            // 0 = keep running; else stop the process with this code
+    virtual void close() = 0;                    // the stop path, before destruction
+};
+
+struct DutyContext
+{
+    std::shared_ptr<aeron::Aeron> aeron;
+    cluster_tools::runtime::LogRing *log = nullptr;
+};
 
 struct ProcessIdentity
 {
@@ -56,6 +85,7 @@ struct ProcessInputs
     StreamReadyBounds streamBounds;
     std::string treasuryLane = "off";
     ProcessHooks hooks;
+    std::function<std::unique_ptr<DutyWork>(const DutyContext &)> makeDuty; // empty = no duty work (no session)
 };
 
 // Runs the process and exits it (std::_Exit with the code); does not return.

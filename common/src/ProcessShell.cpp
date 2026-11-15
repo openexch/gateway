@@ -313,7 +313,17 @@ void runProcess(const ProcessIdentity &id, const ProcessInputs &in)
             rt::IdleStrategy idle(rt::FORWARDER_IDLE);
             Status status;
             std::int64_t lastPublishNs = 0;
-            log.push(rt::LogLevel::INFO, nowNs(), "%s-duty: running (no cluster session in this build)", id.threadPrefix);
+            std::unique_ptr<DutyWork> duty;
+            if (in.makeDuty)
+            {
+                DutyContext context;
+                context.aeron = aeron;
+                context.log = &log;
+                duty = in.makeDuty(context);
+            }
+            log.push(rt::LogLevel::INFO, nowNs(), "%s-duty: running%s", id.threadPrefix,
+                duty ? "" : " (no cluster session in this build)");
+            int dutyExit = exit_code::CLEAN;
             while (!supervisor.stopRequested.load(std::memory_order_acquire))
             {
                 const std::int64_t start = nowNs();
@@ -323,12 +333,23 @@ void runProcess(const ProcessIdentity &id, const ProcessInputs &in)
                 {
                     in.hooks.onDutyIteration();
                 }
-                const int work = 0; // the session wrapper's doWork / poll go here
+                const int work = duty ? duty->doWork() : 0;
+                if (duty && 0 != duty->exitCode())
+                {
+                    dutyExit = duty->exitCode();
+                    log.push(rt::LogLevel::CRITICAL, nowNs(), "%s-duty: stopping the process (exit %d)", id.threadPrefix,
+                        dutyExit);
+                    break;
+                }
                 status.dutyIterations++;
                 processCounter->setOrdered(static_cast<std::int64_t>(status.dutyIterations));
                 if (start - lastPublishNs >= publishIntervalNs)
                 {
                     status.aeronErrors = monitor->errorCount();
+                    if (duty)
+                    {
+                        duty->fillStatus(status);
+                    }
                     if (board.tryPublish(status))
                     {
                         lastPublishNs = start;
@@ -344,8 +365,13 @@ void runProcess(const ProcessIdentity &id, const ProcessInputs &in)
                     idle.idle(work);
                 }
             }
+            if (duty)
+            {
+                duty->close();
+                duty.reset(); // on this thread, before the Aeron client closes
+            }
             log.push(rt::LogLevel::INFO, nowNs(), "%s-duty: stopped", id.threadPrefix);
-            return exit_code::CLEAN;
+            return dutyExit;
         },
         nullptr);
 
