@@ -1,0 +1,19 @@
+Open Exchange gateway
+Copyright 2026 Ziya Emre Bulutlar
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The binaries built from this repository statically link the following third-party
+software, fetched at build time and verified by sha256 against dependencies.lock
+(directly, or through the pinned cluster-tools source tree):
+
+  cluster-tools (https://github.com/openexch/cluster-tools)
+    Copyright 2026 Ziya Emre Bulutlar. Apache License, Version 2.0.
+
+  Aeron (https://github.com/aeron-io/aeron)
+    Copyright Real Logic Limited and Adaptive Financial Consulting Limited.
+    Apache License, Version 2.0.
+
+  Simple Binary Encoding (https://github.com/aeron-io/simple-binary-encoding)
+    Copyright Real Logic Limited. Apache License, Version 2.0.
+    Used at build time to generate codecs; the generated code is linked.

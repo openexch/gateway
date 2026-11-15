@@ -1,0 +1,57 @@
+# Build and test on every push to main and every pull request. No secrets and no signing keys: every input is public
+# and pinned by sha256 in dependencies.lock (cluster-tools by commit and source tarball, the money schema by core
+# commit), and scripts/fetch-cluster-tools.sh refuses anything else before it is built.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends uuid-dev ninja-build
+
+      - name: Restore the cluster-tools package built from the lock
+        id: ct-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ct-prefix
+          key: cluster-tools-${{ runner.os }}-${{ hashFiles('dependencies.lock', 'scripts/build-cluster-tools.sh', 'scripts/fetch-cluster-tools.sh') }}
+
+      - name: Fetch and verify cluster-tools by the lock
+        run: scripts/fetch-cluster-tools.sh "${RUNNER_TEMP}/ct-cache" --verify-only
+
+      - name: Build and install the pinned cluster-tools package
+        if: steps.ct-cache.outputs.cache-hit != 'true'
+        run: JOBS="$(nproc)" scripts/build-cluster-tools.sh "${RUNNER_TEMP}/ct-cache" "${RUNNER_TEMP}/ct-prefix"
+
+      - name: Configure
+        # the configure checks the package against the lock again (source sha, money schema sha256 and version)
+        run: cmake -S . -B build -G Ninja -DCMAKE_PREFIX_PATH="${RUNNER_TEMP}/ct-prefix" -DGW_TEST_BUILDS=ON
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Footprint at idle (reported, not asserted)
+        run: python3 -I tests/process/process_test.py --bin-dir build/bin --work build/footprint footprint

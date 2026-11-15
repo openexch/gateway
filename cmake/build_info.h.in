@@ -1,0 +1,9 @@
+#ifndef GATEWAY_BUILD_INFO_H
+#define GATEWAY_BUILD_INFO_H
+
+// Generated at configure time (CMakeLists.txt): what this build is and what it was built against.
+#define GW_VERSION "@GW_VERSION@"
+#define GW_SOURCE_SHA "@GW_SOURCE_SHA@"
+#define GW_CLUSTER_TOOLS_SHA "@cluster_tools_SOURCE_SHA@"
+
+#endif
