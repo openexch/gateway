@@ -19,7 +19,7 @@
 //   GATEWAY_HASH_QUEUE 32, GATEWAY_REGISTER_RATE 1/s + GATEWAY_REGISTER_BURST 5, GATEWAY_LOGIN_RATE 10/s +
 //   GATEWAY_LOGIN_BURST 20, GATEWAY_AUTH_SOURCE_RATE 10/min + GATEWAY_AUTH_SOURCE_BURST 10 (per source address,
 //   register and login together), GATEWAY_SOURCE_IPV6_PREFIX 64 (an IPv6 source's budget is shared by its /64; 1 to
-//   128, the length of an address), GATEWAY_PBKDF2_ITERATIONS 50000 (new password hashes; a stored hash keeps its own
+//   128, the length of an address), GATEWAY_PBKDF2_ITERATIONS 600000 (OWASP; new password hashes; a stored hash keeps its own
 //   count; at most 2^31-1, the PBKDF2 interface's bound), GATEWAY_MAX_HEADER_BYTES 8192 (the request header block,
 //   above it 431), GATEWAY_HTTP_IDLE_TIMEOUT_MS 60000 (a connection silent this long, inside or between requests, is
 //   closed), GATEWAY_TRUSTED_PROXIES none (IP or CIDR list),

@@ -105,7 +105,7 @@ stop bound hit); 75 temporary; 78 configuration (set `RestartPreventExitStatus=7
 - `dev`: only with `GATEWAY_ALLOW_DEV_AUTH=1`.
 
 A missing or bad key or secret file stops the process with exit 78. A credential is never read from a URL, and
-no request can name a user. Password hashing (PBKDF2, `GATEWAY_PBKDF2_ITERATIONS`) runs on `gw-hash`
+no request can name a user. Password hashing (PBKDF2-SHA256, `GATEWAY_PBKDF2_ITERATIONS`, default 600000; a stored hash keeps its own count) runs on `gw-hash`
 (`GATEWAY_HASH_THREADS`, `GATEWAY_HASH_QUEUE`; a full queue is 503 AUTH_BUSY). Users-store calls run on
 `gw-pg-auth`. Register and login are rate limited globally and per source address (`<n>/s` or `<n>/min` plus a
 burst; `GATEWAY_TRUSTED_PROXIES` decides the source; IPv6 sources share a budget per

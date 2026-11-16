@@ -285,7 +285,7 @@ TEST(settings_auth_rates_and_bounds)
     CHECK(p.settings.loginRate.count == 10 && 20 == p.settings.loginBurst);
     CHECK(p.settings.authSourceRate.count == 10 && p.settings.authSourceRate.periodMs == 60'000 &&
         10 == p.settings.authSourceBurst);
-    CHECK(50'000 == p.settings.pbkdf2Iterations && 8192 == p.settings.maxHeaderBytes &&
+    CHECK(600'000 == p.settings.pbkdf2Iterations && 8192 == p.settings.maxHeaderBytes &&
         60'000 == p.settings.httpIdleTimeoutMs && 1 == p.settings.hashThreads && 32 == p.settings.hashQueue);
     std::set<std::string> recorded;
     for (const auto &r : p.records)
@@ -293,7 +293,7 @@ TEST(settings_auth_rates_and_bounds)
         recorded.insert(r.name + "=" + r.value + "/" + r.source);
     }
     for (const char *want : { "GATEWAY_REGISTER_BURST=5/default", "GATEWAY_LOGIN_BURST=20/default",
-             "GATEWAY_AUTH_SOURCE_BURST=10/default", "GATEWAY_PBKDF2_ITERATIONS=50000/default",
+             "GATEWAY_AUTH_SOURCE_BURST=10/default", "GATEWAY_PBKDF2_ITERATIONS=600000/default",
              "GATEWAY_MAX_HEADER_BYTES=8192/default", "GATEWAY_HTTP_IDLE_TIMEOUT_MS=60000/default",
              "GATEWAY_REGISTER_RATE=1/s/default", "GATEWAY_AUTH_SOURCE_RATE=10/min/default" })
     {
