@@ -1,0 +1,413 @@
+#include "gateway/common/History.h"
+
+#include <array>
+#include <charconv>
+#include <cstdint>
+
+#include "gateway/common/Api.h"
+#include "gateway/common/Crypto.h"
+#include "gateway/common/Rest.h"
+
+namespace openexchange { namespace gateway { namespace history {
+
+namespace {
+
+// A shape check, not a capacity limit: the longest cursor this code writes is base64url of "f1|" + 16 hex + 3 x ("|" +
+// an int64 of up to 20 characters), 82 bytes, 110 characters; anything above 256 is not a cursor of ours.
+constexpr std::size_t MAX_CURSOR_CHARS = 256;
+
+const char *ORDER_COLUMNS = "order_id, client_order_id::text, market_id, side, type, time_in_force, price, stop_price, "
+    "quantity, filled_quantity, remaining_quantity, status, reason, me_reason, me_order_id, hold_asset_id, hold_amount, "
+    "hold_remaining, created_at_ms, updated_at_ms";
+const char *FILL_COLUMNS = "trade_id, order_id, market_id, side, price, quantity, maker, executed_at_ms";
+
+const std::array<const char *, 10> STATUSES = { "NEW", "PARTIALLY_FILLED", "FILLED", "CANCELLED", "REJECTED", "EXPIRED",
+    "PENDING_NEW", "PENDING_TRIGGER", "PENDING_CANCEL", "PENDING_REPLACE" };
+
+const char *tagOf(Kind kind)
+{
+    return Kind::ORDERS == kind ? "o1" : "f1";
+}
+
+std::string binding(Kind kind, const Filter &f)
+{
+    const std::string text = std::string(tagOf(kind)) + "|" + std::to_string(f.marketId) + "|" + f.status + "|" +
+        std::to_string(f.orderId);
+    const crypto::Digest d = crypto::sha256(text);
+    return crypto::hex(crypto::view(d).substr(0, 8));
+}
+
+// A decimal integer, the whole text (an optional '-' only where `negative` allows it).
+bool integer(std::string_view t, std::int64_t &v, bool negative = false)
+{
+    if (t.empty() || (!negative && '-' == t[0]) || '+' == t[0])
+    {
+        return false;
+    }
+    const auto [end, ec] = std::from_chars(t.data(), t.data() + t.size(), v);
+    return std::errc() == ec && end == t.data() + t.size();
+}
+
+std::vector<std::string_view> split(std::string_view s, char sep)
+{
+    std::vector<std::string_view> out;
+    std::size_t from = 0;
+    for (;;)
+    {
+        const std::size_t at = s.find(sep, from);
+        out.push_back(s.substr(from, std::string_view::npos == at ? std::string_view::npos : at - from));
+        if (std::string_view::npos == at)
+        {
+            return out;
+        }
+        from = at + 1;
+    }
+}
+
+std::string param(std::vector<std::string> &params, std::string value)
+{
+    params.push_back(std::move(value));
+    return "$" + std::to_string(params.size());
+}
+
+// Row readers: each records the first problem.
+struct Reader
+{
+    const Row &row;
+    std::string &problem;
+
+    const std::optional<std::string> *cell(std::size_t i, const char *column)
+    {
+        if (i >= row.size())
+        {
+            fail(column, "is missing");
+            return nullptr;
+        }
+        return &row[i];
+    }
+    void fail(const char *column, const char *what)
+    {
+        if (problem.empty())
+        {
+            problem = std::string("column ") + column + " " + what;
+        }
+    }
+    std::int64_t number(std::size_t i, const char *column)
+    {
+        const auto *c = cell(i, column);
+        std::int64_t v = 0;
+        if (nullptr == c || !c->has_value())
+        {
+            nullptr == c ? void() : fail(column, "is NULL");
+            return 0;
+        }
+        if (!integer(**c, v, true))
+        {
+            fail(column, "is not an integer");
+        }
+        return v;
+    }
+    std::optional<std::int64_t> optNumber(std::size_t i, const char *column)
+    {
+        const auto *c = cell(i, column);
+        if (nullptr == c || !c->has_value())
+        {
+            return std::nullopt;
+        }
+        return number(i, column);
+    }
+    std::string text(std::size_t i, const char *column)
+    {
+        const auto *c = cell(i, column);
+        if (nullptr == c || !c->has_value())
+        {
+            nullptr == c ? void() : fail(column, "is NULL");
+            return std::string();
+        }
+        return **c;
+    }
+    std::optional<std::string> optText(std::size_t i, const char *column)
+    {
+        const auto *c = cell(i, column);
+        return nullptr == c ? std::nullopt : *c;
+    }
+    // a cell as stored, for a problem line (NULL and a missing cell named as such)
+    std::string raw(std::size_t i) const
+    {
+        return i >= row.size() ? std::string("(missing)") : row[i] ? *row[i] : std::string("NULL");
+    }
+};
+
+std::string id(std::int64_t v)
+{
+    return api::quote(std::to_string(v));
+}
+
+std::string money(std::int64_t v)
+{
+    return api::quote(rest::formatMoney(v));
+}
+
+std::string optMoney(const std::optional<std::int64_t> &v)
+{
+    return v ? money(*v) : std::string("null");
+}
+
+}
+
+bool knownStatus(std::string_view name)
+{
+    for (const char *s : STATUSES)
+    {
+        if (name == s)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Each placeholder is numbered by its own statement (never two param() calls in one expression: the operands of +
+// are unsequenced, and the numbers would follow the compiler's order instead of the text's).
+Statement pageStatement(const PageRequest &r)
+{
+    Statement s;
+    const bool orders = Kind::ORDERS == r.kind;
+    s.sql = std::string("SELECT ") + (orders ? ORDER_COLUMNS : FILL_COLUMNS) + " FROM " +
+        (orders ? "gateway_order_history_v1" : "gateway_fills_v1") + " WHERE user_id = ";
+    s.sql += param(s.params, std::to_string(r.userId)) + "::bigint";
+    if (0 != r.filter.marketId)
+    {
+        s.sql += " AND market_id = ";
+        s.sql += param(s.params, std::to_string(r.filter.marketId)) + "::integer";
+    }
+    if (orders && !r.filter.status.empty())
+    {
+        s.sql += " AND status = ";
+        s.sql += param(s.params, r.filter.status) + "::text";
+    }
+    if (!orders && 0 != r.filter.orderId)
+    {
+        s.sql += " AND order_id = ";
+        s.sql += param(s.params, std::to_string(r.filter.orderId)) + "::bigint";
+    }
+#ifndef GW_NC_OFFSET_PAGING
+    if (r.after)
+    {
+        s.sql += orders ? " AND (updated_at_ms, order_id) < (" : " AND (executed_at_ms, trade_id, order_id) < (";
+        s.sql += param(s.params, std::to_string(r.after->a)) + "::bigint, ";
+        s.sql += param(s.params, std::to_string(r.after->b)) + "::bigint";
+        if (!orders)
+        {
+            s.sql += ", ";
+            s.sql += param(s.params, std::to_string(r.after->c)) + "::bigint";
+        }
+        s.sql += ")";
+    }
+#endif
+    s.sql += orders ? " ORDER BY updated_at_ms DESC, order_id DESC" : " ORDER BY executed_at_ms DESC, trade_id DESC, order_id DESC";
+    // one row more than the page tells whether another page exists
+    const std::int64_t fetch = r.limit < INT64_MAX ? r.limit + 1 : r.limit;
+    s.sql += " LIMIT ";
+    s.sql += param(s.params, std::to_string(fetch)) + "::bigint";
+#ifdef GW_NC_OFFSET_PAGING
+    if (r.after)
+    {
+        s.sql += " OFFSET "; // control: rows served so far
+        s.sql += param(s.params, std::to_string(r.after->a)) + "::bigint";
+    }
+#endif
+    return s;
+}
+
+Statement orderStatement(std::int64_t userId, std::int64_t orderId)
+{
+    Statement s;
+    s.sql = std::string("SELECT ") + ORDER_COLUMNS + " FROM gateway_order_history_v1 WHERE user_id = ";
+    s.sql += param(s.params, std::to_string(userId)) + "::bigint AND order_id = ";
+    s.sql += param(s.params, std::to_string(orderId)) + "::bigint";
+    return s;
+}
+
+const std::string &heartbeatStatement()
+{
+    // NULL when there is no row: GREATEST ignores NULL, so the empty case is tested before it (else it reads as age 0).
+    // applied_order_id: the lowest of the rows (one row in the reference DDL; with more, the conservative one, so an
+    // order is never answered 404 before every reporter has applied it)
+    static const std::string sql = "SELECT CASE WHEN max(beat_at) IS NULL THEN NULL ELSE GREATEST(0, floor(extract("
+        "epoch FROM (clock_timestamp() - max(beat_at))) * 1000))::bigint END, min(applied_order_id) "
+        "FROM gateway_history_heartbeat_v1";
+    return sql;
+}
+
+std::string encodeCursor(Kind kind, const Filter &filter, const Key &key)
+{
+    std::string text = std::string(tagOf(kind)) + "|" + binding(kind, filter) + "|" + std::to_string(key.a) + "|" +
+        std::to_string(key.b);
+    if (Kind::FILLS == kind)
+    {
+        text += "|" + std::to_string(key.c);
+    }
+    return crypto::base64UrlEncode(text);
+}
+
+CursorError decodeCursor(std::string_view text, Kind kind, const Filter &filter, Key &out)
+{
+    if (text.empty() || text.size() > MAX_CURSOR_CHARS)
+    {
+        return CursorError::MALFORMED;
+    }
+    const auto raw = crypto::base64UrlDecode(text);
+    if (!raw)
+    {
+        return CursorError::MALFORMED;
+    }
+    const std::vector<std::string_view> parts = split(*raw, '|');
+    const std::string_view tag = parts.front();
+    if (tag != "o1" && tag != "f1")
+    {
+        return CursorError::MALFORMED;
+    }
+    const Kind of = "o1" == tag ? Kind::ORDERS : Kind::FILLS;
+    if (parts.size() != (Kind::ORDERS == of ? 4u : 5u) || 16 != parts[1].size())
+    {
+        return CursorError::MALFORMED;
+    }
+    Key k;
+    if (!integer(parts[2], k.a) || !integer(parts[3], k.b) || k.b < 1 ||
+        (Kind::FILLS == of && (!integer(parts[4], k.c) || k.c < 1)))
+    {
+        return CursorError::MALFORMED;
+    }
+    if (of != kind)
+    {
+        return CursorError::OTHER_ROUTE;
+    }
+    if (parts[1] != binding(kind, filter))
+    {
+        return CursorError::OTHER_FILTER;
+    }
+    out = k;
+    return CursorError::NONE;
+}
+
+std::string nextCursor(const PageRequest &request, const Key &last, std::size_t served)
+{
+#ifdef GW_NC_OFFSET_PAGING
+    (void)last;
+    const std::int64_t offset = (request.after ? request.after->a : 0) + static_cast<std::int64_t>(served);
+    return encodeCursor(request.kind, request.filter, Key{ offset, 1, 1 });
+#else
+    (void)served;
+    return encodeCursor(request.kind, request.filter, last);
+#endif
+}
+
+bool orderJson(const Row &row, std::string &json, Key &key, std::string &problem)
+{
+    Reader r{ row, problem };
+    const std::int64_t orderId = r.number(0, "order_id");
+    const auto clientOrderId = r.optText(1, "client_order_id");
+    const std::int64_t marketId = r.number(2, "market_id");
+    const std::string side = r.text(3, "side");
+    const std::string type = r.text(4, "type");
+    const std::string tif = r.text(5, "time_in_force");
+    const auto price = r.optNumber(6, "price");
+    const auto stopPrice = r.optNumber(7, "stop_price");
+    const std::int64_t quantity = r.number(8, "quantity");
+    const std::int64_t filled = r.number(9, "filled_quantity");
+    const std::int64_t remaining = r.number(10, "remaining_quantity");
+    const std::string status = r.text(11, "status");
+    const auto reason = r.optText(12, "reason");
+    const auto meReason = r.optNumber(13, "me_reason");
+    const auto meOrderId = r.optNumber(14, "me_order_id");
+    const std::int64_t holdAsset = r.number(15, "hold_asset_id");
+    const std::int64_t holdAmount = r.number(16, "hold_amount");
+    const auto holdRemaining = r.optNumber(17, "hold_remaining");
+    const std::int64_t createdAt = r.number(18, "created_at_ms");
+    const std::int64_t updatedAt = r.number(19, "updated_at_ms");
+    if (!problem.empty())
+    {
+        problem += " (row order_id " + r.raw(0) + ")";
+        return false;
+    }
+    json = "{\"orderId\":" + id(orderId);
+    json += ",\"clientOrderId\":" + (clientOrderId ? api::quote(*clientOrderId) : std::string("null"));
+    json += ",\"marketId\":" + id(marketId);
+    json += ",\"side\":" + api::quote(side);
+    json += ",\"type\":" + api::quote(type);
+    json += ",\"timeInForce\":" + api::quote(tif);
+    json += ",\"price\":" + optMoney(price);
+    json += ",\"stopPrice\":" + optMoney(stopPrice);
+    json += ",\"quantity\":" + money(quantity);
+    json += ",\"filledQuantity\":" + money(filled);
+    json += ",\"remainingQuantity\":" + money(remaining);
+    json += ",\"status\":" + api::quote(status);
+    json += ",\"reason\":" + (reason ? api::quote(*reason) : std::string("null"));
+    json += ",\"meReason\":" + (meReason ? std::to_string(*meReason) : std::string("null"));
+    json += ",\"meOrderId\":" + (meOrderId ? id(*meOrderId) : std::string("null"));
+    json += ",\"hold\":{\"assetId\":" + id(holdAsset) + ",\"amount\":" + money(holdAmount);
+    if (holdRemaining)
+    {
+        json += ",\"remaining\":" + money(*holdRemaining);
+    }
+    json += "},\"createdAt\":" + std::to_string(createdAt);
+    json += ",\"updatedAt\":" + std::to_string(updatedAt);
+    json += "}";
+    key = Key{ updatedAt, orderId, 0 };
+    return true;
+}
+
+bool fillJson(const Row &row, std::string &json, Key &key, std::string &problem)
+{
+    Reader r{ row, problem };
+    const std::int64_t tradeId = r.number(0, "trade_id");
+    const std::int64_t orderId = r.number(1, "order_id");
+    const std::int64_t marketId = r.number(2, "market_id");
+    const std::string side = r.text(3, "side");
+    const std::int64_t price = r.number(4, "price");
+    const std::int64_t quantity = r.number(5, "quantity");
+    const std::string maker = r.text(6, "maker");
+    const std::int64_t executedAt = r.number(7, "executed_at_ms");
+    if (problem.empty() && "t" != maker && "f" != maker)
+    {
+        r.fail("maker", "is not a boolean");
+    }
+    if (!problem.empty())
+    {
+        problem += " (row trade_id " + r.raw(0) + ", order_id " + r.raw(1) + ")";
+        return false;
+    }
+    json = "{\"tradeId\":" + id(tradeId);
+    json += ",\"orderId\":" + id(orderId);
+    json += ",\"marketId\":" + id(marketId);
+    json += ",\"side\":" + api::quote(side);
+    json += ",\"price\":" + money(price);
+    json += ",\"quantity\":" + money(quantity);
+    json += ",\"maker\":" + std::string("t" == maker ? "true" : "false");
+    json += ",\"executedAt\":" + std::to_string(executedAt);
+    json += "}";
+    key = Key{ executedAt, tradeId, orderId };
+    return true;
+}
+
+}
+
+const char *nameOf(HistoryCause c) noexcept
+{
+    switch (c)
+    {
+        case HistoryCause::NONE: return "none";
+        case HistoryCause::UNCONFIGURED: return "unconfigured";
+        case HistoryCause::ABSENT: return "absent";
+        case HistoryCause::UNREACHABLE: return "unreachable";
+        case HistoryCause::TIMEOUT: return "timeout";
+        case HistoryCause::NO_HEARTBEAT: return "no_heartbeat";
+        case HistoryCause::BAD_ROW: return "bad_row";
+        case HistoryCause::ERROR: return "error";
+        case HistoryCause::LAGGING: return "lagging";
+    }
+    return "?";
+}
+
+}}

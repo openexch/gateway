@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <initializer_list>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -70,6 +71,9 @@ std::optional<boost::json::object> readBody(const HttpExchange &ex, std::initial
     ApiResponse &bad);
 // True when the query names only `allowed` parameters (each at most once); else `bad` is the 400 to answer.
 bool readQuery(const HttpExchange &ex, std::initializer_list<std::string_view> allowed, ApiResponse &bad);
+// The query's parameters, names and values %-decoded (call after readQuery: every name appears once); nullopt when a
+// value has a bad %-escape.
+std::optional<std::map<std::string, std::string>> queryValues(const HttpExchange &ex);
 // A "userId" key anywhere in the value (any depth, any case of the key's letters).
 bool namesAUser(const boost::json::value &v, std::string &where);
 

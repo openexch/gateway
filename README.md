@@ -130,8 +130,8 @@ Alert on any rise, and after a restore set the sequence above the highest userId
   `POST /orders/cancel` (`{orderIds}` or `{all:true}`, at most `GATEWAY_BULK_CANCEL_MAX` per request).
 - `GET /balances`.
 - `POST /balances/deposit|withdraw`: only with the treasury lane, otherwise 404 FEATURE_DISABLED.
-- `/orders/history` and `/fills` answer 503 HISTORY_UNAVAILABLE for now. So does `GET /orders/{id}` for an order
-  that is not open, with `Retry-After: 60`.
+- History: `GET /orders/history?limit=&cursor=&marketId=&status=` and `GET /fills?limit=&cursor=&marketId=&orderId=`,
+  and `GET /orders/{orderId}` for an order that is no longer open (see History below).
 
 Money is a decimal string (at most 8 fraction digits) and ids are decimal strings. Errors are
 `{error, code, reason, detail, keyFinal}`. `keyFinal: true` appears only on a reject of a request that carried
@@ -142,6 +142,27 @@ Bulk cancel takes one principal token per order id plus one, never more than one
 (`GATEWAY_PRINCIPAL_BURST`); near the bucket size it can get 429 shortly after other requests: wait for
 `Retry-After` and resend, nothing was sent. `all:true` is charged one token for the read, then at most
 `burst - 1` for the cancels.
+
+History. The three history reads come from the history projection's relations, defined in
+`sql/history_read_contract_v1.sql`; the projection owns them and the gateway's role needs SELECT on those three
+relations only. They are read when `GATEWAY_PG_URL` is set, on `GATEWAY_PG_HISTORY_POOL` read-only connections of
+their own with their own queue (sized by `GATEWAY_PG_QUEUE`), so a history storm never takes a connection from login.
+No order-path request touches PostgreSQL.
+
+- Pages are `{items, nextCursor, asOf:{ageMs}}`, newest first, keyset only: send `nextCursor` back unchanged with the
+  same filters (a cursor from another route or filter is 400). `nextCursor: null` is the last page. `limit` defaults
+  to `GATEWAY_HISTORY_LIMIT_DEFAULT` (100); above `GATEWAY_HISTORY_LIMIT_MAX` (1000) is 400. A row whose key does not
+  change is served exactly once; an order updated during a walk moves to the top, so a walk that has not reached it
+  yet does not serve it and a walk started over from the top does.
+- `asOf.ageMs` is the age of the projection's heartbeat, measured by the database clock.
+- `GET /orders/{orderId}` of an order that is not open answers from history; an unknown order and another user's
+  order both answer the same 404. An id above the projection's `applied_order_id` with no row yet answers 503
+  HISTORY_UNAVAILABLE with `Retry-After` from `GATEWAY_HISTORY_LAG_RETRY_AFTER_MS` (1000), never 404.
+- Each read has one deadline, `GATEWAY_PG_STATEMENT_TIMEOUT_MS`, counted from when it is queued. A full queue, or a
+  read still queued at its deadline, is 503 HISTORY_BUSY (`Retry-After` from `GATEWAY_HISTORY_BUSY_RETRY_AFTER_MS`,
+  1000). No URL, no projection, no heartbeat, an unreachable database or a timeout is 503 HISTORY_UNAVAILABLE
+  (`Retry-After` from `GATEWAY_HISTORY_RETRY_AFTER_MS`, 60000); the cause is in `gateway_history_reads_total`. A
+  connection the server dropped is retried once on a fresh connection.
 
 Treasury lane (demo only): `GATEWAY_TREASURY_CREDENTIAL` plus `GATEWAY_ALLOW_TREASURY_LANE=1` plus
 `GATEWAY_FAUCET_MAX_AMOUNT` (`assetId:amount,...`), rate limited by `GATEWAY_FAUCET_RATE`. A deposit or withdraw
@@ -171,7 +192,7 @@ Server frames: `subscribed`, `snapshot`, `order`, `fill`, `balance`, `admission`
 
 Resume. Keep the last `eventSeq` of any frame, heartbeats included, and resume from it. A resume the stream
 cannot serve gets `resync` `RESUME_TOO_OLD` and a snapshot. After a resync, fills between your last frame and
-the snapshot may be missing until history is served.
+the snapshot may be missing; read them from `GET /fills`.
 
 Snapshots. A user's open orders come from the core in pages and are stitched by log position: the first page
 exclusive, the last inclusive, so no event is lost or doubled between pages. No snapshot is read until the

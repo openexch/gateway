@@ -8,6 +8,7 @@
 #include "gateway/common/Authenticator.h"
 #include "gateway/common/DutyBridge.h"
 #include "gateway/common/HttpServer.h"
+#include "gateway/common/PgHistoryStore.h"
 #include "gateway/common/PgUserStore.h"
 #include "gateway/common/ProcessShell.h"
 #include "gateway/common/WorkPool.h"
@@ -16,7 +17,8 @@
 
 // GatewayFront - oe-gateway's public side as the process shell runs it (FrontWork): the REST listener
 // (GATEWAY_HTTP_BIND, gw-io-<n>), the password hash pool (gw-hash-<n>, demo mode), the users store pool
-// (gw-pg-auth-<n>, demo mode) and the duty bridge's completion thread (gw-done). None of them is the duty thread, and
+// (gw-pg-auth-<n>, demo mode), the history pool (gw-pg-hist-<n>, with GATEWAY_PG_URL; its own connections) and the
+// duty bridge's completion thread (gw-done). None of them is the duty thread, and
 // the duty thread waits on none of them.
 
 namespace openexchange { namespace gateway {
@@ -42,6 +44,8 @@ private:
     std::unique_ptr<PgUserStore> m_store;
     std::unique_ptr<WorkPool> m_storePool;
     std::unique_ptr<WorkPool> m_hashPool;
+    std::unique_ptr<PgHistoryStore> m_history;
+    std::unique_ptr<WorkPool> m_historyPool;
     std::unique_ptr<Authenticator> m_auth;
     std::unique_ptr<GatewayApi> m_api;
     std::unique_ptr<HttpServer> m_server;

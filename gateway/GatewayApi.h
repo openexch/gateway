@@ -15,6 +15,7 @@
 
 #include "gateway/common/Api.h"
 #include "gateway/common/Authenticator.h"
+#include "gateway/common/History.h"
 #include "gateway/common/HttpServer.h"
 #include "gateway/common/RateLimit.h"
 #include "gateway/common/SessionParts.h"
@@ -71,6 +72,8 @@ struct ApiDeps
     UserStore *store = nullptr;     // null without demo mode
     WorkPool *storePool = nullptr;  // null without demo mode
     WorkPool *hashPool = nullptr;   // null without demo mode
+    HistoryStore *history = nullptr; // null without GATEWAY_PG_URL: every history read is 503 HISTORY_UNAVAILABLE
+    WorkPool *historyPool = nullptr; // gw-pg-hist: GATEWAY_PG_HISTORY_POOL workers over its own GATEWAY_PG_QUEUE
     // Offers one command to the GATEWAY session; false when the command ring is full (nothing queued, `done` never runs).
     std::function<bool(session::Command, std::function<void(const session::Outcome &)>)> askCore;
     // The same for the TREASURY session (Deposit, Withdraw); empty when the treasury lane is off.
@@ -141,7 +144,14 @@ private:
     void moneyCommand(const Ex &ex, bool deposit);
     void ordersHistory(const Ex &ex);
     void fills(const Ex &ex);
-    void historyUnavailable(const Ex &ex, const char *route, std::initializer_list<std::string_view> params);
+    void historyPage(const Ex &ex, history::Kind kind);
+    void orderFromHistory(const Ex &ex, std::int64_t userId, std::int64_t orderId);
+    // Runs `job` on the history pool with the read's one deadline (steady clock ns, stamped now:
+    // GATEWAY_PG_STATEMENT_TIMEOUT_MS); false (and 503 HISTORY_BUSY answered) when its queue is full. A job that
+    // starts after its deadline is not run: 503 HISTORY_BUSY (its client has waited out the read's time in the queue).
+    bool runHistory(const Ex &ex, const char *route, const char *query, std::function<void(int, std::int64_t)> job);
+    ApiResponse historyUnavailable(HistoryCause cause, const char *query);
+    void countHistory(const char *query, const char *result);
 
     // ---- GatewayApi.cpp
     void registerUser(const Ex &ex);
@@ -180,6 +190,7 @@ private:
     std::atomic<std::uint64_t> m_hashBusy{ 0 };
     mutable std::mutex m_countMutex;
     std::map<std::pair<std::string, unsigned>, std::uint64_t> m_requests; // (route, status) -> count
+    std::map<std::pair<std::string, std::string>, std::uint64_t> m_historyReads; // (query, result) -> count
 };
 
 }}

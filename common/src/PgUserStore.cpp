@@ -1,12 +1,8 @@
 #include "gateway/common/PgUserStore.h"
 
-#include <poll.h>
-
 #include <chrono>
 #include <cstring>
 #include <map>
-
-#include <libpq-fe.h>
 
 #include "gateway/common/Crypto.h"
 #include "gateway/common/FrontLog.h"
@@ -18,24 +14,9 @@ namespace {
 // pg_advisory_lock key of the migration step: the eight bytes "gwschema" as a big-endian int64
 constexpr const char *MIGRATION_LOCK_KEY = "7455554578925579617";
 
-std::int64_t nowNs()
-{
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
-
-struct ResultDeleter
-{
-    void operator()(PGresult *r) const noexcept { PQclear(r); }
-};
-using Result = std::unique_ptr<PGresult, ResultDeleter>;
-
-enum class Exec : std::uint8_t
-{
-    OK,
-    UNIQUE,     // SQLSTATE 23505
-    FAILED      // any other error, a lost connection or the deadline
-};
+using pg::Exec;
+using pg::nowNs;
+using pg::Result;
 
 std::string unhex(const char *text)
 {
@@ -50,171 +31,6 @@ std::string unhex(const char *text)
 }
 
 }
-
-class PgUserStore::Conn
-{
-public:
-    ~Conn() { close(); }
-
-    void close()
-    {
-        if (nullptr != pg)
-        {
-            PQfinish(pg);
-            pg = nullptr;
-        }
-    }
-
-    bool ok() const { return nullptr != pg && CONNECTION_OK == PQstatus(pg); }
-
-    // Waits until the socket is readable (or writable) or the deadline passes.
-    bool waitSocket(bool forWrite, std::int64_t deadlineNs)
-    {
-        const std::int64_t left = deadlineNs - nowNs();
-        if (left <= 0)
-        {
-            return false;
-        }
-        pollfd p{};
-        p.fd = PQsocket(pg);
-        p.events = forWrite ? POLLOUT : POLLIN;
-        const int ms = static_cast<int>((left + 999'999) / 1'000'000);
-        const int r = ::poll(&p, 1, ms);
-        return r > 0;
-    }
-
-    bool connect(const std::string &url, std::int64_t timeoutMs, std::string &error)
-    {
-        close();
-        const std::int64_t deadline = nowNs() + timeoutMs * 1'000'000LL;
-        const char *keys[] = { "dbname", nullptr };
-        const char *values[] = { url.c_str(), nullptr };
-        pg = PQconnectStartParams(keys, values, 1);
-        if (nullptr == pg || CONNECTION_BAD == PQstatus(pg))
-        {
-            error = nullptr == pg ? "out of memory" : PQerrorMessage(pg);
-            close();
-            return false;
-        }
-        PostgresPollingStatusType st = PGRES_POLLING_WRITING;
-        while (PGRES_POLLING_OK != st)
-        {
-            if (PGRES_POLLING_FAILED == st)
-            {
-                error = PQerrorMessage(pg);
-                close();
-                return false;
-            }
-            if (!waitSocket(PGRES_POLLING_WRITING == st, deadline))
-            {
-                error = "connect deadline (" + std::to_string(timeoutMs) + " ms) passed";
-                close();
-                return false;
-            }
-            st = PQconnectPoll(pg);
-        }
-        if (0 != PQsetnonblocking(pg, 1))
-        {
-            error = PQerrorMessage(pg);
-            close();
-            return false;
-        }
-        Result r;
-        std::string why;
-        if (Exec::OK != exec("SET statement_timeout = " + std::to_string(timeoutMs), {}, timeoutMs, r, why, false))
-        {
-            error = "SET statement_timeout: " + why;
-            close();
-            return false;
-        }
-        return true;
-    }
-
-    // One statement with text parameters (or, `simple`, a script of statements without parameters). The last result
-    // is kept in `out`; any error result makes the call fail with its message.
-    Exec exec(const std::string &sql, const std::vector<std::string> &params, std::int64_t timeoutMs, Result &out,
-        std::string &error, bool simple)
-    {
-        const std::int64_t deadline = nowNs() + timeoutMs * 1'000'000LL;
-        std::vector<const char *> values;
-        for (const std::string &p : params)
-        {
-            values.push_back(p.c_str());
-        }
-        const int sent = simple ? PQsendQuery(pg, sql.c_str())
-                                : PQsendQueryParams(pg, sql.c_str(), static_cast<int>(values.size()), nullptr,
-                                      values.data(), nullptr, nullptr, 0);
-        if (1 != sent)
-        {
-            error = PQerrorMessage(pg);
-            return Exec::FAILED;
-        }
-        for (;;)
-        {
-            const int f = PQflush(pg);
-            if (0 == f)
-            {
-                break;
-            }
-            if (f < 0 || !waitSocket(true, deadline))
-            {
-                error = f < 0 ? PQerrorMessage(pg) : "statement deadline passed while sending";
-                close();
-                return Exec::FAILED;
-            }
-        }
-        Exec verdict = Exec::OK;
-        out.reset();
-        for (;;)
-        {
-            while (PQisBusy(pg))
-            {
-                if (!waitSocket(false, deadline))
-                {
-                    error = "statement deadline (" + std::to_string(timeoutMs) + " ms) passed";
-                    close(); // the server's statement_timeout ends the statement on its side
-                    return Exec::FAILED;
-                }
-                if (1 != PQconsumeInput(pg))
-                {
-                    error = PQerrorMessage(pg);
-                    close();
-                    return Exec::FAILED;
-                }
-            }
-            PGresult *raw = PQgetResult(pg);
-            if (nullptr == raw)
-            {
-                break;
-            }
-            Result r(raw);
-            const ExecStatusType st = PQresultStatus(raw);
-            if (PGRES_FATAL_ERROR == st || PGRES_BAD_RESPONSE == st || PGRES_NONFATAL_ERROR == st)
-            {
-                if (Exec::OK == verdict)
-                {
-                    const char *state = PQresultErrorField(raw, PG_DIAG_SQLSTATE);
-                    verdict = nullptr != state && 0 == std::strcmp(state, "23505") ? Exec::UNIQUE : Exec::FAILED;
-                    error = PQresultErrorMessage(raw);
-                    while (!error.empty() && ('\n' == error.back() || ' ' == error.back()))
-                    {
-                        error.pop_back();
-                    }
-                }
-            }
-            out = std::move(r);
-        }
-        if (!ok())
-        {
-            close();
-            return Exec::FAILED;
-        }
-        return verdict;
-    }
-
-    PGconn *pg = nullptr;
-    bool counted = false;
-};
 
 const char *nameOf(StoreStatus s) noexcept
 {
@@ -233,7 +49,7 @@ PgUserStore::PgUserStore(PgSettings settings, std::vector<Migration> migrations)
 {
     for (int i = 0; i < m_settings.workers; ++i)
     {
-        m_conns.push_back(std::make_unique<Conn>());
+        m_conns.push_back(std::make_unique<PgConn>());
     }
 }
 
@@ -250,24 +66,20 @@ void PgUserStore::note(const char *what, const std::string &detail)
             m_state = std::string(what) + ": " + detail;
         }
     }
-    const std::int64_t now = nowNs();
-    std::int64_t last = m_lastWarnNs.load(std::memory_order_acquire);
-    if ((0 == last || now - last >= m_settings.retryMs * 1'000'000) &&
-        m_lastWarnNs.compare_exchange_strong(last, now, std::memory_order_acq_rel))
+    std::uint64_t held = 0;
+    if (!m_warns.take(m_settings.retryMs * 1'000'000, held))
     {
-        const std::uint64_t held = m_warnsHeld.exchange(0, std::memory_order_acq_rel);
-        if (0 == held)
-        {
-            frontLog(FrontLevel::WARN, "users store: %s: %s", what, detail.c_str());
-        }
-        else
-        {
-            frontLog(FrontLevel::WARN, "users store: %s: %s (%llu similar lines held back)", what, detail.c_str(),
-                static_cast<unsigned long long>(held));
-        }
         return;
     }
-    m_warnsHeld.fetch_add(1, std::memory_order_relaxed);
+    if (0 == held)
+    {
+        frontLog(FrontLevel::WARN, "users store: %s: %s", what, detail.c_str());
+    }
+    else
+    {
+        frontLog(FrontLevel::WARN, "users store: %s: %s (%llu similar lines held back)", what, detail.c_str(),
+            static_cast<unsigned long long>(held));
+    }
 }
 
 std::string PgUserStore::state() const
@@ -276,13 +88,13 @@ std::string PgUserStore::state() const
     return m_state;
 }
 
-PgUserStore::Conn *PgUserStore::ready(int worker)
+PgConn *PgUserStore::ready(int worker)
 {
     if (m_mismatch.load(std::memory_order_acquire) || worker < 0 || worker >= static_cast<int>(m_conns.size()))
     {
         return nullptr;
     }
-    Conn &c = *m_conns[static_cast<std::size_t>(worker)];
+    PgConn &c = *m_conns[static_cast<std::size_t>(worker)];
     if (!c.ok())
     {
         if (c.counted)
@@ -318,7 +130,7 @@ PgUserStore::Conn *PgUserStore::ready(int worker)
     const std::int64_t t = m_settings.statementTimeoutMs;
     Result r;
     std::string error;
-    auto fail = [&](const char *what) -> Conn * {
+    auto fail = [&](const char *what) -> PgConn * {
         note(what, error);
         if (c.ok() && m_settings.migrate)
         {
@@ -430,7 +242,7 @@ PgUserStore::Conn *PgUserStore::ready(int worker)
 
 StoreStatus PgUserStore::reserveUserId(int worker, const std::string &username, std::int64_t &userId)
 {
-    Conn *c = ready(worker);
+    PgConn *c = ready(worker);
     if (nullptr == c)
     {
         return StoreStatus::UNAVAILABLE;
@@ -455,7 +267,7 @@ StoreStatus PgUserStore::reserveUserId(int worker, const std::string &username, 
 StoreStatus PgUserStore::insertUser(int worker, std::int64_t userId, const std::string &username,
     const std::string &passwordHash, const std::string &tokenHash)
 {
-    Conn *c = ready(worker);
+    PgConn *c = ready(worker);
     if (nullptr == c)
     {
         return StoreStatus::UNAVAILABLE;
@@ -499,7 +311,7 @@ void readUser(PGresult *r, StoredUser &out)
 
 StoreStatus PgUserStore::findByUsername(int worker, const std::string &username, StoredUser &out)
 {
-    Conn *c = ready(worker);
+    PgConn *c = ready(worker);
     if (nullptr == c)
     {
         return StoreStatus::UNAVAILABLE;
@@ -523,7 +335,7 @@ StoreStatus PgUserStore::findByUsername(int worker, const std::string &username,
 
 StoreStatus PgUserStore::findByToken(int worker, const std::string &tokenHash, StoredUser &out)
 {
-    Conn *c = ready(worker);
+    PgConn *c = ready(worker);
     if (nullptr == c)
     {
         return StoreStatus::UNAVAILABLE;
@@ -547,7 +359,7 @@ StoreStatus PgUserStore::findByToken(int worker, const std::string &tokenHash, S
 
 StoreStatus PgUserStore::setToken(int worker, std::int64_t userId, const std::string &tokenHash)
 {
-    Conn *c = ready(worker);
+    PgConn *c = ready(worker);
     if (nullptr == c)
     {
         return StoreStatus::UNAVAILABLE;
@@ -570,7 +382,7 @@ StoreStatus PgUserStore::setToken(int worker, std::int64_t userId, const std::st
 
 StoreStatus PgUserStore::clearToken(int worker, std::int64_t userId, const std::string &tokenHash)
 {
-    Conn *c = ready(worker);
+    PgConn *c = ready(worker);
     if (nullptr == c)
     {
         return StoreStatus::UNAVAILABLE;

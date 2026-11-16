@@ -20,6 +20,7 @@
 #include "Check.h"
 #include "HttpClient.h"
 #include "MemoryStore.h"
+#include "StubHistory.h"
 #include "gateway/common/HttpServer.h"
 #include "gateway/common/Rest.h"
 #include "GatewayApi.h"
@@ -28,6 +29,7 @@ using namespace openexchange::gateway;
 using gwtest::httpCall;
 using gwtest::HttpResult;
 using gwtest::MemoryStore;
+using gwtest::StubHistory;
 namespace json = boost::json;
 namespace money = wire::money;
 
@@ -283,6 +285,10 @@ struct Rig
     std::unique_ptr<WorkPool> storePool;
     std::unique_ptr<WorkPool> hashPool;
     std::unique_ptr<WorkPool> corePool;
+    StubHistory *history = nullptr; // set before start(): history reads through this store
+    int historyThreads = 2;
+    std::size_t historyQueue = 64;
+    std::unique_ptr<WorkPool> historyPool;
     std::unique_ptr<Authenticator> auth;
     std::unique_ptr<GatewayApi> api;
     std::unique_ptr<HttpServer> server;
@@ -332,6 +338,12 @@ struct Rig
         d.store = &store;
         d.storePool = storePool.get();
         d.hashPool = hashPool.get();
+        if (nullptr != history)
+        {
+            historyPool = std::make_unique<WorkPool>("gw-pg-hist", historyThreads, historyQueue);
+            d.history = history;
+            d.historyPool = historyPool.get();
+        }
         auto asker = [this](session::Command c, std::function<void(const session::Outcome &)> done) {
             if (ringFull.load())
             {
@@ -359,6 +371,10 @@ struct Rig
         storePool->start();
         hashPool->start();
         corePool->start();
+        if (historyPool)
+        {
+            historyPool->start();
+        }
         server->start();
         port = server->boundPort();
     }
@@ -367,7 +383,15 @@ struct Rig
     {
         if (server)
         {
+            if (nullptr != history)
+            {
+                history->hold(false);
+            }
             server->stop(5000);
+            if (historyPool)
+            {
+                historyPool->stop(5000);
+            }
             corePool->stop(5000);
             hashPool->stop(5000);
             storePool->stop(5000);
@@ -1111,4 +1135,289 @@ TEST(routes_treasury_504_names_faucet_rate)
     const HttpResult r = rig.call("POST", "/api/v2/balances/deposit", R"({"assetId":"2","amount":"1"})", as(7, KEY_A));
     CHECK_MSG(504 == r.status && str(body(r), "code") == "OUTCOME_UNKNOWN" &&
             str(body(r), "detail").find("GATEWAY_FAUCET_RATE") != std::string::npos, what(r));
+}
+
+// ---------------------------------------------------------------- history (the read layer over a stub store)
+
+namespace {
+
+const std::string HISTORY_ORDER = R"({"orderId":"900","clientOrderId":null,"marketId":"1","side":"BUY","type":"LIMIT",)"
+    R"("timeInForce":"GTC","price":"100","stopPrice":null,"quantity":"1","filledQuantity":"1","remainingQuantity":"0",)"
+    R"("status":"FILLED","reason":null,"meReason":null,"meOrderId":"55","hold":{"assetId":"2","amount":"100",)"
+    R"("remaining":"0"},"createdAt":1800000000000,"updatedAt":1800000000500})";
+
+std::string cursorFor(history::Kind kind, const history::Filter &f = {})
+{
+    return history::encodeCursor(kind, f, history::Key{ 1'800'000'000'000, 900, 901 });
+}
+
+bool waitFor(const std::function<bool()> &done, int ms = 5000)
+{
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    while (!done() && std::chrono::steady_clock::now() < until)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return done();
+}
+
+}
+
+TEST(routes_history_validation)
+{
+    StubHistory stub;
+    Rig rig;
+    rig.g.historyLimitMax = 50;
+    rig.history = &stub;
+    rig.start();
+    history::Filter market1;
+    market1.marketId = 1;
+    const std::vector<std::pair<std::string, std::string>> bad = {
+        { "/api/v2/orders/history?limit=0", "limit" },
+        { "/api/v2/orders/history?limit=51", "limit" },          // above GATEWAY_HISTORY_LIMIT_MAX: 400, never clamped
+        { "/api/v2/orders/history?limit=abc", "limit" },
+        { "/api/v2/orders/history?limit=-1", "limit" },
+        { "/api/v2/orders/history?limit=", "limit" },
+        { "/api/v2/orders/history?marketId=0", "marketId" },
+        { "/api/v2/orders/history?status=OPEN", "status" },
+        { "/api/v2/orders/history?orderId=5", "orderId" },        // fills only
+        { "/api/v2/fills?status=FILLED", "status" },              // orders only
+        { "/api/v2/fills?orderId=x", "orderId" },
+        { "/api/v2/orders/history?offset=10", "offset" },         // the old paging is refused, never ignored
+        { "/api/v2/orders/history?userId=8", "userId" },
+        { "/api/v2/orders/history?cursor=", "cursor" },
+        { "/api/v2/orders/history?cursor=%%%", "escape" },
+        { "/api/v2/orders/history?cursor=bm90LWEtY3Vyc29y", "cursor" },                      // "not-a-cursor"
+        { "/api/v2/orders/history?cursor=" + cursorFor(history::Kind::FILLS), "another route" },
+        { "/api/v2/fills?cursor=" + cursorFor(history::Kind::ORDERS), "another route" },
+        { "/api/v2/orders/history?cursor=" + cursorFor(history::Kind::ORDERS, market1), "another filter" },
+        { "/api/v2/orders/history?marketId=2&cursor=" + cursorFor(history::Kind::ORDERS, market1), "another filter" },
+    };
+    for (const auto &[target, why] : bad)
+    {
+        const HttpResult r = rig.call("GET", target, "", as(7));
+        CHECK_MSG(400 == r.status && str(body(r), "code") == "VALIDATION", target + " (" + why + "): " + what(r));
+    }
+    CHECK_MSG(0 == stub.calls.load(), "a refused request reached the store");
+    // the same cursor with its own filter is accepted
+    const HttpResult ok = rig.call("GET", "/api/v2/orders/history?marketId=1&cursor=" +
+        cursorFor(history::Kind::ORDERS, market1), "", as(7));
+    CHECK_MSG(200 == ok.status, what(ok));
+    CHECK(401 == rig.call("GET", "/api/v2/orders/history").status);
+}
+
+TEST(routes_history_pages)
+{
+    StubHistory stub;
+    stub.canned.items = { HISTORY_ORDER };
+    stub.canned.nextCursor = "next-page";
+    stub.canned.ageMs = 1234;
+    Rig rig;
+    rig.history = &stub;
+    rig.start();
+    HttpResult r = rig.call("GET", "/api/v2/orders/history", "", as(7));
+    json::object b = body(r);
+    CHECK_MSG(200 == r.status && str(b, "nextCursor") == "next-page" && b.at("items").as_array().size() == 1 &&
+            str(b.at("asOf").as_object(), "ageMs") == "1234" &&
+            str(b.at("items").as_array().at(0).as_object(), "status") == "FILLED", what(r));
+    r = rig.call("GET", "/api/v2/orders/history?limit=7&marketId=1&status=CANCELLED", "", as(8));
+    CHECK_MSG(200 == r.status, what(r));
+    stub.canned.nextCursor.reset();
+    stub.canned.items.clear();
+    r = rig.call("GET", "/api/v2/fills?limit=1000&orderId=900", "", as(9));
+    CHECK_MSG(200 == r.status && r.body == R"({"items":[],"nextCursor":null,"asOf":{"ageMs":1234}})", what(r));
+    std::lock_guard<std::mutex> l(stub.mutex);
+    CHECK(stub.requests.size() == 3);
+    if (stub.requests.size() == 3)
+    {
+        const auto &a = stub.requests[0];
+        CHECK(history::Kind::ORDERS == a.kind && 7 == a.userId && 100 == a.limit && !a.after && 0 == a.filter.marketId);
+        const auto &c = stub.requests[1];
+        CHECK(8 == c.userId && 7 == c.limit && 1 == c.filter.marketId && "CANCELLED" == c.filter.status);
+        const auto &f = stub.requests[2];
+        CHECK(history::Kind::FILLS == f.kind && 9 == f.userId && 1000 == f.limit && 900 == f.filter.orderId);
+    }
+}
+
+TEST(routes_history_unavailable_and_busy)
+{
+    {
+        Rig rig; // no GATEWAY_PG_URL: no store
+        rig.start();
+        for (const char *target : { "/api/v2/orders/history", "/api/v2/fills" })
+        {
+            HttpResult r = rig.call("GET", target, "", as(7));
+            CHECK_MSG(503 == r.status && str(body(r), "code") == "HISTORY_UNAVAILABLE" && r.headers["retry-after"] == "60",
+                what(r));
+        }
+        CHECK(rig.api->metrics("gw_").find("history_reads_total{query=\"fills\",result=\"unavailable\",cause=\"unconfigured\"} 1") != std::string::npos);
+    }
+    StubHistory stub;
+    Rig rig;
+    rig.g.historyRetryAfterMs = 30'000;
+    rig.historyThreads = 1;
+    rig.historyQueue = 1;
+    rig.history = &stub;
+    rig.start();
+    // every cause is one public body; the cause is in the metrics
+    std::string first;
+    for (HistoryCause cause : { HistoryCause::ABSENT, HistoryCause::UNREACHABLE, HistoryCause::TIMEOUT,
+             HistoryCause::NO_HEARTBEAT })
+    {
+        stub.answer = HistoryAnswer{ HistoryStatus::UNAVAILABLE, cause };
+        HttpResult r = rig.call("GET", "/api/v2/fills", "", as(7));
+        CHECK_MSG(503 == r.status && str(body(r), "code") == "HISTORY_UNAVAILABLE" && r.headers["retry-after"] == "30",
+            what(r));
+        first = first.empty() ? r.body : first;
+        CHECK_MSG(r.body == first, std::string("the body names the cause ") + nameOf(cause) + ": " + r.body);
+    }
+    const std::string m = rig.api->metrics("gw_");
+    for (const char *cause : { "absent", "unreachable", "timeout", "no_heartbeat" })
+    {
+        CHECK_MSG(m.find("history_reads_total{query=\"fills\",result=\"unavailable\",cause=\"" + std::string(cause) +
+            "\"} 1") != std::string::npos, std::string("no metric for ") + cause);
+    }
+    // one worker, a queue of one: the third concurrent read is 503 HISTORY_BUSY at once
+    stub.answer = HistoryAnswer{ HistoryStatus::OK, HistoryCause::NONE };
+    stub.hold(true);
+    std::vector<std::thread> readers;
+    std::vector<HttpResult> results(2);
+    for (int i = 0; i < 2; ++i)
+    {
+        readers.emplace_back([&rig, &results, i] { results[i] = rig.call("GET", "/api/v2/orders/history", "", as(7)); });
+        if (0 == i)
+        {
+            CHECK(waitFor([&stub] { return 1 == stub.waiting.load(); }));
+        }
+    }
+    CHECK(waitFor([&rig] { return 1 == rig.historyPool->queued(); }));
+    const HttpResult busy = rig.call("GET", "/api/v2/orders/history", "", as(7));
+    CHECK_MSG(503 == busy.status && str(body(busy), "code") == "HISTORY_BUSY" && busy.headers.count("retry-after") &&
+            busy.ms < 1000, what(busy));
+    // the order path never waits on history
+    const HttpResult order = rig.call("POST", "/api/v2/orders", LIMIT_BUY, as(7, KEY_A));
+    CHECK_MSG(201 == order.status, what(order));
+    stub.hold(false);
+    for (std::thread &t : readers)
+    {
+        t.join();
+    }
+    CHECK_MSG(200 == results[0].status && 200 == results[1].status, what(results[0]) + " / " + what(results[1]));
+    const std::string m2 = rig.api->metrics("gw_");
+    CHECK(m2.find("gw_pg_history_refused_total 1") != std::string::npos);
+    CHECK(m2.find("history_reads_total{query=\"orders\",result=\"busy\",cause=\"none\"} 1") != std::string::npos);
+}
+
+TEST(routes_history_queued_past_its_deadline_is_busy)
+{
+    StubHistory stub;
+    Rig rig;
+    rig.g.pgStatementTimeoutMs = 200; // one history read's deadline, queue wait included
+    rig.historyThreads = 1;
+    rig.historyQueue = 4;
+    rig.history = &stub;
+    rig.start();
+    stub.hold(true);
+    HttpResult first;
+    HttpResult second;
+    std::thread one([&] { first = rig.call("GET", "/api/v2/orders/history", "", as(7)); });
+    CHECK(waitFor([&stub] { return 1 == stub.waiting.load(); }));
+    std::thread two([&] { second = rig.call("GET", "/api/v2/fills", "", as(7)); });
+    CHECK(waitFor([&rig] { return 1 == rig.historyPool->queued(); }));
+    std::this_thread::sleep_for(std::chrono::milliseconds(400)); // past the queued read's deadline
+    stub.hold(false);
+    one.join();
+    two.join();
+    CHECK_MSG(200 == first.status, what(first)); // it started inside its deadline
+    // the client of the queued read has waited out its deadline: 503 HISTORY_BUSY, the store is never asked
+    CHECK_MSG(503 == second.status && str(body(second), "code") == "HISTORY_BUSY" && second.headers.count("retry-after"),
+        what(second));
+    CHECK_MSG(1 == stub.calls.load(), "store calls: " + std::to_string(stub.calls.load()));
+    CHECK(rig.api->metrics("gw_").find("history_reads_total{query=\"fills\",result=\"busy\",cause=\"expired\"} 1") !=
+        std::string::npos);
+}
+
+TEST(routes_order_from_history)
+{
+    StubHistory stub;
+    Rig rig;
+    rig.history = &stub;
+    rig.start();
+    HttpResult r = rig.call("POST", "/api/v2/orders", LIMIT_BUY, as(7, KEY_A));
+    const std::string open = str(body(r), "orderId");
+    {
+        std::lock_guard<std::mutex> l(rig.core.mutex);
+        FakeCore::Order closed;
+        closed.userId = 7;
+        closed.open = false;
+        rig.core.orders[900] = closed;
+        FakeCore::Order foreign;
+        foreign.userId = 8;
+        foreign.open = false;
+        rig.core.orders[901] = foreign;
+    }
+    stub.orders[{ 7, 900 }] = HISTORY_ORDER;
+    stub.orders[{ 8, 901 }] = HISTORY_ORDER;
+    // open: the core answers, history is not asked
+    r = rig.call("GET", "/api/v2/orders/" + open, "", as(7));
+    CHECK_MSG(200 == r.status && str(body(r), "orderId") == open && 0 == stub.calls.load(), what(r));
+    // not open: the caller's row in history
+    r = rig.call("GET", "/api/v2/orders/900", "", as(7));
+    CHECK_MSG(200 == r.status && r.body == HISTORY_ORDER, what(r));
+    // another user's closed order, another user's open order, an unknown id: one 404 body for all three
+    const HttpResult foreign = rig.call("GET", "/api/v2/orders/901", "", as(7));
+    const HttpResult foreignOpen = rig.call("GET", "/api/v2/orders/" + open, "", as(8));
+    const HttpResult unknown = rig.call("GET", "/api/v2/orders/424242", "", as(7));
+    CHECK_MSG(404 == unknown.status && str(body(unknown), "code") == "NOT_FOUND", what(unknown));
+    CHECK_MSG(foreign.status == unknown.status && foreign.body == unknown.body, what(foreign) + " vs " + what(unknown));
+    CHECK_MSG(foreignOpen.status == unknown.status && foreignOpen.body == unknown.body, what(foreignOpen));
+    // history down: today's 503 HISTORY_UNAVAILABLE with the history Retry-After
+    stub.answer = HistoryAnswer{ HistoryStatus::UNAVAILABLE, HistoryCause::UNREACHABLE };
+    r = rig.call("GET", "/api/v2/orders/900", "", as(7));
+    CHECK_MSG(503 == r.status && str(body(r), "code") == "HISTORY_UNAVAILABLE" && r.headers["retry-after"] == "60",
+        what(r));
+    const std::string downBody = r.body;
+    // not projected yet (above applied_order_id): the same body, the short Retry-After, never 404
+    stub.answer = HistoryAnswer{ HistoryStatus::UNAVAILABLE, HistoryCause::LAGGING };
+    r = rig.call("GET", "/api/v2/orders/902", "", as(7));
+    CHECK_MSG(503 == r.status && r.body == downBody && r.headers["retry-after"] == "1", what(r));
+    CHECK(rig.api->metrics("gw_").find("history_reads_total{query=\"order\",result=\"unavailable\",cause=\"lagging\"} 1") !=
+        std::string::npos);
+    // every store call carried one deadline, GATEWAY_PG_STATEMENT_TIMEOUT_MS (2000) from when it was queued
+    {
+        std::lock_guard<std::mutex> l(stub.mutex);
+        const std::int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        for (const std::int64_t d : stub.deadlines)
+        {
+            CHECK_MSG(d > now - 2'000'000'000LL && d <= now + 2'000'000'000LL, "deadline " + std::to_string(d - now));
+        }
+        CHECK(!stub.deadlines.empty());
+    }
+}
+
+TEST(routes_history_never_blocks_the_core_completion)
+{
+    StubHistory stub;
+    Rig rig;
+    rig.history = &stub;
+    rig.start();
+    {
+        std::lock_guard<std::mutex> l(rig.core.mutex);
+        FakeCore::Order closed;
+        closed.userId = 7;
+        closed.open = false;
+        rig.core.orders[900] = closed;
+    }
+    stub.orders[{ 7, 900 }] = HISTORY_ORDER;
+    stub.hold(true);
+    HttpResult held;
+    std::thread reader([&] { held = rig.call("GET", "/api/v2/orders/900", "", as(7)); });
+    CHECK(waitFor([&stub] { return 1 == stub.waiting.load(); }));
+    // the core's completion thread (one thread in this rig) handed the lookup over and is free: an order still goes
+    const HttpResult order = rig.call("POST", "/api/v2/orders", LIMIT_BUY, as(7, KEY_A));
+    CHECK_MSG(201 == order.status && order.ms < 1000, "core completion blocked by a history read: " + what(order));
+    stub.hold(false);
+    reader.join();
+    CHECK_MSG(200 == held.status, what(held));
 }

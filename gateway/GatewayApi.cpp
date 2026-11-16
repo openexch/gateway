@@ -687,6 +687,14 @@ std::string GatewayApi::healthJson() const
             std::to_string(m_deps.storePool->queued());
     }
     out += ",\"userIdConflicts\":" + std::to_string(userIdConflicts()) + "}";
+    out += ",\"history\":{\"state\":" + api::quote(nullptr == m_deps.history ? std::string("off (no GATEWAY_PG_URL)")
+        : m_deps.history->state());
+    if (nullptr != m_deps.historyPool)
+    {
+        out += ",\"queue\":" + std::to_string(m_deps.historyPool->queued()) + ",\"queueCapacity\":" +
+            std::to_string(m_deps.historyPool->capacity());
+    }
+    out += "}";
     return out;
 }
 
@@ -724,6 +732,28 @@ std::string GatewayApi::metrics(const std::string &p) const
         out += "# HELP " + p + "pg_auth_refused_total Users store calls refused because the queue was full.\n"
             "# TYPE " + p + "pg_auth_refused_total counter\n" + p + "pg_auth_refused_total " +
             std::to_string(m_deps.storePool->refused()) + "\n";
+    }
+    out += "# HELP " + p + "history_reads_total History reads by query (orders, fills, order), result (ok, not_found, "
+        "busy, unavailable) and the cause (busy: none for a full queue, expired for a read that waited past its "
+        "deadline; unavailable: unconfigured, absent, unreachable, timeout, no_heartbeat, bad_row, error, lagging).\n# TYPE " + p + "history_reads_total counter\n";
+    {
+        std::lock_guard<std::mutex> lock(m_countMutex);
+        for (const auto &[key, n] : m_historyReads)
+        {
+            const std::size_t bar = key.second.find('|');
+            const std::string result = key.second.substr(0, bar);
+            const std::string cause = std::string::npos == bar ? "none" : key.second.substr(bar + 1);
+            out += p + "history_reads_total{query=\"" + key.first + "\",result=\"" + result + "\",cause=\"" + cause +
+                "\"} " + std::to_string(n) + "\n";
+        }
+    }
+    if (nullptr != m_deps.historyPool)
+    {
+        out += "# HELP " + p + "pg_history_queue History reads waiting for a history connection.\n# TYPE " + p +
+            "pg_history_queue gauge\n" + p + "pg_history_queue " + std::to_string(m_deps.historyPool->queued()) + "\n";
+        out += "# HELP " + p + "pg_history_refused_total History reads refused because the queue was full (503 "
+            "HISTORY_BUSY).\n# TYPE " + p + "pg_history_refused_total counter\n" + p + "pg_history_refused_total " +
+            std::to_string(m_deps.historyPool->refused()) + "\n";
     }
     out += "# HELP " + p + "token_lookup_refused_total Bearer tokens the cache did not hold, refused before the users "
         "store was asked (per-source lookup budget or the lookup share of the store queue).\n# TYPE " + p +

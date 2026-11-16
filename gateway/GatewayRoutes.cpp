@@ -7,15 +7,30 @@
 //                                          global)
 //   POST   /api/v2/orders                  Idempotency-Key required: CreateOrder; 201 (duplicate false) or 200
 //   GET    /api/v2/orders?marketId=        the caller's open orders, every page of RequestOrderSnapshot joined
-//   GET    /api/v2/orders/{orderId}        the open order (one snapshot page from orderId); a closed or unknown order is
-//                                          503 HISTORY_UNAVAILABLE until the history read layer exists
+//   GET    /api/v2/orders/{orderId}        the open order (one snapshot page from orderId); an order the core does not
+//                                          hold open is the caller's row in history (gateway_order_history_v1), else
+//                                          404 NOT_FOUND (unknown and another user's order: one answer)
 //   PUT    /api/v2/orders/{orderId}        Idempotency-Key required: AmendOrder {price?, quantity?}
 //   DELETE /api/v2/orders/{orderId}        Idempotency-Key optional: CancelOrder (the re-offer rule below)
 //   POST   /api/v2/orders/cancel           {orderIds:[...]} or {all:true, marketId?}: unkeyed cancels, at most
 //                                          GATEWAY_BULK_CANCEL_MAX per request (truncated, remaining)
 //   GET    /api/v2/balances                RequestUserBalances joined with the config's asset list (zero included)
 //   POST   /api/v2/balances/deposit, /withdraw   the treasury lane: 404 FEATURE_DISABLED when it is off
-//   GET    /api/v2/orders/history, /api/v2/fills  503 HISTORY_UNAVAILABLE (the history read layer is a later slice)
+//   GET    /api/v2/orders/history?limit&cursor&marketId&status   the caller's orders in history, newest first
+//   GET    /api/v2/fills?limit&cursor&marketId&orderId           the caller's fills in history, newest first
+//          200 {items, nextCursor, asOf:{ageMs}}; keyset pages (History.h), limit GATEWAY_HISTORY_LIMIT_DEFAULT, above
+//          GATEWAY_HISTORY_LIMIT_MAX 400; a cursor of another route or filter, or a malformed one, 400 VALIDATION
+//
+// History reads run on the history pool (gw-pg-hist, GATEWAY_PG_HISTORY_POOL connections of their own over a queue of
+// GATEWAY_PG_QUEUE): a full queue is 503 HISTORY_BUSY (Retry-After GATEWAY_HISTORY_BUSY_RETRY_AFTER_MS). One read has
+// one deadline, GATEWAY_PG_STATEMENT_TIMEOUT_MS from the moment it is queued, queue wait included: a read still queued
+// when it passes is 503 HISTORY_BUSY, and connect, heartbeat and rows spend only what is left of it. No
+// GATEWAY_PG_URL, a missing relation, a projection that never reported, an unreachable server or a statement timeout is
+// 503 HISTORY_UNAVAILABLE (Retry-After GATEWAY_HISTORY_RETRY_AFTER_MS), one body for every cause (the cause is in the
+// log and in gateway_history_reads_total). GET /orders/{orderId} of an order not open in the core, without a row and
+// above the projection's applied_order_id, is the same 503 with Retry-After GATEWAY_HISTORY_LAG_RETRY_AFTER_MS (not
+// projected yet), never 404. A history read takes one token of the principal's bucket. No order-path request touches
+// PostgreSQL, and no history query runs on an I/O thread, the duty thread or the completion thread.
 //
 // Every core-backed route of a principal takes one token of the principal's bucket (GATEWAY_PRINCIPAL_RATE + _BURST;
 // a bulk cancel one per order id plus one, never more than one full bucket); empty: 429 RATE_LIMITED with Retry-After.
@@ -50,6 +65,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <charconv>
+#include <chrono>
 #include <cstring>
 #include <set>
 
@@ -739,7 +755,8 @@ void GatewayApi::getOrder(const Ex &ex, std::int64_t orderId)
         wire::RequestOrderSnapshot q;
         q.userId = p.userId;
         q.fromOrderId = orderId - 1; // the page starts at orderId: one query finds an open order
-        ask(ex, route, false, session::Command{ q }, [this, ex, orderId](const session::Outcome &o) {
+        const std::int64_t userId = p.userId;
+        ask(ex, route, false, session::Command{ q }, [this, ex, orderId, userId](const session::Outcome &o) {
             const auto *page = std::get_if<session::SnapshotReply>(&o.reply);
             if (session::OutcomeKind::REPLY != o.kind || nullptr == page)
             {
@@ -751,9 +768,8 @@ void GatewayApi::getOrder(const Ex &ex, std::int64_t orderId)
                 finish(ex, route, api::jsonBody(200, rest::orderJson(page->entries.front())));
                 return;
             }
-            // the history Retry-After: asking again soon cannot change the answer until history is served
-            finish(ex, route, unavailable503(api::code::HISTORY_UNAVAILABLE, "the order is not open",
-                "closed and unknown orders are answered from history, which this gateway does not serve yet", 60'000));
+            // not open (closed, unknown or another user's): history answers, on its own pool, never on this thread
+            orderFromHistory(ex, userId, orderId);
         });
     });
 }
@@ -1118,29 +1134,203 @@ void GatewayApi::bulkCancel(const Ex &ex)
     });
 }
 
-void GatewayApi::historyUnavailable(const Ex &ex, const char *route, std::initializer_list<std::string_view> params)
+// ---------------------------------------------------------------- history (the history projection, read-only)
+
+void GatewayApi::countHistory(const char *query, const char *result)
 {
+    std::lock_guard<std::mutex> lock(m_countMutex);
+    ++m_historyReads[{ query, result }];
+}
+
+ApiResponse GatewayApi::historyUnavailable(HistoryCause cause, const char *query)
+{
+    countHistory(query, (std::string("unavailable|") + nameOf(cause)).c_str());
+    // one public answer whatever the cause: the cause is in the log (the store's WARN line) and the metrics. Only the
+    // Retry-After differs for an order not projected yet (LAGGING): the projection is expected to reach it soon
+    return unavailable503(api::code::HISTORY_UNAVAILABLE, "history is not available",
+        "order and fill history are read from the history projection, which cannot answer now",
+        HistoryCause::LAGGING == cause ? m_s.historyLagRetryAfterMs : m_s.historyRetryAfterMs);
+}
+
+bool GatewayApi::runHistory(const Ex &ex, const char *route, const char *query,
+    std::function<void(int, std::int64_t)> job)
+{
+    const auto now = [] {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+    const std::int64_t deadlineNs = now() + m_s.pgStatementTimeoutMs * 1'000'000;
+    auto run = [this, ex, route, query, deadlineNs, now, job = std::move(job)](int worker) {
+        if (now() >= deadlineNs)
+        {
+            // its client has waited out the read's whole time in the queue: not run, the store is never asked
+            countHistory(query, "busy|expired");
+            finish(ex, route, unavailable503(api::code::HISTORY_BUSY, "too many history reads at once",
+                "the read waited in the history queue past its deadline (GATEWAY_PG_STATEMENT_TIMEOUT_MS)",
+                m_s.historyBusyRetryAfterMs));
+            return;
+        }
+        job(worker, deadlineNs);
+    };
+    if (nullptr != m_deps.historyPool && m_deps.historyPool->trySubmit(std::move(run)))
+    {
+        return true;
+    }
+    countHistory(query, "busy");
+    finish(ex, route, unavailable503(api::code::HISTORY_BUSY, "too many history reads at once",
+        "the history read queue (GATEWAY_PG_QUEUE) is full", m_s.historyBusyRetryAfterMs));
+    return false;
+}
+
+void GatewayApi::historyPage(const Ex &ex, history::Kind kind)
+{
+    const bool orders = history::Kind::ORDERS == kind;
+    const char *route = orders ? "orders_history" : "fills";
+    const char *query = orders ? "orders" : "fills";
     ApiResponse bad;
-    if (!api::readQuery(*ex, params, bad))
+    const bool known = orders ? api::readQuery(*ex, { "limit", "cursor", "marketId", "status" }, bad)
+                              : api::readQuery(*ex, { "limit", "cursor", "marketId", "orderId" }, bad);
+    if (!known)
     {
         finish(ex, route, std::move(bad));
         return;
     }
-    withPrincipal(ex, route, [this, ex, route](const Principal &) {
-        finish(ex, route, unavailable503(api::code::HISTORY_UNAVAILABLE, "history is not available",
-            "order and fill history are served from the history projection, which this gateway does not read yet",
-            60'000));
+    const auto values = api::queryValues(*ex);
+    if (!values)
+    {
+        finish(ex, route, validation("malformed query string", "a parameter value has a bad %-escape"));
+        return;
+    }
+    auto value = [&values](const char *name) -> const std::string * {
+        const auto it = values->find(name);
+        return it == values->end() ? nullptr : &it->second;
+    };
+    history::PageRequest request;
+    request.kind = kind;
+    request.limit = m_s.historyLimitDefault;
+    json::object none;
+    Fields f(none);
+    if (const std::string *v = value("limit"))
+    {
+        // above GATEWAY_HISTORY_LIMIT_MAX is refused, never clamped: a client never gets fewer rows than it asked for
+        // without being told
+        request.limit = f.idOf("limit", *v, m_s.historyLimitMax);
+    }
+    if (const std::string *v = value("marketId"))
+    {
+        request.filter.marketId = static_cast<std::int32_t>(f.idOf("marketId", *v, INT32_MAX));
+    }
+    if (const std::string *v = value("status"))
+    {
+        if (history::knownStatus(*v))
+        {
+            request.filter.status = *v;
+        }
+        else
+        {
+            f.fail("status", "must be one of NEW, PARTIALLY_FILLED, FILLED, CANCELLED, REJECTED, EXPIRED, PENDING_NEW, "
+                "PENDING_TRIGGER, PENDING_CANCEL, PENDING_REPLACE");
+        }
+    }
+    if (const std::string *v = value("orderId"))
+    {
+        request.filter.orderId = f.idOf("orderId", *v);
+    }
+    if (!f.ok())
+    {
+        finish(ex, route, f.bad());
+        return;
+    }
+    if (const std::string *v = value("cursor"))
+    {
+        history::Key key;
+        switch (history::decodeCursor(*v, kind, request.filter, key))
+        {
+            case history::CursorError::NONE:
+                request.after = key;
+                break;
+            case history::CursorError::MALFORMED:
+                finish(ex, route, validation("invalid cursor", "send the nextCursor of the previous page unchanged"));
+                return;
+            case history::CursorError::OTHER_ROUTE:
+                finish(ex, route, validation("invalid cursor", "the cursor belongs to another route"));
+                return;
+            case history::CursorError::OTHER_FILTER:
+                finish(ex, route, validation("invalid cursor",
+                    "the cursor was issued for another filter: keep marketId, status and orderId as on the first page"));
+                return;
+        }
+    }
+    withPrincipal(ex, route, [this, ex, route, query, request](const Principal &p) mutable {
+        if (nullptr == m_deps.history)
+        {
+            finish(ex, route, historyUnavailable(HistoryCause::UNCONFIGURED, query));
+            return;
+        }
+        if (!takePrincipal(ex, route, p.userId, 1))
+        {
+            return;
+        }
+        request.userId = p.userId; // always the principal's: nothing in the request can name a user
+        runHistory(ex, route, query, [this, ex, route, query, request](int worker, std::int64_t deadlineNs) {
+            HistoryPage page;
+            const HistoryAnswer a = m_deps.history->page(worker, request, page, deadlineNs);
+            if (HistoryStatus::OK != a.status)
+            {
+                finish(ex, route, historyUnavailable(a.cause, query));
+                return;
+            }
+            countHistory(query, "ok");
+            std::string out = "{\"items\":[";
+            for (std::size_t i = 0; i < page.items.size(); ++i)
+            {
+                out += (0 == i ? "" : ",") + page.items[i];
+            }
+            out += "],\"nextCursor\":" + (page.nextCursor ? api::quote(*page.nextCursor) : std::string("null")) +
+                ",\"asOf\":{\"ageMs\":" + std::to_string(page.ageMs) + "}}";
+            finish(ex, route, api::jsonBody(200, std::move(out)));
+        });
+    });
+}
+
+// GET /orders/{orderId} of an order the core does not hold open: the caller's row in history, or 404 (unknown and
+// another user's order get the same answer). Called from the core's completion: the query runs on the history pool.
+void GatewayApi::orderFromHistory(const Ex &ex, std::int64_t userId, std::int64_t orderId)
+{
+    static const char *route = "orders_get";
+    if (nullptr == m_deps.history)
+    {
+        finish(ex, route, historyUnavailable(HistoryCause::UNCONFIGURED, "order"));
+        return;
+    }
+    runHistory(ex, route, "order", [this, ex, userId, orderId](int worker, std::int64_t deadlineNs) {
+        std::string json;
+        const HistoryAnswer a = m_deps.history->order(worker, userId, orderId, json, deadlineNs);
+        switch (a.status)
+        {
+            case HistoryStatus::OK:
+                countHistory("order", "ok");
+                finish(ex, route, api::jsonBody(200, std::move(json)));
+                return;
+            case HistoryStatus::NOT_FOUND:
+                countHistory("order", "not_found");
+                finish(ex, route, api::error(404, api::code::NOT_FOUND, "not found"));
+                return;
+            case HistoryStatus::UNAVAILABLE:
+                break;
+        }
+        finish(ex, route, historyUnavailable(a.cause, "order"));
     });
 }
 
 void GatewayApi::ordersHistory(const Ex &ex)
 {
-    historyUnavailable(ex, "orders_history", { "limit", "cursor", "marketId", "status" });
+    historyPage(ex, history::Kind::ORDERS);
 }
 
 void GatewayApi::fills(const Ex &ex)
 {
-    historyUnavailable(ex, "fills", { "limit", "cursor", "marketId", "orderId" });
+    historyPage(ex, history::Kind::FILLS);
 }
 
 // ---------------------------------------------------------------- balances and the treasury lane

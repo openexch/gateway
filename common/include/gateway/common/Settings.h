@@ -163,6 +163,9 @@ struct GatewaySettings
     std::int64_t tokenLookupInflight = 0; // in force after parsing: set, or half of pgQueue (at least 1)
     std::int64_t historyLimitDefault = 100;
     std::int64_t historyLimitMax = 1000;
+    std::int64_t historyRetryAfterMs = 60'000;   // Retry-After of 503 HISTORY_UNAVAILABLE
+    std::int64_t historyBusyRetryAfterMs = 1000; // Retry-After of 503 HISTORY_BUSY
+    std::int64_t historyLagRetryAfterMs = 1000;  // Retry-After of 503 HISTORY_UNAVAILABLE: an order not projected yet
     std::vector<FaucetCap> faucetMaxAmount;
     Rate faucetRate;
 };
