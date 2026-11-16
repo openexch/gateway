@@ -386,19 +386,8 @@ def run(args, gateways):
     check(status == 200 and body["available"] == "3", "lane on: withdraw 200", raw)
     status, body, raw = http(b.public, "/api/v2/balances/withdraw", "POST", {"assetId": asset, "amount": "100"},
                              user=user, key=str(uuid.uuid4()))
-    known_core_defect = False
-    if status == 504:
-        # Core defect at the pinned commit: CoreEventPublisher.onWithdrawReject never writes the v6 `duplicate` field,
-        # so the frame carries an undefined BoolFlag byte and this gateway's decoder refuses it (bad_value duplicate).
-        # The gateway answers 504 OUTCOME_UNKNOWN (never a 2xx, never a guess); the ledger is unchanged. Not worked
-        # around here: it is the core's row to fix. Remove this branch (and the refused-frame allowance below) when the
-        # core fix is pinned; until then the treasury row is not fully green end to end for WithdrawReject.
-        known_core_defect = "template 14 WithdrawReject" in open(os.path.join(args.work, "gateway-b.log")).read()
-        print(f"KNOWN CORE DEFECT: WithdrawReject refused by the decoder (bad_value duplicate): {known_core_defect}",
-              flush=True)
-    check((status == 422 and body["reason"] == "INSUFFICIENT_FUNDS" and body["keyFinal"] is False)
-          or (status == 504 and body["code"] == "OUTCOME_UNKNOWN" and known_core_defect),
-          "lane on: a withdrawal above the balance: 422 INSUFFICIENT_FUNDS (or 504 under the known core defect)", raw)
+    check(status == 422 and body["reason"] == "INSUFFICIENT_FUNDS" and body["keyFinal"] is False,
+          "lane on: a withdrawal above the balance: 422 INSUFFICIENT_FUNDS", raw)
     status, body, raw = http(b.public, "/api/v2/balances/deposit", "POST", {"assetId": asset, "amount": "1000.1"},
                              user=user, key=str(uuid.uuid4()))
     check(status == 422 and body["code"] == "REJECTED" and "1000" in body["detail"], "lane on: above the faucet cap: 422",
@@ -415,13 +404,7 @@ def run(args, gateways):
     print(f"money-dump balances of {user}: {ledger}", flush=True)
     check(any(x.get("asset") == int(asset) and x.get("available") == 3 * FP for x in ledger),
           "lane on: the core's ledger agrees (3)", str(ledger))
-    if known_core_defect:
-        _, metrics = b.admin_get("/metrics")
-        refused = [line for line in metrics.splitlines() if line.startswith("gateway_decode_refused_total ")]
-        check(refused == ["gateway_decode_refused_total 1"],
-              "B: the only egress frame refused is the core's WithdrawReject (the known core defect)", str(refused))
-    else:
-        no_refused(b, "B")
+    no_refused(b, "B")
 
 
 if __name__ == "__main__":
