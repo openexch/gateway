@@ -33,6 +33,7 @@
 #include "cluster_tools/runtime/LogRing.h"
 
 #include "gateway/common/CoreSession.h"
+#include "gateway/common/OrderEntry.h"
 #include "gateway/common/Readiness.h"
 
 namespace cl = cluster_tools::client;
@@ -155,6 +156,7 @@ int main(int argc, char **argv)
     settings.queryBurst = std::stoll(arg(args, "--query-burst", "200"));
     settings.reconnectDelayMs = 500;
     settings.registerResendMs = 2000;
+    settings.encoder = gs::encodeCommand;
 
     rt::LogRing log;
     int exitCode = 0;

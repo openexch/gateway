@@ -311,6 +311,24 @@ public final class GoldenGateway {
                 .kind(OrderFaultKind.FEED_HALT).orderId(v(113, 0, 2)).userId(v(113, 0, 3)).marketId(i(113, 0, 4))
                 .tradeId(v(113, 0, 5)).amount(v(113, 0, 6)).logPosition(v(113, 0, 7));
         print("JAVA_ORDER_FAULT", fault.encodedLength());
+
+        // The core opens every session with all the legacy channels until its RegisterSession lands, so these
+        // CH_SETTLEMENTS broadcasts can reach a gateway before its mask applies.
+        final SettlementAppliedEncoder applied = new SettlementAppliedEncoder().wrapAndApplyHeader(BUF, 0, HEADER)
+                .tradeId(v(13, 0, 1)).buyerUserId(v(13, 0, 2)).sellerUserId(v(13, 0, 3));
+        print("JAVA_SETTLEMENT_APPLIED", applied.encodedLength());
+
+        final SettleFaultEncoder settleFault = new SettleFaultEncoder().wrapAndApplyHeader(BUF, 0, HEADER)
+                .tradeId(v(21, 0, 1)).orderId(v(21, 0, 2)).userId(v(21, 0, 3)).assetId(i(21, 0, 4))
+                .drawnFromAvailable(v(21, 0, 5)).uncovered(v(21, 0, 6));
+        print("JAVA_SETTLE_FAULT", settleFault.encodedLength());
+
+        final SettlementAppliedBatchEncoder batch = new SettlementAppliedBatchEncoder().wrapAndApplyHeader(BUF, 0, HEADER);
+        final SettlementAppliedBatchEncoder.SettlementsEncoder lines = batch.settlementsCount(2);
+        for (int e = 1; e <= 2; e++) {
+            lines.next().tradeId(v(24, e, 1)).buyerUserId(v(24, e, 2)).sellerUserId(v(24, e, 3));
+        }
+        print("JAVA_SETTLEMENT_APPLIED_BATCH", batch.encodedLength());
     }
 
     public static void main(final String[] args) {

@@ -71,12 +71,30 @@
 // runtime's 30 s, a constant in code) exitCode() is 70: restartable, never 78. Without it a session on a full tmpfs
 // retries forever, alive and never progressing.
 //
+// Live streams (oe-stream). A session that registers the ORDERS or BALANCES channel receives every order event (102, and
+// each entry of 103) and every balance line (12, and each entry of 22) as BROADCAST frames. They are not replies, so
+// they complete nothing here: they go to the SessionListener set with setListener(), in arrival order, together with
+// the AdmissionState broadcasts and one onRegistered() call per registration round that reached REGISTERED (the
+// stream's seam: a new session or leader may have lost broadcast frames). Without a listener they are read and dropped.
+//
 // Test-only controls (never in a published build): GW_NC_NOT_CONNECTED_FATAL, GW_NC_REGISTERED_AT_OFFER,
 // GW_NC_NO_REOFFER, GW_NC_LATE_REPLY_BY_KEY, GW_NC_FRESH_KEY, GW_NC_NO_QUERY_BUDGET, GW_NC_ADMINACK_ANY_VERSION,
 // GW_NC_NO_STORAGE_STARVATION each
 // switch one rule off; tests/CMakeLists.txt names the failure text each must produce.
 
 namespace openexchange { namespace gateway { namespace session {
+
+// What a session hands on that is not the reply to a request of its own (see "Live streams" above). Called on the
+// duty thread, inside doWork().
+class SessionListener
+{
+public:
+    virtual ~SessionListener() = default;
+    virtual void onRegistered(std::uint64_t /*sessionEpoch*/, std::int64_t /*leadershipTermId*/) {}
+    virtual void onLiveOrderEvent(const wire::OrderEvent &) {}
+    virtual void onLiveBalance(const wire::BalanceUpdate &) {}
+    virtual void onAdmission(const wire::AdmissionState &) {}
+};
 
 struct SessionCounters
 {
@@ -243,6 +261,8 @@ public:
     }
     std::int64_t lastKeepaliveOfferNs() const { return m_lastKeepaliveNs; }
 
+    void setListener(SessionListener *listener) noexcept { m_listener = listener; }
+
     // Polite close of the session (SessionCloseRequest). The held requests are not completed: the process is stopping.
     void close() { m_client.close(); }
 
@@ -302,7 +322,14 @@ private:
         e.command = std::move(command);
         requestIdOf(e.command, e.requestIdHigh, e.requestIdLow);
         e.frame.resize(wire::maxCommandLength());
-        const std::size_t length = encodeCommand(e.command, e.correlationId, e.frame.data(), e.frame.size());
+        const std::size_t length = m_settings.encoder(e.command, e.correlationId, e.frame.data(), e.frame.size());
+        if (0 == length)
+        {
+            // a command this session's encoder does not encode (a write on a read-only session): never sent
+            m_nextCorrelationId--;
+            r.refusal = OutcomeKind::INTERNAL;
+            return r;
+        }
         e.frame.resize(length);
         e.submittedNs = now;
         e.deadlineNs = now + m_settings.requestTimeoutMs * MS;
@@ -445,6 +472,10 @@ private:
         {
             requestConfigRead();
         }
+        if (nullptr != m_listener)
+        {
+            m_listener->onRegistered(epoch, term);
+        }
         return 1;
     }
 
@@ -461,7 +492,7 @@ private:
         e.requestIdLow += 0x1000;
         setRequestId(e.command, e.requestIdHigh, e.requestIdLow);
         e.frame.resize(wire::maxCommandLength());
-        e.frame.resize(encodeCommand(e.command, e.correlationId, e.frame.data(), e.frame.size()));
+        e.frame.resize(m_settings.encoder(e.command, e.correlationId, e.frame.data(), e.frame.size()));
 #endif
     }
 
@@ -814,6 +845,26 @@ private:
     void onAdmissionState(const wire::AdmissionState &admission) override
     {
         m_config.onAdmission(admission);
+        if (nullptr != m_listener)
+        {
+            m_listener->onAdmission(admission);
+        }
+    }
+
+    void onOrderEvent(const wire::OrderEvent &event) override
+    {
+        if (nullptr != m_listener)
+        {
+            m_listener->onLiveOrderEvent(event);
+        }
+    }
+
+    void onBalanceUpdate(const wire::BalanceUpdate &update) override
+    {
+        if (nullptr != m_listener)
+        {
+            m_listener->onLiveBalance(update);
+        }
     }
 
     void onConfigApplied(const wire::ConfigApplied &applied) override
@@ -1051,6 +1102,7 @@ private:
     Registrar m_registrar;
     Sink m_sink;
     cluster_tools::runtime::LogRing *m_log;
+    SessionListener *m_listener = nullptr;
     wire::Decoder m_decoder;
     ConfigCache m_config;
     TokenBucket m_bucket;

@@ -2,8 +2,8 @@
 // one, wrong block lengths, unknown templates, trailing bytes and values the schema does not name are refused, by
 // name and counted, never read and never a crash; a refused frame delivers nothing to the handler. Also the reason the
 // decoder is the gate in front of the exported session registrar: the registrar alone reads an AdminAck at any header
-// version. Ignored templates (OrderFault) are counted apart and pass the same structural checks; a handler that throws
-// (std or not) never takes the process down; refusals are logged rate limited.
+// version. Ignored templates (OrderFault, the settlement broadcasts) are counted apart and pass the same structural
+// checks; a handler that throws (std or not) never takes the process down; refusals are logged rate limited.
 //
 // The random leg is seeded and sized by the environment (GW_WIRE_FUZZ_SEED, GW_WIRE_FUZZ_ITERATIONS; defaults 1 and
 // 200000); a failure prints the seed and the iteration.
@@ -69,6 +69,9 @@ const Golden REPLIES[] = {
 // every ignored golden frame
 const Golden IGNORED_FRAMES[] = {
     { "OrderFault", &JAVA_ORDER_FAULT },
+    { "SettlementApplied", &JAVA_SETTLEMENT_APPLIED },
+    { "SettleFault", &JAVA_SETTLE_FAULT },
+    { "SettlementAppliedBatch", &JAVA_SETTLEMENT_APPLIED_BATCH },
 };
 
 // Counts every handler call; a refused frame must leave it at zero.
@@ -341,7 +344,8 @@ TEST(wire_an_ignored_template_is_still_checked)
         const std::string name = g.name;
         std::vector<std::uint8_t> v7 = *g.frame;
         putU16(v7, 6, 7);
-        expectRefused(name + " v7", v7, Refusal::WRONG_VERSION, "template 113 OrderFault");
+        expectRefused(name + " v7", v7, Refusal::WRONG_VERSION,
+            "template " + std::to_string(getU16(*g.frame, 2)) + " " + name);
         std::vector<std::uint8_t> v9 = *g.frame;
         putU16(v9, 6, 9);
         expectRefused(name + " v9", v9, Refusal::WRONG_VERSION);

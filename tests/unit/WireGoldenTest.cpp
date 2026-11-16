@@ -20,6 +20,7 @@
 #include "Check.h"
 #include "WireTestValues.h"
 #include "cluster_tools/client/CoreSessionRegistrar.h"
+#include "gateway/common/OrderEntry.h"
 #include "gateway/common/Wire.h"
 
 namespace {
@@ -446,6 +447,10 @@ void ignoredCases()
 {
     // CoreEventPublisher.onOrderFault: BROADCAST on CH_CONTROL, which oe-gateway and oe-stream both subscribe to
     ignoredCase(tid::ORDER_FAULT, JAVA_ORDER_FAULT);
+    // CH_SETTLEMENTS broadcasts: the core opens a session with every legacy channel until its RegisterSession lands
+    ignoredCase(tid::SETTLEMENT_APPLIED, JAVA_SETTLEMENT_APPLIED);
+    ignoredCase(tid::SETTLE_FAULT, JAVA_SETTLE_FAULT);
+    ignoredCase(tid::SETTLEMENT_APPLIED_BATCH, JAVA_SETTLEMENT_APPLIED_BATCH);
 }
 
 }

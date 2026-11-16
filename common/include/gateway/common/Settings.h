@@ -167,6 +167,18 @@ struct GatewaySettings
     Rate faucetRate;
 };
 
+// One cluster node's own probe endpoint (cluster-kit NodeEndpoint: /health, /ready, /metrics), as configured.
+struct NodeEndpoint
+{
+    std::int64_t memberId = 0;
+    std::string host;
+    std::uint16_t port = 0;
+};
+
+// "<memberId>@<host>:<port>[,...]" -> the list, or nullopt with `error`. Member ids are distinct (one row per node). An
+// IPv6 host is written in brackets ("0@[fd00::1]:9090"); `host` holds the address without them.
+std::optional<std::vector<NodeEndpoint>> parseNodeEndpoints(const std::string &text, std::string &error);
+
 struct StreamSettings
 {
     CommonSettings common;
@@ -175,7 +187,7 @@ struct StreamSettings
     std::int64_t replayPage = 1024;
     std::int64_t gapBufferEvents = 65'536;
     Rate queryRate;
-    std::int64_t queryBurst = 50;
+    std::int64_t queryBurst = 10; // below the rate, so a storm second stays within 1.2x the rate
     std::int64_t userLingerMs = 30'000;
     std::int64_t headProbeMs = 5000;
     std::int64_t readyStaleMs = 15'000;
@@ -186,6 +198,19 @@ struct StreamSettings
     std::int64_t wsPingMs = 15'000;
     std::int64_t wsIdleMs = 60'000;
     std::int64_t pgAuthPool = 1;
+    std::int64_t requestTimeoutMs = 5000;   // one core query's deadline
+    std::int64_t wsMaxMessageBytes = 65'536; // a client frame above it closes the connection
+    std::int64_t pgQueue = 64;
+    std::int64_t pgStatementTimeoutMs = 2000;
+    std::int64_t pgRetryMs = 1000;
+    std::int64_t wsSendBufferBytes = 0;    // 0 = the OS default (autotuned)
+    // the engine status feed: each node's own endpoint, polled over the network (an empty list = that block all null)
+    std::vector<NodeEndpoint> coreNodeEndpoints;
+    std::vector<NodeEndpoint> meNodeEndpoints;
+    std::int64_t enginePollMs = 1000;
+    std::int64_t enginePollTimeoutMs = 500;
+    std::int64_t engineFrameMinMs = 1000;
+    std::int64_t engineMaxBodyBytes = 1'048'576;
 };
 
 template<typename S>

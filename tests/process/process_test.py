@@ -30,7 +30,9 @@ STREAM_REQUIRED = ["STREAM_DRIVER_MODE", "STREAM_CORE_INGRESS", "STREAM_CORE_ING
                    "STREAM_CORE_RESPONSE_CHANNEL", "CORE_AUTH_CREDENTIAL", "STREAM_INSTANCE_ID", "STREAM_WS_BIND",
                    "STREAM_ADMIN_BIND", "STREAM_AUTH_MODES"]
 GATEWAY_NOT_READY = ["session_connected", "session_registered", "config_loaded", "gate_open", "keepalive_fresh"]
-STREAM_NOT_READY = ["session_registered", "head_probe_fresh", "ws_listener"]
+# no core behind it: not registered, no watermark yet (an unresolved gap), no head probe answered; the WebSocket
+# listener accepts
+STREAM_NOT_READY = ["session_registered", "event_gap", "head_probe_fresh"]
 
 
 class Failure(Exception):
@@ -172,6 +174,10 @@ def expect_serving(ctx, role, proc, env, mode):
     process = "oe-gateway" if role == "gateway" else "oe-stream"
     check(wait_for_line(proc, "Aeron client connected", 20), f"{process} did not connect to its driver:\n{text_of(proc)}")
     port = admin_port(env)
+    # the line is written before the process counter is registered: /health reads STARTING for those few milliseconds
+    end = time.time() + 5
+    while time.time() < end and http(port, "/health")[0] != 200:
+        time.sleep(0.05)
     status, body = http(port, "/health")
     check(status == 200, f"/health {status}: {body}")
     health = json.loads(body)

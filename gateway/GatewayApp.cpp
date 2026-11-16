@@ -17,6 +17,7 @@
 #include "gateway/common/DutyBridge.h"
 #include "gateway/common/Environment.h"
 #include "gateway/common/FrontLog.h"
+#include "gateway/common/OrderEntry.h"
 #include "gateway/common/Settings.h"
 
 #include "GatewayFront.h"
@@ -51,6 +52,7 @@ session::SessionSettings gatewaySessionSettings(const GatewaySettings &g)
     s.reconnectDelayMs = g.common.reconnectDelayMs;
     s.registerResendMs = g.common.registerResendMs;
     s.readConfig = true;
+    s.encoder = session::encodeCommand; // the writes: orders, and the treasury lane's money commands
     return s;
 }
 

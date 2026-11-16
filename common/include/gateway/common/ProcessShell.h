@@ -72,7 +72,8 @@ struct ProcessIdentity
     const char *frontBindKey = "GATEWAY_HTTP_BIND";
 };
 
-// The public side of a binary (oe-gateway: the REST listener and its worker pools), run by the shell around the duty
+// The public side of a binary (oe-gateway: the REST listener and its worker pools; oe-stream: the WebSocket listener),
+// run by the shell around the duty
 // thread: created and bound right after the admin bind (a bind failure is 78, naming ProcessIdentity::frontBindKey),
 // started once the driver is connected (its threads start just before the duty thread), stopped on the stop path
 // before the admin listener closes (bounded by <P>_STOP_TIMEOUT_MS; a thread that does not stop is 70). The admin thread

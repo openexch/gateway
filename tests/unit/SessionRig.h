@@ -44,6 +44,7 @@
 #include "com_openexchange_core_infrastructure_generated/UserBalances.h"
 
 #include "gateway/common/CoreSession.h"
+#include "gateway/common/OrderEntry.h"
 
 namespace gwtest { namespace session_rig {
 
@@ -75,6 +76,7 @@ inline gs::SessionSettings sessionSettings()
     s.requestTimeoutMs = 5000;
     s.registerResendMs = 300;
     s.reconnectDelayMs = 100;
+    s.encoder = gs::encodeCommand;
     return s;
 }
 

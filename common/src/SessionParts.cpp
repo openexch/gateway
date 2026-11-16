@@ -43,6 +43,10 @@ std::string validate(const SessionSettings &s)
     {
         problem("session: identity must be a positive int64");
     }
+    if (nullptr == s.encoder)
+    {
+        problem("session: no command encoder");
+    }
     return out;
 }
 
@@ -92,25 +96,20 @@ void requestIdOf(const Command &command, std::int64_t &high, std::int64_t &low) 
         command);
 }
 
-std::size_t encodeCommand(Command &command, std::int64_t correlationId, std::uint8_t *buffer, std::size_t capacity) noexcept
+std::size_t encodeReadCommand(Command &command, std::int64_t correlationId, std::uint8_t *buffer, std::size_t capacity) noexcept
 {
     return std::visit(
         [&](auto &c) -> std::size_t {
             using T = std::decay_t<decltype(c)>;
-            if constexpr (std::is_same_v<T, Deposit>)
-            {
-                c.command.correlationId = correlationId;
-                return wire::encodeDeposit(c.command, buffer, capacity);
-            }
-            else if constexpr (std::is_same_v<T, Withdraw>)
-            {
-                c.command.correlationId = correlationId;
-                return wire::encodeWithdraw(c.command, buffer, capacity);
-            }
-            else
+            if constexpr (std::is_same_v<T, wire::RequestOrderSnapshot> || std::is_same_v<T, wire::RequestOrderEvents> ||
+                std::is_same_v<T, wire::RequestUserBalances> || std::is_same_v<T, wire::RequestCoreConfig>)
             {
                 c.correlationId = correlationId;
                 return wire::encode(c, buffer, capacity);
+            }
+            else
+            {
+                return 0; // a write: not this encoder's (OrderEntry.h)
             }
         },
         command);

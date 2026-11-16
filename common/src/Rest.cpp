@@ -365,6 +365,85 @@ std::string orderJson(const wire::OrderSnapshotEntry &e)
     return out;
 }
 
+std::string orderJson(const wire::OrderEvent &e)
+{
+    auto optMoney = [](std::int64_t v) { return 0 == v ? std::string("null") : moneyText(v); };
+    std::string out = "{\"orderId\":" + idText(e.orderId);
+    out += ",\"clientOrderId\":" + (0 == e.clientOrderIdHigh && 0 == e.clientOrderIdLow
+            ? std::string("null") : api::quote(formatUuid(e.clientOrderIdHigh, e.clientOrderIdLow)));
+    out += ",\"marketId\":" + idText(e.marketId);
+    out += ",\"side\":" + api::quote(nameOf(e.side));
+    out += ",\"type\":" + api::quote(nameOf(e.orderType));
+    out += ",\"timeInForce\":" + api::quote(nameOf(e.timeInForce));
+    out += ",\"price\":" + (priceLess(e.orderType) ? std::string("null") : moneyText(e.price));
+    out += ",\"stopPrice\":" + optMoney(e.stopPrice);
+    out += ",\"quantity\":" + moneyText(e.quantity);
+    out += ",\"filledQuantity\":" + moneyText(e.filledQty);
+    out += ",\"remainingQuantity\":" + moneyText(e.remainingQty);
+    out += ",\"status\":" + api::quote(nameOf(e.status));
+    out += ",\"reason\":" + (money::CoreRejectReason::NONE == e.reason ? std::string("null")
+            : api::quote(money::CoreRejectReason::c_str(e.reason)));
+    out += ",\"meReason\":" + (255 == e.meReason ? std::string("null") : std::to_string(e.meReason));
+    out += ",\"meOrderId\":" + (0 == e.meOrderId ? std::string("null") : idText(e.meOrderId));
+    out += ",\"hold\":{\"assetId\":" + idText(e.holdAssetId) + ",\"amount\":" + moneyText(e.holdAmount) +
+        ",\"remaining\":" + moneyText(e.holdRemaining) + "}";
+    out += ",\"createdAt\":" + std::to_string(e.createdAtMs);
+    out += ",\"updatedAt\":" + std::to_string(e.updatedAtMs);
+    out += "}";
+    return out;
+}
+
+std::string fillJson(const wire::OrderEvent &e)
+{
+    std::string out = "{\"tradeId\":" + idText(e.tradeId);
+    out += ",\"orderId\":" + idText(e.orderId);
+    out += ",\"marketId\":" + idText(e.marketId);
+    out += ",\"side\":" + api::quote(nameOf(e.side));
+    out += ",\"price\":" + moneyText(e.lastPrice);
+    out += ",\"quantity\":" + moneyText(e.lastQty);
+    out += ",\"maker\":null";
+    out += ",\"executedAt\":" + std::to_string(e.updatedAtMs);
+    out += "}";
+    return out;
+}
+
+const char *nameOf(money::EventKind::Value v)
+{
+    return money::EventKind::c_str(v);
+}
+
+bool terminal(money::OrderStatus::Value v)
+{
+    return money::OrderStatus::FILLED == v || money::OrderStatus::CANCELLED == v || money::OrderStatus::REJECTED == v ||
+        money::OrderStatus::EXPIRED == v;
+}
+
+std::string gateReasonsJson(std::uint32_t bits)
+{
+    std::string out = "[";
+    bool first = true;
+    for (unsigned b = 0; b < 32; ++b)
+    {
+        if (0 == (bits & (1u << b)))
+        {
+            continue;
+        }
+        const auto value = static_cast<money::GateReason::Value>(b);
+        std::string name;
+        try
+        {
+            name = money::GateReason::c_str(value);
+        }
+        catch (...)
+        {
+            name = "BIT_" + std::to_string(b); // a reason this build's schema does not name
+        }
+        out += (first ? "" : ",") + api::quote(name);
+        first = false;
+    }
+    return out + "]";
+}
+
 Mapping mapOrderReject(money::CoreRejectReason::Value reason, std::uint16_t refTemplateId)
 {
     using R = money::CoreRejectReason;

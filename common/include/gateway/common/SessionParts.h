@@ -23,29 +23,6 @@ namespace openexchange { namespace gateway { namespace session {
 
 namespace cl = cluster_tools::client;
 
-// ---- settings
-
-struct SessionSettings
-{
-    cl::SessionClass sessionClass = cl::SessionClass::GATEWAY;
-    cl::SessionClass credentialClass = cl::SessionClass::GATEWAY; // the class of the client's credential
-    std::uint32_t channels = cl::core_channel::ACKS | cl::core_channel::CONTROL;
-    std::int64_t identity = 0;              // the registration identity (<P>_INSTANCE_ID)
-    std::int64_t maxInflight = 4096;        // GATEWAY_MAX_INFLIGHT: requests held, offered or waiting to be offered
-    std::int64_t requestTimeoutMs = 5000;   // GATEWAY_REQUEST_TIMEOUT_MS
-    std::int64_t queryRateCount = 100;      // GATEWAY_QUERY_RATE: tokens per period
-    std::int64_t queryRatePeriodMs = 1000;
-    std::int64_t queryBurst = 200;          // GATEWAY_QUERY_BURST
-    std::int64_t reconnectDelayMs = 1000;   // <P>_RECONNECT_DELAY_MS: a closed or failed session is replaced after this
-    std::int64_t registerResendMs = 5000;   // <P>_REGISTER_RESEND_MS: a RegisterSession without its ack is re-sent
-    int pollFragments = 64;                 // egress messages per poll (a batching step, not a capacity)
-    bool readConfig = true;                 // read CoreConfigReport after every registration and ConfigApplied
-    std::int64_t correlationIdBase = 0x4757'0000'0000'0000LL; // request correlation ids count up from here
-};
-
-// Empty = valid; otherwise every problem, one per line.
-std::string validate(const SessionSettings &settings);
-
 // ---- commands
 
 struct Deposit
@@ -65,8 +42,37 @@ std::uint16_t templateOf(const Command &command) noexcept;
 bool isQuery(std::uint16_t templateId) noexcept;
 // the command's requestId (0/0 when it has none or is unkeyed)
 void requestIdOf(const Command &command, std::int64_t &high, std::int64_t &low) noexcept;
-// Writes the correlation id into the command and encodes it; the frame length, 0 when the buffer is too short.
-std::size_t encodeCommand(Command &command, std::int64_t correlationId, std::uint8_t *buffer, std::size_t capacity) noexcept;
+// Writes the correlation id into a read (53, 54, 55, 56) and encodes it; the frame length, 0 for any other command
+// and when the buffer is too short. The encoder of every command, the writes included, is encodeCommand
+// (OrderEntry.h, the gw_order_entry library).
+std::size_t encodeReadCommand(Command &command, std::int64_t correlationId, std::uint8_t *buffer, std::size_t capacity) noexcept;
+using CommandEncoder = std::size_t (*)(Command &, std::int64_t, std::uint8_t *, std::size_t) noexcept;
+
+// ---- settings
+
+struct SessionSettings
+{
+    cl::SessionClass sessionClass = cl::SessionClass::GATEWAY;
+    cl::SessionClass credentialClass = cl::SessionClass::GATEWAY; // the class of the client's credential
+    std::uint32_t channels = cl::core_channel::ACKS | cl::core_channel::CONTROL;
+    std::int64_t identity = 0;              // the registration identity (<P>_INSTANCE_ID)
+    std::int64_t maxInflight = 4096;        // GATEWAY_MAX_INFLIGHT: requests held, offered or waiting to be offered
+    std::int64_t requestTimeoutMs = 5000;   // GATEWAY_REQUEST_TIMEOUT_MS
+    std::int64_t queryRateCount = 100;      // GATEWAY_QUERY_RATE: tokens per period
+    std::int64_t queryRatePeriodMs = 1000;
+    std::int64_t queryBurst = 200;          // GATEWAY_QUERY_BURST
+    std::int64_t reconnectDelayMs = 1000;   // <P>_RECONNECT_DELAY_MS: a closed or failed session is replaced after this
+    std::int64_t registerResendMs = 5000;   // <P>_REGISTER_RESEND_MS: a RegisterSession without its ack is re-sent
+    int pollFragments = 64;                 // egress messages per poll (a batching step, not a capacity)
+    bool readConfig = true;                 // read CoreConfigReport after every registration and ConfigApplied
+    std::int64_t correlationIdBase = 0x4757'0000'0000'0000LL; // request correlation ids count up from here
+    // How a command becomes a frame. The default encodes the reads only (a write is refused at submit, INTERNAL, never
+    // sent); oe-gateway sets encodeCommand (OrderEntry.h). oe-stream keeps the default and does not link the writes.
+    CommandEncoder encoder = encodeReadCommand;
+};
+
+// Empty = valid; otherwise every problem, one per line.
+std::string validate(const SessionSettings &settings);
 
 // ---- replies
 

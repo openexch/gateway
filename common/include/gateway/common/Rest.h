@@ -79,6 +79,17 @@ std::string fixedText(const char *bytes, std::size_t size);
 // The JSON object of one open order (a RequestOrderSnapshot row): the Order shape with displayQuantity, expiresAt and
 // budget, and no hold.remaining.
 std::string orderJson(const wire::OrderSnapshotEntry &e);
+// The JSON object of an order as an order event left it (OrderEvent 102 / 103 / 115): the Order shape with
+// hold.remaining, reason and meReason, and without displayQuantity, expiresAt and budget (an event carries none).
+std::string orderJson(const wire::OrderEvent &e);
+// The Fill of one FILL event: {tradeId, orderId, marketId, side, price, quantity, maker, executedAt}; maker is null on
+// the live stream (an event carries no maker flag).
+std::string fillJson(const wire::OrderEvent &e);
+const char *nameOf(money::EventKind::Value v);
+// FILLED, CANCELLED, REJECTED, EXPIRED: the core keeps no such order (it left the open-order set)
+bool terminal(money::OrderStatus::Value v);
+// The GateReasons bits as a JSON array of the schema's names ("BIT_<n>" for a bit this build does not name).
+std::string gateReasonsJson(std::uint32_t bits);
 
 // ---- the status table: core reject -> HTTP status, code, keyFinal
 

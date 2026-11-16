@@ -36,7 +36,19 @@
 //   STREAM_BALANCE_STREAM on|off (on), STREAM_EVENT_WINDOW 65536, STREAM_REPLAY_PAGE 1024, STREAM_GAP_BUFFER_EVENTS
 //   65536, STREAM_QUERY_RATE 50/s + _BURST 50, STREAM_USER_LINGER_MS 30000, STREAM_HEAD_PROBE_MS 5000,
 //   STREAM_READY_STALE_MS 15000, STREAM_HEARTBEAT_MS 5000, STREAM_WS_QUEUE_MESSAGES 256, STREAM_WS_QUEUE_BYTES
-//   1048576, STREAM_WS_AUTH_TIMEOUT_MS 5000, STREAM_WS_PING_MS 15000, STREAM_WS_IDLE_MS 60000, STREAM_PG_AUTH_POOL 1.
+//   1048576, STREAM_WS_AUTH_TIMEOUT_MS 5000, STREAM_WS_PING_MS 15000, STREAM_WS_IDLE_MS 60000, STREAM_PG_AUTH_POOL 1,
+//   STREAM_REQUEST_TIMEOUT_MS 5000 (the deadline of one core query: a snapshot page, a balance read, a replay page, a
+//   head probe), STREAM_WS_MAX_MESSAGE_BYTES 65536 (a client frame above it closes the connection, 1009),
+//   STREAM_PG_QUEUE 64, STREAM_PG_STATEMENT_TIMEOUT_MS 2000, STREAM_PG_RETRY_MS 1000 (demo token lookups: the auth pool's
+//   queue, statement timeout and reconnect spacing; at most half the queue waits for unknown tokens),
+//   STREAM_WS_SEND_BUFFER_BYTES unset (the kernel's send buffer of each WebSocket socket; unset leaves the OS default and
+//   its autotuning, which can hold megabytes per connection before a slow reader reaches the outbound queue's bound),
+//   STREAM_CORE_NODE_ENDPOINTS and STREAM_ME_NODE_ENDPOINTS unset (<memberId>@<host>:<port>,...: each core and matching
+//   engine node's own probe endpoint, polled for the engine status feed; unset = that block is all null),
+//   STREAM_ENGINE_POLL_MS 1000 (one round of GET /health and GET /metrics on every configured node),
+//   STREAM_ENGINE_POLL_TIMEOUT_MS 500 (one request's deadline; a node that misses it is unreachable for that round),
+//   STREAM_ENGINE_FRAME_MIN_MS 1000 (the rate cap of the engine frame: a changed frame waits until the last one is this
+//   old), STREAM_ENGINE_MAX_BODY_BYTES 1048576 (a node's answer above it counts as no answer).
 
 namespace openexchange { namespace gateway {
 
@@ -862,6 +874,61 @@ ParseResult<GatewaySettings> parseGatewaySettings(const Environment &env, const 
     return out;
 }
 
+std::optional<std::vector<NodeEndpoint>> parseNodeEndpoints(const std::string &text, std::string &error)
+{
+    const std::optional<std::vector<std::string>> items = splitList(text);
+    if (!items)
+    {
+        error = "expected <memberId>@<host>:<port>[,...], got an empty item in '" + text + "'";
+        return std::nullopt;
+    }
+    std::vector<NodeEndpoint> out;
+    for (const std::string &item : *items)
+    {
+        const std::size_t at = item.find('@');
+        const std::size_t colon = item.rfind(':');
+        NodeEndpoint n;
+        std::int64_t port = 0;
+        const bool idZero = at == 1 && '0' == item[0];
+        if (at == std::string::npos || colon == std::string::npos || colon < at + 2 ||
+            !(idZero || parsePositiveDecimal(item.substr(0, at), n.memberId)) ||
+            !parsePositiveDecimal(item.substr(colon + 1), port) || port > 65535)
+        {
+            error = "expected <memberId>@<host>:<port>[,...] (memberId >= 0, port 1..65535), got '" + item + "'";
+            return std::nullopt;
+        }
+        n.host = item.substr(at + 1, colon - at - 1);
+        // an IPv6 literal is written in brackets ([::1]:9090); the host is the address without them. A bare colon in
+        // the host could be part of the address or the port separator, so it is refused, as is a stray bracket.
+        if ('[' == n.host.front())
+        {
+            if (n.host.size() < 3 || ']' != n.host.back())
+            {
+                error = "expected [<IPv6 address>] in brackets, got '" + item + "'";
+                return std::nullopt;
+            }
+            n.host = n.host.substr(1, n.host.size() - 2);
+        }
+        if (n.host.find_first_of("[]") != std::string::npos ||
+            ('[' != item[at + 1] && n.host.find(':') != std::string::npos))
+        {
+            error = "an IPv6 host is written in brackets (<memberId>@[<address>]:<port>), got '" + item + "'";
+            return std::nullopt;
+        }
+        n.port = static_cast<std::uint16_t>(port);
+        for (const NodeEndpoint &o : out)
+        {
+            if (o.memberId == n.memberId)
+            {
+                error = "member id " + std::to_string(n.memberId) + " named twice (one row per node)";
+                return std::nullopt;
+            }
+        }
+        out.push_back(std::move(n));
+    }
+    return out;
+}
+
 ParseResult<StreamSettings> parseStreamSettings(const Environment &env, const rt::DirProbe &probe)
 {
     ParseResult<StreamSettings> out;
@@ -884,6 +951,48 @@ ParseResult<StreamSettings> parseStreamSettings(const Environment &env, const rt
     s.wsPingMs = r.positive("STREAM_WS_PING_MS", s.wsPingMs);
     s.wsIdleMs = r.positive("STREAM_WS_IDLE_MS", s.wsIdleMs);
     s.pgAuthPool = r.positive("STREAM_PG_AUTH_POOL", s.pgAuthPool);
+    s.requestTimeoutMs = r.positive("STREAM_REQUEST_TIMEOUT_MS", s.requestTimeoutMs);
+    s.wsMaxMessageBytes = r.positive("STREAM_WS_MAX_MESSAGE_BYTES", s.wsMaxMessageBytes);
+    s.pgQueue = r.positive("STREAM_PG_QUEUE", s.pgQueue);
+    s.pgStatementTimeoutMs = r.positive("STREAM_PG_STATEMENT_TIMEOUT_MS", s.pgStatementTimeoutMs);
+    s.pgRetryMs = r.positive("STREAM_PG_RETRY_MS", s.pgRetryMs);
+    if (r.isSet("STREAM_WS_SEND_BUFFER_BYTES"))
+    {
+        s.wsSendBufferBytes = r.positive("STREAM_WS_SEND_BUFFER_BYTES", 0);
+    }
+    else
+    {
+        r.record("STREAM_WS_SEND_BUFFER_BYTES", "os", "default");
+    }
+
+    for (const auto &[key, target] : { std::pair{ "STREAM_CORE_NODE_ENDPOINTS", &s.coreNodeEndpoints },
+             std::pair{ "STREAM_ME_NODE_ENDPOINTS", &s.meNodeEndpoints } })
+    {
+        const std::optional<std::string> text = r.optionalString(key, "<memberId>@<host>:<port>[,...]");
+        if (!text)
+        {
+            continue; // unset: no node of that engine is polled (recorded "(unset)")
+        }
+        std::string error;
+        const std::optional<std::vector<NodeEndpoint>> nodes = parseNodeEndpoints(*text, error);
+        if (!nodes)
+        {
+            r.problem(std::string(key) + ": " + error);
+            continue;
+        }
+        *target = *nodes;
+    }
+    s.enginePollMs = r.positive("STREAM_ENGINE_POLL_MS", s.enginePollMs);
+    s.enginePollTimeoutMs = r.positive("STREAM_ENGINE_POLL_TIMEOUT_MS", s.enginePollTimeoutMs);
+    s.engineFrameMinMs = r.positive("STREAM_ENGINE_FRAME_MIN_MS", s.engineFrameMinMs);
+    s.engineMaxBodyBytes = r.positive("STREAM_ENGINE_MAX_BODY_BYTES", s.engineMaxBodyBytes);
+    if (s.enginePollTimeoutMs >= s.enginePollMs)
+    {
+        // a round (name lookups included) ends by the timeout; at or above the interval rounds run back to back and
+        // the stated request rate no longer holds
+        r.problem("STREAM_ENGINE_POLL_TIMEOUT_MS (" + std::to_string(s.enginePollTimeoutMs) +
+            ") must be below STREAM_ENGINE_POLL_MS (" + std::to_string(s.enginePollMs) + ")");
+    }
 
     r.refuseUnknown({ "STREAM_" });
     out.errors = r.errors();

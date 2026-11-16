@@ -109,16 +109,26 @@ set(GW_MONEY_SCHEMA_DEFINITIONS GW_MONEY_SCHEMA_ID=${GW_LOCK_money_schema_id}
     GW_MONEY_SCHEMA_VERSION=${GW_LOCK_money_schema_version})
 target_compile_definitions(gw_common PRIVATE ${GW_MONEY_SCHEMA_DEFINITIONS})
 
+# gw_order_entry: the encoders of every command that writes (CreateOrder, CancelOrder, AmendOrder, Deposit, Withdraw)
+# and the session encoder that includes them. oe-gateway links it; oe-stream never does (its key could create orders):
+# the stream's sources are built with GW_NO_ORDER_ENTRY, under which OrderEntry.h refuses to compile, and tests/build
+# checks that a reference fails to compile and to link and that the finished binary holds none of these symbols.
+add_library(gw_order_entry STATIC common/src/OrderEntry.cpp common/src/OrderEntryWire.cpp)
+target_link_libraries(gw_order_entry PUBLIC gw_common)
+target_compile_options(gw_order_entry PRIVATE ${GW_WARNINGS})
+
 add_library(oe_gateway_app STATIC gateway/GatewayApp.cpp gateway/GatewayApi.cpp gateway/GatewayFront.cpp
     gateway/GatewayRoutes.cpp)
 target_include_directories(oe_gateway_app PUBLIC gateway)
-target_link_libraries(oe_gateway_app PUBLIC gw_common)
+target_link_libraries(oe_gateway_app PUBLIC gw_order_entry gw_common)
 target_compile_options(oe_gateway_app PRIVATE ${GW_WARNINGS})
 
-add_library(oe_stream_app STATIC stream/StreamApp.cpp)
+set(GW_STREAM_SOURCES stream/StreamCore.cpp stream/WsServer.cpp stream/EngineStatus.cpp stream/EnginePoller.cpp)
+add_library(oe_stream_app STATIC stream/StreamApp.cpp ${GW_STREAM_SOURCES})
 target_include_directories(oe_stream_app PUBLIC stream)
 target_link_libraries(oe_stream_app PUBLIC gw_common)
 target_compile_options(oe_stream_app PRIVATE ${GW_WARNINGS})
+target_compile_definitions(oe_stream_app PRIVATE GW_NO_ORDER_ENTRY)
 
 # The binaries: the embedded driver first in the link list (its archive resolves the C client symbols before
 # aeron_static is scanned).
@@ -126,6 +136,7 @@ add_executable(oe-gateway gateway/main.cpp)
 target_link_libraries(oe-gateway PRIVATE cluster_tools::runtime_embedded_driver oe_gateway_app)
 add_executable(oe-stream stream/main.cpp)
 target_link_libraries(oe-stream PRIVATE cluster_tools::runtime_embedded_driver oe_stream_app)
+target_compile_definitions(oe-stream PRIVATE GW_NO_ORDER_ENTRY)
 install(TARGETS oe-gateway oe-stream RUNTIME DESTINATION bin)
 
 include(CTest)

@@ -5,7 +5,8 @@ Open Exchange core. Each has its own cluster session and no shared state; run N 
 one static library, `gw_common`.
 
 This version has the process shell (settings, both media driver modes, the supervisor, the admin
-endpoints), the wire codec, `oe-gateway`'s core session, auth and the REST routes. User streams come next.
+endpoints), the wire codec, both core sessions, auth, the REST routes, the user streams and the engine status
+feed.
 
 ## Build
 
@@ -83,7 +84,8 @@ cluster-tools codecs. Every egress frame is checked before any field is read. A 
 version, an unknown template, wrong lengths, trailing bytes and unnamed enum values are refused. Refusals
 are counted in `gateway_decode_refused_total` and logged rate-limited (the first, then every 1000th, with
 the count). Frames the core sends on a subscribed channel that the gateway does not read (`OrderFault`, a
-CONTROL broadcast) are counted in `gateway_wire_ignored_total{template}` and never logged. A frame reaches
+CONTROL broadcast, and `SettlementApplied`, `SettleFault` and `SettlementAppliedBatch`, which the core can
+broadcast to a new session before its registration sets the channel mask) are counted in `gateway_wire_ignored_total{template}` and never logged. A frame reaches
 its handler only after it decoded completely.
 
 `tests/golden/regen.sh <core-cluster.jar>` regenerates the golden corpus. It accepts only a jar whose
@@ -147,6 +149,68 @@ retried after a 504 also takes a faucet token. A TREASURY key can credit any use
 guard against bugs. Registration funding re-sends a deposit whose outcome is unknown only when the core's
 `idempotencyWindowMs` is longer than twice `GATEWAY_REQUEST_TIMEOUT_MS`; otherwise `funded` is false and
 nothing is re-sent, because a re-send after the window could credit twice.
+
+## User stream
+
+`oe-stream` serves each user's own orders, fills and balances over WebSocket at `/ws/v2`, from its own
+GATEWAY session to the core. It holds no state that survives a restart, and it does not link the order or
+money encoders (`tests/link` checks the compile, the link and the symbols).
+
+Credential, exactly one of:
+
+- `Sec-WebSocket-Protocol: bearer, <token>`
+- `Authorization` or `X-API-Key`
+- a first frame `{"op":"auth","token":"..."}` within `STREAM_WS_AUTH_TIMEOUT_MS`
+
+A query string is refused with 400. Any `userId` in a client frame closes the connection with 4003. Other
+close codes: 1008 auth failure or timeout, 1013 users store unavailable or ring full, 1001 idle.
+
+Client frames: `subscribe` `{channels: orders|fills|balances, resume:{eventSeq}?}`, `unsubscribe`, `ping`.
+Server frames: `subscribed`, `snapshot`, `order`, `fill`, `balance`, `admission`, `heartbeat` `{eventSeq}`,
+`pong`, `resync` `{reason}`, `error`, `engine`, `election`.
+
+Resume. Keep the last `eventSeq` of any frame, heartbeats included, and resume from it. A resume the stream
+cannot serve gets `resync` `RESUME_TOO_OLD` and a snapshot. After a resync, fills between your last frame and
+the snapshot may be missing until history is served.
+
+Snapshots. A user's open orders come from the core in pages and are stitched by log position: the first page
+exclusive, the last inclusive, so no event is lost or doubled between pages. No snapshot is read until the
+first head probe has set the watermark; a failed first probe is asked again at once. Order caches are dropped
+on every re-registration, a leader change included. Re-snapshots after an overrun are paced by
+`STREAM_QUERY_RATE` and `STREAM_QUERY_BURST` (default 10, below the rate, so a storm second stays within 1.2x the rate).
+
+Slow clients. Each connection's bound (`STREAM_WS_QUEUE_MESSAGES`, `STREAM_WS_QUEUE_BYTES`) counts the frames
+waiting in `oe-stream` and the frames the writer holds unwritten. The byte test leaves out the largest frame
+sent since the connection was last empty, so a snapshot larger than the byte bound still goes out; what
+queues behind it must fit. At the bound the connection is closed 4001. Queued order frames for one order
+coalesce to the latest; fill frames never do. If the client has stopped reading, the close frame cannot pass
+the blocked write and the connection ends as a socket close after `STREAM_WS_IDLE_MS`. The duty thread and
+other clients are not affected.
+
+`/ready` requires a registered session, no open event gap, a head probe answered within
+`STREAM_READY_STALE_MS` and the listener accepting. A closed admission gate does not affect it.
+
+Engine status. Every connection gets an `engine` frame on connect and again on change, at most once per
+`STREAM_ENGINE_FRAME_MIN_MS` (a held frame goes out as soon as the cap allows), and `election` frames with
+phase `start` and `end`. Values come from each node's own endpoint (`GET /health`, `GET /metrics`), polled
+every `STREAM_ENGINE_POLL_MS` from `STREAM_CORE_NODE_ENDPOINTS` and `STREAM_ME_NODE_ENDPOINTS`
+(`<memberId>@<host>:<port>`, an IPv6 host in brackets); an unset list leaves that block null. A whole round,
+name lookups included, ends by `STREAM_ENGINE_POLL_TIMEOUT_MS`, which must be below the poll interval (boot
+refuses otherwise, exit 78). A node that does not answer is `unreachable` with null values; a follower's row
+always comes from that follower. The leader is the live node (`/health` 200) that reports itself leader.
+`behindBytes` and `bridge.entriesBehind` compare two answers sampled at different instants, so they can
+briefly read negative. Fields no node supplies are null and render as a dash: snapshot state hash, version,
+build commit, entries behind, election duration, first entry position, order entry reopened. Each instance
+makes 2 x nodes HTTP requests per poll and adds nothing to the cluster log.
+
+New settings with defaults: `STREAM_REQUEST_TIMEOUT_MS` 5000, `STREAM_WS_MAX_MESSAGE_BYTES` 65536,
+`STREAM_PG_QUEUE` 64, `STREAM_PG_STATEMENT_TIMEOUT_MS` 2000, `STREAM_PG_RETRY_MS` 1000,
+`STREAM_WS_SEND_BUFFER_BYTES` (default: the OS buffer), `STREAM_ENGINE_POLL_MS` 1000,
+`STREAM_ENGINE_POLL_TIMEOUT_MS` 500, `STREAM_ENGINE_FRAME_MIN_MS` 1000, `STREAM_ENGINE_MAX_BODY_BYTES` 1048576.
+
+T1: `ctest -L t1` with `-DGW_IT_CORE_JAR` and `-DGW_IT_PROBE_JAR`. `GW_IT_STREAM_CONNECTIONS` sets the storm
+size (default 2000). The T1 suites take port bases in 24000..31299, below the usual Linux ephemeral range, and
+`it.stream` fails at start if a core node's endpoint does not answer.
 
 ## Footprint
 
