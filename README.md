@@ -148,9 +148,6 @@ guard against bugs. Registration funding re-sends a deposit whose outcome is unk
 `idempotencyWindowMs` is longer than twice `GATEWAY_REQUEST_TIMEOUT_MS`; otherwise `funded` is false and
 nothing is re-sent, because a re-send after the window could credit twice.
 
-Known core defect: a withdrawal the core rejects currently answers 504, because the core's WithdrawReject
-frame leaves its `duplicate` field unset and the gateway refuses the frame. No money moves.
-
 ## Footprint
 
 Idle, defaults, no session yet: an embedded driver holds about 48 MB in its driver directory (`cnc.dat`
