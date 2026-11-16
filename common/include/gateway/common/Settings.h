@@ -187,7 +187,7 @@ struct StreamSettings
     std::int64_t replayPage = 1024;
     std::int64_t gapBufferEvents = 65'536;
     Rate queryRate;
-    std::int64_t queryBurst = 50;
+    std::int64_t queryBurst = 10; // below the rate, so a storm second stays within 1.2x the rate
     std::int64_t userLingerMs = 30'000;
     std::int64_t headProbeMs = 5000;
     std::int64_t readyStaleMs = 15'000;

@@ -182,8 +182,6 @@ class Stream(Proc):
             "STREAM_REPLAY_PAGE": "16",
             "STREAM_MAX_CONNECTIONS": str(max(4000, args.connections + 500)),
             "STREAM_QUERY_RATE": f"{QUERY_RATE}/s",
-            # a burst below the rate: one second of the storm then shows the rate itself (the 1.2x rate bound)
-            "STREAM_QUERY_BURST": "10",
             "STREAM_IO_THREADS": "2",
             # a 12 s SIGSTOP (past the core's 10 s session timeout) must cost the core session, not the Aeron client
             "STREAM_DRIVER_TIMEOUT_MS": "30000",

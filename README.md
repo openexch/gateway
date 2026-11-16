@@ -177,7 +177,7 @@ Snapshots. A user's open orders come from the core in pages and are stitched by 
 exclusive, the last inclusive, so no event is lost or doubled between pages. No snapshot is read until the
 first head probe has set the watermark; a failed first probe is asked again at once. Order caches are dropped
 on every re-registration, a leader change included. Re-snapshots after an overrun are paced by
-`STREAM_QUERY_RATE` and `STREAM_QUERY_BURST`.
+`STREAM_QUERY_RATE` and `STREAM_QUERY_BURST` (default 10, below the rate, so a storm second stays within 1.2x the rate).
 
 Slow clients. Each connection's bound (`STREAM_WS_QUEUE_MESSAGES`, `STREAM_WS_QUEUE_BYTES`) counts the frames
 waiting in `oe-stream` and the frames the writer holds unwritten. The byte test leaves out the largest frame
