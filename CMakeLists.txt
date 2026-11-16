@@ -85,11 +85,14 @@ add_library(gw_common STATIC
     common/src/DutyBridge.cpp
     common/src/Environment.cpp
     common/src/FrontLog.cpp
+    common/src/History.cpp
     common/src/HttpServer.cpp
     common/src/JsonImpl.cpp
     common/src/Jwt.cpp
     common/src/Migrations.cpp
     common/src/Password.cpp
+    common/src/PgConn.cpp
+    common/src/PgHistoryStore.cpp
     common/src/PgUserStore.cpp
     common/src/ProcessShell.cpp
     common/src/RateLimit.cpp

@@ -52,7 +52,7 @@ endif()
 
 add_executable(gw_unit_tests unit/TestMain.cpp unit/SettingsTest.cpp unit/AdminTest.cpp unit/WireGoldenTest.cpp
     unit/WireRefusalTest.cpp unit/WireClusterToolsGoldenTest.cpp unit/SessionTest.cpp unit/AuthTest.cpp
-    unit/GatewayApiTest.cpp unit/RestTest.cpp unit/RestRoutesTest.cpp)
+    unit/GatewayApiTest.cpp unit/RestTest.cpp unit/RestRoutesTest.cpp unit/HistoryTest.cpp)
 target_include_directories(gw_unit_tests PRIVATE unit golden "${GW_CT_GOLDEN_DIR}" "${GW_CT_FAKE_TRANSPORT_DIR}")
 target_compile_definitions(gw_unit_tests PRIVATE ${GW_WIRE_TEST_DEFINITIONS})
 target_link_libraries(gw_unit_tests PRIVATE oe_gateway_app gw_common)
@@ -294,13 +294,37 @@ add_test(NAME build.stream_no_order_entry_symbols
 # The users store against a real PostgreSQL in a throwaway container (docker; the image pinned by digest). Built
 # always; registered with GW_PG_TESTS=ON.
 add_executable(gw_pg_tests unit/TestMain.cpp pg/PgStoreTest.cpp)
-target_include_directories(gw_pg_tests PRIVATE unit)
+target_include_directories(gw_pg_tests PRIVATE unit pg)
 target_link_libraries(gw_pg_tests PRIVATE gw_common)
 target_compile_options(gw_pg_tests PRIVATE ${GW_WARNINGS})
+# The history read layer against the same container, seeded from the read contract's reference DDL
+# (sql/history_read_contract_v1.sql): the keyset walk under concurrent inserts, the routes over the real users and
+# history stores, pool exhaustion while login answers, and the causes of 503 HISTORY_UNAVAILABLE.
+set(GW_HISTORY_CONTRACT_DEFINITION GW_HISTORY_CONTRACT_SQL="${PROJECT_SOURCE_DIR}/sql/history_read_contract_v1.sql")
+add_executable(gw_pg_history_tests unit/TestMain.cpp pg/HistoryPgTest.cpp)
+target_include_directories(gw_pg_history_tests PRIVATE unit pg)
+target_compile_definitions(gw_pg_history_tests PRIVATE ${GW_HISTORY_CONTRACT_DEFINITION})
+target_link_libraries(gw_pg_history_tests PRIVATE oe_gateway_app gw_common)
+target_compile_options(gw_pg_history_tests PRIVATE ${GW_WARNINGS})
+# Control for the keyset walk (history_keyset_walk_under_concurrent_inserts): the history statements built with OFFSET
+# paging (GW_NC_OFFSET_PAGING, test-only, never in a binary) must fail the walk with "row skipped or repeated".
+add_executable(gw_pg_nc_offset_paging unit/TestMain.cpp pg/HistoryPgTest.cpp "${PROJECT_SOURCE_DIR}/common/src/History.cpp")
+target_include_directories(gw_pg_nc_offset_paging PRIVATE unit pg)
+target_compile_definitions(gw_pg_nc_offset_paging PRIVATE ${GW_HISTORY_CONTRACT_DEFINITION} GW_NC_OFFSET_PAGING)
+target_link_libraries(gw_pg_nc_offset_paging PRIVATE oe_gateway_app gw_common)
+target_compile_options(gw_pg_nc_offset_paging PRIVATE ${GW_WARNINGS})
 if(GW_PG_TESTS)
     add_test(NAME pg.users COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/pg/pg_it.py"
         --binary "$<TARGET_FILE:gw_pg_tests>" --image "${GW_PG_TEST_IMAGE}")
     set_tests_properties(pg.users PROPERTIES TIMEOUT 300 LABELS pg RUN_SERIAL TRUE)
+    add_test(NAME pg.history COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/pg/pg_it.py"
+        --binary "$<TARGET_FILE:gw_pg_history_tests>" --image "${GW_PG_TEST_IMAGE}")
+    set_tests_properties(pg.history PROPERTIES TIMEOUT 300 LABELS pg RUN_SERIAL TRUE)
+    add_test(NAME pg.history_nc_offset_paging COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/pg/pg_it.py"
+        --binary "$<TARGET_FILE:gw_pg_nc_offset_paging>" --image "${GW_PG_TEST_IMAGE}"
+        history_keyset_walk_under_concurrent_inserts)
+    set_tests_properties(pg.history_nc_offset_paging PROPERTIES TIMEOUT 300 LABELS pg RUN_SERIAL TRUE
+        PASS_REGULAR_EXPRESSION "row skipped or repeated")
 endif()
 
 add_test(NAME lock COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/lock/lock_test.sh" "${PROJECT_SOURCE_DIR}" "${CMAKE_COMMAND}"

@@ -17,56 +17,19 @@
 #include <libpq-fe.h>
 
 #include "Check.h"
+#include "PgTestSupport.h"
 #include "gateway/common/Authenticator.h"
 #include "gateway/common/Crypto.h"
 #include "gateway/common/PgUserStore.h"
 #include "gateway/common/WorkPool.h"
 
 using namespace openexchange::gateway;
+using gwtest::env;
+using gwtest::freshDatabase;
+using gwtest::run;
+using gwtest::sql;
 
 namespace {
-
-std::string env(const char *name)
-{
-    const char *v = std::getenv(name);
-    return nullptr == v ? std::string() : std::string(v);
-}
-
-// One statement on a fresh connection; the first value of the first row ("" when none). Fails the test on an error.
-std::string sql(const std::string &url, const std::string &statement)
-{
-    PGconn *c = PQconnectdb(url.c_str());
-    std::string out;
-    if (CONNECTION_OK != PQstatus(c))
-    {
-        gwtest::fail(__FILE__, __LINE__, std::string("connect: ") + PQerrorMessage(c));
-        PQfinish(c);
-        return out;
-    }
-    PGresult *r = PQexec(c, statement.c_str());
-    const ExecStatusType st = PQresultStatus(r);
-    if (PGRES_COMMAND_OK != st && PGRES_TUPLES_OK != st)
-    {
-        gwtest::fail(__FILE__, __LINE__, statement + ": " + PQresultErrorMessage(r));
-    }
-    else if (PGRES_TUPLES_OK == st && PQntuples(r) > 0)
-    {
-        out = PQgetvalue(r, 0, 0);
-    }
-    PQclear(r);
-    PQfinish(c);
-    return out;
-}
-
-// A fresh database on the test server; its URL.
-std::string freshDatabase(const std::string &name)
-{
-    const std::string admin = env("GW_TEST_PG_ADMIN_URL");
-    sql(admin, "DROP DATABASE IF EXISTS " + name);
-    sql(admin, "CREATE DATABASE " + name);
-    const std::string base = env("GW_TEST_PG_URL");
-    return base.substr(0, base.rfind('/') + 1) + name;
-}
 
 PgSettings settingsFor(const std::string &url, bool migrate = true, int workers = 2, std::int64_t timeoutMs = 2000)
 {
@@ -81,15 +44,6 @@ PgSettings settingsFor(const std::string &url, bool migrate = true, int workers 
 std::string hashOf(const std::string &token)
 {
     return std::string(crypto::view(crypto::sha256(token)));
-}
-
-void run(const char *what)
-{
-    const std::string cmd = env(what);
-    if (cmd.empty() || 0 != std::system(cmd.c_str()))
-    {
-        gwtest::fail(__FILE__, __LINE__, std::string(what) + " failed: '" + cmd + "'");
-    }
 }
 
 }

@@ -30,7 +30,13 @@
 //   tokens the cache does not hold), GATEWAY_TOKEN_LOOKUP_INFLIGHT half of GATEWAY_PG_QUEUE (such lookups waiting at
 //   once; with demo it must stay below GATEWAY_PG_QUEUE, the correctness reason being that the rest of the queue is
 //   what login, register and logout are guaranteed),
-//   GATEWAY_HISTORY_LIMIT_DEFAULT 100 (<= _MAX), GATEWAY_HISTORY_LIMIT_MAX 1000,
+//   GATEWAY_HISTORY_LIMIT_DEFAULT 100 (<= _MAX), GATEWAY_HISTORY_LIMIT_MAX 1000 (a larger limit is 400),
+//   GATEWAY_HISTORY_RETRY_AFTER_MS 60000 (Retry-After of 503 HISTORY_UNAVAILABLE), GATEWAY_HISTORY_BUSY_RETRY_AFTER_MS
+//   1000 (Retry-After of 503 HISTORY_BUSY), GATEWAY_HISTORY_LAG_RETRY_AFTER_MS 1000 (Retry-After of the 503
+//   HISTORY_UNAVAILABLE of GET /orders/{orderId} for an id above the projection's applied_order_id: not projected yet).
+//   History is read when GATEWAY_PG_URL is set, on its own pool (GATEWAY_PG_HISTORY_POOL connections over a queue of
+//   its own, sized GATEWAY_PG_QUEUE like the auth pool's), never the auth pool's connections;
+//   GATEWAY_PG_STATEMENT_TIMEOUT_MS is also one history read's whole deadline, queue wait included,
 //   GATEWAY_FAUCET_MAX_AMOUNT none (assetId:amount,...), GATEWAY_FAUCET_RATE 1/s.
 // oe-stream only:
 //   STREAM_BALANCE_STREAM on|off (on), STREAM_EVENT_WINDOW 65536, STREAM_REPLAY_PAGE 1024, STREAM_GAP_BUFFER_EVENTS
@@ -823,6 +829,9 @@ ParseResult<GatewaySettings> parseGatewaySettings(const Environment &env, const 
     }
     g.historyLimitDefault = r.positive("GATEWAY_HISTORY_LIMIT_DEFAULT", g.historyLimitDefault);
     g.historyLimitMax = r.positive("GATEWAY_HISTORY_LIMIT_MAX", g.historyLimitMax);
+    g.historyRetryAfterMs = r.positive("GATEWAY_HISTORY_RETRY_AFTER_MS", g.historyRetryAfterMs);
+    g.historyBusyRetryAfterMs = r.positive("GATEWAY_HISTORY_BUSY_RETRY_AFTER_MS", g.historyBusyRetryAfterMs);
+    g.historyLagRetryAfterMs = r.positive("GATEWAY_HISTORY_LAG_RETRY_AFTER_MS", g.historyLagRetryAfterMs);
     if (g.historyLimitDefault > g.historyLimitMax)
     {
         r.problem("GATEWAY_HISTORY_LIMIT_DEFAULT (" + std::to_string(g.historyLimitDefault) +

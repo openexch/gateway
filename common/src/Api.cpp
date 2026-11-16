@@ -217,6 +217,31 @@ std::optional<json::object> readBody(const HttpExchange &ex, std::initializer_li
     return std::move(v.as_object());
 }
 
+std::optional<std::map<std::string, std::string>> queryValues(const HttpExchange &ex)
+{
+    std::map<std::string, std::string> out;
+    std::string_view q = ex.query();
+    while (!q.empty())
+    {
+        const std::size_t amp = q.find('&');
+        const std::string_view item = q.substr(0, amp);
+        q = std::string_view::npos == amp ? std::string_view() : q.substr(amp + 1);
+        if (item.empty())
+        {
+            continue;
+        }
+        const std::size_t eq = item.find('=');
+        const auto name = percentDecoded(item.substr(0, eq));
+        const auto value = percentDecoded(std::string_view::npos == eq ? std::string_view() : item.substr(eq + 1));
+        if (!name || !value)
+        {
+            return std::nullopt;
+        }
+        out[*name] = *value;
+    }
+    return out;
+}
+
 bool readQuery(const HttpExchange &ex, std::initializer_list<std::string_view> allowed, ApiResponse &bad)
 {
     std::string_view q = ex.query();

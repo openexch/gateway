@@ -1,5 +1,7 @@
 #include "GatewayFront.h"
 
+#include "gateway/common/FrontLog.h"
+
 namespace openexchange { namespace gateway {
 
 GatewayFront::GatewayFront(const GatewaySettings &g, AuthMaterial material, DutyBridge &bridge) :
@@ -21,6 +23,23 @@ GatewayFront::GatewayFront(const GatewaySettings &g, AuthMaterial material, Duty
         m_hashPool = std::make_unique<WorkPool>("gw-hash", static_cast<int>(g.hashThreads),
             static_cast<std::size_t>(g.hashQueue));
     }
+    if (c.pgUrl)
+    {
+        // history reads: their own connections and queue, so a history storm never takes one of the auth pool's
+        PgHistorySettings hs;
+        hs.url = *c.pgUrl;
+        hs.workers = static_cast<int>(g.pgHistoryPool);
+        hs.statementTimeoutMs = g.pgStatementTimeoutMs;
+        hs.retryMs = g.pgRetryMs;
+        m_history = std::make_unique<PgHistoryStore>(hs);
+        m_historyPool = std::make_unique<WorkPool>("gw-pg-hist", static_cast<int>(g.pgHistoryPool),
+            static_cast<std::size_t>(g.pgQueue));
+    }
+    else
+    {
+        frontLog(FrontLevel::INFO, "history reads off: GATEWAY_PG_URL is unset (history routes answer 503 "
+            "HISTORY_UNAVAILABLE)");
+    }
     AuthenticatorSettings as;
     as.modes = c.authModes;
     as.tokenCacheTtlMs = c.tokenCacheTtlMs;
@@ -33,6 +52,8 @@ GatewayFront::GatewayFront(const GatewaySettings &g, AuthMaterial material, Duty
     deps.store = m_store.get();
     deps.storePool = m_storePool.get();
     deps.hashPool = m_hashPool.get();
+    deps.history = m_history.get();
+    deps.historyPool = m_historyPool.get();
     deps.askCore = [this](session::Command command, std::function<void(const session::Outcome &)> done) {
         return m_bridge.submit(std::move(command), std::move(done));
     };
@@ -78,6 +99,10 @@ void GatewayFront::start()
     {
         m_storePool->start();
     }
+    if (m_historyPool)
+    {
+        m_historyPool->start();
+    }
     m_bridge.startCompletions();
     m_server->start();
 }
@@ -92,6 +117,10 @@ bool GatewayFront::stop(std::int64_t boundMs)
     if (m_storePool)
     {
         ok = m_storePool->stop(boundMs) && ok;
+    }
+    if (m_historyPool)
+    {
+        ok = m_historyPool->stop(boundMs) && ok;
     }
     ok = m_bridge.stopCompletions(boundMs) && ok;
     return ok;

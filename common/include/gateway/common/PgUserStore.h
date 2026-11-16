@@ -8,9 +8,10 @@
 #include <string>
 #include <vector>
 
+#include "gateway/common/PgConn.h"
 #include "gateway/common/UserStore.h"
 
-// PgUserStore - UserStore over libpq: one connection per store worker, opened on first use and re-opened after any
+// PgUserStore - UserStore over libpq (PgConn): one connection per store worker, opened on first use and re-opened after any
 // connection failure. Every connect and every statement has a client-side deadline of GATEWAY_PG_STATEMENT_TIMEOUT_MS
 // (the server's statement_timeout is set to the same value), so a dead or partitioned server costs a worker at most
 // that long; a deadline passed is UNAVAILABLE and the connection is dropped. After a failed connect no worker tries
@@ -65,15 +66,13 @@ public:
     std::uint64_t failures() const noexcept { return m_failures.load(std::memory_order_relaxed); }
     std::uint64_t connectAttempts() const noexcept { return m_connectAttempts.load(std::memory_order_relaxed); }
 
-    class Conn;
-
 private:
-    Conn *ready(int worker);
+    PgConn *ready(int worker);
     void note(const char *what, const std::string &detail);
 
     PgSettings m_settings;
     std::vector<Migration> m_migrations;
-    std::vector<std::unique_ptr<Conn>> m_conns;
+    std::vector<std::unique_ptr<PgConn>> m_conns;
     std::atomic<bool> m_schemaVerified{ false };
     std::atomic<bool> m_mismatch{ false };
     std::atomic<bool> m_degraded{ false };
@@ -81,8 +80,7 @@ private:
     std::atomic<std::uint64_t> m_failures{ 0 };
     std::atomic<std::uint64_t> m_connectAttempts{ 0 };
     std::atomic<std::int64_t> m_retryAtNs{ 0 };      // no connect before this (steady clock)
-    std::atomic<std::int64_t> m_lastWarnNs{ 0 };
-    std::atomic<std::uint64_t> m_warnsHeld{ 0 };
+    pg::WarnLimiter m_warns;
     mutable std::mutex m_stateMutex;
     std::string m_state = "not connected";
 };
