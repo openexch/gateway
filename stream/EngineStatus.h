@@ -36,10 +36,14 @@
 //                            round (log positions are bytes). Sampled from two processes, not at one instant, so a node
 //                            polled after the leader can read negative; not clamped. Null while there is no leader
 //   node.entriesBehind       null: no node reports a count of entries, only byte positions
-//   node.snapshot.position   core_snapshot_last_log_position (-1 = never -> null); the matching engine exposes none
+//   node.snapshot.position   <p>snapshot_last_log_position, for both engines (-1 or absent = never -> null)
 //   node.snapshot.atMs       the poll time minus <p>snapshot_age_seconds, fixed when the snapshot is first seen
-//   node.snapshot.stateHash  <p>snapshot_state_hash: no engine exposes a snapshot state hash today, so null
-//   node.version, node.buildCommit  null: neither engine exposes its version or build commit on its endpoint
+//   node.snapshot.stateHash  <p>snapshot_state_hash, taken only when it is all decimal digits; absent, negative or any
+//                            other text is null, so an engine that cannot name its hash never reads as "matched"
+//   node.version             /health version= (the build's release version, as the engine wrote it; absent = null)
+//   node.buildCommit         /health build= (the build's commit sha; absent = null). Not commit=, which stays the
+//                            commit log position. Both tokens come after the existing ones and are optional: an
+//                            engine that sends neither shows null
 //   cluster.leaderId/term    the live node (/health 200) that reports itself leader, with its term (two leaders: the
 //                            higher term wins; the same term twice: null, shown as a conflict). A node that is not live
 //                            keeps the role of its last evidence on its own row and is never the cluster's leader
@@ -81,6 +85,8 @@ struct HealthBody
     std::optional<std::int64_t> elections;
     std::optional<std::int64_t> applied;
     std::optional<std::int64_t> commit;
+    std::optional<std::string> version; // version=, after the position tokens; absent on an engine that does not send it
+    std::optional<std::string> build;   // build=, the build's commit sha as the engine wrote it
 };
 
 // nullopt when the body carries no role= token (not a cluster-kit node probe).
@@ -129,6 +135,8 @@ struct NodeView
     std::optional<std::int64_t> appliedPosition;
     std::optional<std::int64_t> behindBytes;
     SnapshotView snapshot;
+    std::optional<std::string> version;     // /health version=
+    std::optional<std::string> buildCommit; // /health build=
     std::optional<std::string> error;
     // the series the bridge line reads (not rendered per node)
     std::optional<std::int64_t> feedCursor;

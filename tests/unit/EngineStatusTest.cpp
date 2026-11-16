@@ -37,6 +37,15 @@ std::string health(const char *role, std::int64_t term, std::int64_t applied, st
         std::to_string(commit) + " observationAgeMs=2 consensusAgeMs=3 maxLagBytes=65536 maxCheckpointAgeMs=1000\n";
 }
 
+// The /health body of an engine that names its release: the identity tokens come after the existing ones.
+std::string healthWithIdentity(const char *role, std::int64_t term, std::int64_t applied, std::int64_t commit,
+    const std::string &version, const std::string &build)
+{
+    std::string body = health(role, term, applied, commit);
+    body.pop_back(); // the trailing newline
+    return body + " version=" + version + " build=" + build + "\n";
+}
+
 std::string coreMetrics(std::int64_t member, std::int64_t snapshotPosition = -1, std::int64_t snapshotAge = -1,
     const std::string &extra = "")
 {
@@ -113,6 +122,24 @@ TEST(engine_parse_health)
     CHECK(!en::parseHealth("").has_value());
     const auto junk = en::parseHealth("role=LEADER term=x commit=12abc applied==5");
     CHECK(junk && !junk->term && !junk->commit && !junk->applied);
+    // an engine that sends no identity: null, and every other field as before
+    const auto bare = en::parseHealth(health("LEADER", 3, 4000, 4096));
+    CHECK(bare && !bare->version && !bare->build && 4096 == bare->commit.value_or(-9));
+    // version= and build= come after the existing tokens; commit= stays the commit log position even when the build
+    // sha starts with digits
+    const auto named = en::parseHealth(
+        health("LEADER", 3, 4000, 4096) + "version=1.2.3-rc.1+meta build=4096abcdef");
+    CHECK(named && "1.2.3-rc.1+meta" == named->version.value_or("") && "4096abcdef" == named->build.value_or("") &&
+        4096 == named->commit.value_or(-9));
+    const auto both = en::parseHealth("role=LEADER recovery=ready term=3 applied=4000 commit=4096 version=0.1.22 build=1234abc\n");
+    CHECK(both && "0.1.22" == both->version.value_or("") && "1234abc" == both->build.value_or("") &&
+        4096 == both->commit.value_or(-9));
+    // the sanitized placeholder the engine writes when it does not know is shown as written
+    const auto unknown2 = en::parseHealth("role=LEADER commit=7 version=unknown build=unknown");
+    CHECK(unknown2 && "unknown" == unknown2->version.value_or("") && 7 == unknown2->commit.value_or(-9));
+    // a key without a value is null, never an empty string
+    const auto empty = en::parseHealth("role=LEADER version= build=");
+    CHECK(empty && !empty->version && !empty->build);
 }
 
 TEST(engine_parse_metrics)
@@ -284,6 +311,77 @@ TEST(engine_snapshot_matched_and_diverged)
     CHECK(!en::snapshotAgreement(nodes, 6, diverged));
 }
 
+TEST(engine_snapshot_hash_is_digits_only)
+{
+    // an engine that cannot name its hash sends none, or a sentinel: neither may read as an equal hash
+    const auto metrics = [](const char *hash) { return std::string("core_snapshot_state_hash ") + hash + "\n"; };
+    en::ClusterModel core(en::Flavor::CORE, three());
+    core.ingest({ answered(health("LEADER", 3, 9000, 9000), coreMetrics(0, 8192, 10, metrics("-1"))),
+                    answered(health("FOLLOWER", 3, 9000, 9000), coreMetrics(1, 8192, 10, metrics("-1"))),
+                    answered(health("FOLLOWER", 3, 9000, 9000), coreMetrics(2, 8192, 10, metrics("-1"))) },
+        100'000);
+    for (std::int64_t i = 0; i < 3; ++i)
+    {
+        CHECK_MSG(!node(core, i).snapshot.stateHash, "a negative sentinel is accepted as a snapshot hash");
+    }
+    CHECK_MSG(!core.snapshot().agreement, "three nodes reporting -1 read as matched");
+    for (const char *bad : { "NaN", "0x2a", "12ab", "1.5", "+7", "1e3" })
+    {
+        en::ClusterModel one(en::Flavor::CORE, three());
+        one.ingest({ answered(health("LEADER", 3, 9000, 9000), coreMetrics(0, 8192, 10, metrics(bad))), silent(), silent() },
+            100'000);
+        CHECK_MSG(!node(one, 0).snapshot.stateHash, std::string("accepted as a hash: ") + bad);
+    }
+    en::ClusterModel ok(en::Flavor::CORE, three());
+    ok.ingest({ answered(health("LEADER", 3, 9000, 9000), coreMetrics(0, 8192, 10, metrics("0"))), silent(), silent() },
+        100'000);
+    CHECK("0" == node(ok, 0).snapshot.stateHash.value_or(""));
+}
+
+TEST(engine_matching_engine_snapshot_position_and_hash)
+{
+    const auto meMetrics = [](std::int64_t member, const char *position, const char *hash) {
+        return "match_cluster_role 2\nmatch_member_id " + std::to_string(member) +
+            "\nmatch_snapshot_age_seconds 60\nmatch_snapshot_last_log_position " + position +
+            "\nmatch_snapshot_state_hash " + hash + "\nmatch_engine_next_journal_seq 151\n";
+    };
+    en::ClusterModel me(en::Flavor::MATCHING_ENGINE, { { 0, "10.0.1.1", 9500 }, { 1, "10.0.1.2", 9501 }, { 2, "10.0.1.3", 9502 } });
+    me.ingest({ answered(health("LEADER", 7, 500, 500), meMetrics(0, "4096", "3735928559")),
+                  answered(health("FOLLOWER", 7, 500, 500), meMetrics(1, "4096", "3735928559")),
+                  answered(health("FOLLOWER", 7, 500, 500), meMetrics(2, "4096", "3735928559")) },
+        200'000);
+    CHECK(4096 == node(me, 0).snapshot.position.value_or(-9));
+    CHECK("3735928559" == node(me, 1).snapshot.stateHash.value_or(""));
+    CHECK(4096 == me.snapshot().position.value_or(-9));
+    CHECK("matched" == me.snapshot().agreement.value_or(""));
+    me.ingest({ answered(health("LEADER", 7, 500, 500), meMetrics(0, "4096", "3735928559")),
+                  answered(health("FOLLOWER", 7, 500, 500), meMetrics(1, "4096", "1")),
+                  answered(health("FOLLOWER", 7, 500, 500), meMetrics(2, "4096", "3735928559")) },
+        201'000);
+    CHECK("diverged" == me.snapshot().agreement.value_or(""));
+    CHECK(1 == me.divergedNodes().size() && 1 == me.divergedNodes()[0]);
+    // -1 = never taken: no position, and no hash
+    me.ingest({ answered(health("LEADER", 7, 500, 500), meMetrics(0, "-1", "-1")), silent(), silent() }, 202'000);
+    CHECK(!node(me, 0).snapshot.position && !node(me, 0).snapshot.stateHash);
+}
+
+TEST(engine_version_and_build_commit)
+{
+    en::ClusterModel core(en::Flavor::CORE, three());
+    core.ingest({ answered(healthWithIdentity("LEADER", 3, 10, 10, "0.1.22", "1234abc"), coreMetrics(0, 8192, 5)),
+                    answered(health("FOLLOWER", 3, 10, 10), coreMetrics(1, 8192, 5)), silent() },
+        50'000);
+    CHECK("0.1.22" == node(core, 0).version.value_or("") && "1234abc" == node(core, 0).buildCommit.value_or(""));
+    CHECK(10 == node(core, 0).appliedPosition.value_or(-9) && 10 == node(core, 0).commitPosition.value_or(-9));
+    CHECK(!node(core, 1).version && !node(core, 1).buildCommit);
+    const json::object f = parsed(en::engineFrame(core, en::ClusterModel(en::Flavor::MATCHING_ENGINE, {})));
+    const json::array &rows = f.at("core").at("nodes").as_array();
+    CHECK("0.1.22" == rows.at(0).at("version").as_string() && "1234abc" == rows.at(0).at("buildCommit").as_string());
+    CHECK(rows.at(1).at("version").is_null() && rows.at(1).at("buildCommit").is_null());
+    // a node that does not answer shows no identity
+    CHECK(!node(core, 2).version && !node(core, 2).buildCommit);
+}
+
 TEST(engine_null_fields)
 {
     // nothing configured: both blocks all null, no node rows
@@ -313,7 +411,7 @@ TEST(engine_null_fields)
             CHECK_MSG(r.at(k).is_null(), std::string(k) + " is not null before the first poll");
         }
     }
-    // polled and answering: the fields no endpoint supplies stay null (no state hash in the core today)
+    // polled and answering, an engine that sends no identity and no hash: those stay null
     en::ClusterModel core(en::Flavor::CORE, three());
     core.ingest({ answered(health("LEADER", 3, 10, 10), coreMetrics(0, 8192, 5)),
                     answered(health("FOLLOWER", 3, 10, 10), coreMetrics(1, 8192, 5)),
@@ -340,7 +438,7 @@ TEST(engine_matching_engine_block)
         200'000);
     CHECK(0 == me.leaderId().value_or(-9) && 7 == me.term().value_or(-9));
     CHECK(20 == node(me, 1).behindBytes.value_or(-9));
-    CHECK(!node(me, 0).snapshot.position);                   // the matching engine exposes no snapshot position
+    CHECK(!node(me, 0).snapshot.position);                   // this engine sent no snapshot position series
     CHECK(140'000 == node(me, 0).snapshot.atMs.value_or(-9)); // its age is
     CHECK(!node(me, 1).snapshot.atMs);                       // -1 = never
     CHECK(140'000 == me.snapshot().atMs.value_or(-9));
