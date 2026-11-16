@@ -217,31 +217,6 @@ const char *gateName(wire::money::GateState::Value v)
     return wire::money::GateState::c_str(v);
 }
 
-std::string reasonsJson(std::uint32_t bits)
-{
-    std::string out = "[";
-    bool first = true;
-    for (unsigned b = 0; b < 32; ++b)
-    {
-        if (0 == (bits & (1u << b)))
-        {
-            continue;
-        }
-        const auto value = static_cast<wire::money::GateReason::Value>(b);
-        std::string name;
-        try
-        {
-            name = wire::money::GateReason::c_str(value);
-        }
-        catch (...)
-        {
-            name = "BIT_" + std::to_string(b); // a reason this build's schema does not name
-        }
-        out += (first ? "" : ",") + api::quote(name);
-        first = false;
-    }
-    return out + "]";
-}
 
 std::string idJson(std::int64_t v)
 {
@@ -523,7 +498,7 @@ void GatewayApi::status(const Ex &ex)
         std::to_string(config->idempotencyWindowMs()) + ",\"admission\":[";
     auto gate = [](std::int32_t marketId, const session::GateView &g) {
         return "{\"marketId\":" + idJson(marketId) + ",\"gate\":" + (g.known() ? api::quote(gateName(g.state))
-            : std::string("null")) + ",\"reasons\":" + reasonsJson(g.reasons) + ",\"circuitBreaker\":" +
+            : std::string("null")) + ",\"reasons\":" + rest::gateReasonsJson(g.reasons) + ",\"circuitBreaker\":" +
             (g.circuitBreaker ? "true" : "false") + "}";
     };
     out += gate(0, config->global);

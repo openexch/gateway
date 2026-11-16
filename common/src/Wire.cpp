@@ -1,5 +1,7 @@
 #include "gateway/common/Wire.h"
 
+#include "WireEncode.h"
+
 #include <cstring>
 #include <exception>
 #include <iterator>
@@ -32,12 +34,18 @@
 #include "com_openexchange_core_infrastructure_generated/RequestOrderEvents.h"
 #include "com_openexchange_core_infrastructure_generated/RequestOrderSnapshot.h"
 #include "com_openexchange_core_infrastructure_generated/RequestUserBalances.h"
+#include "com_openexchange_core_infrastructure_generated/SettleFault.h"
+#include "com_openexchange_core_infrastructure_generated/SettlementApplied.h"
+#include "com_openexchange_core_infrastructure_generated/SettlementAppliedBatch.h"
 #include "com_openexchange_core_infrastructure_generated/UserBalances.h"
 #include "com_openexchange_core_infrastructure_generated/Withdraw.h"
 #include "com_openexchange_core_infrastructure_generated/WithdrawAck.h"
 #include "com_openexchange_core_infrastructure_generated/WithdrawReject.h"
 
 namespace openexchange { namespace gateway { namespace wire {
+
+using detail::lengthOf;
+using detail::wrapCommand;
 
 #if defined(GW_MONEY_SCHEMA_ID) && defined(GW_MONEY_SCHEMA_VERSION)
 static_assert(MONEY_SCHEMA_ID == GW_MONEY_SCHEMA_ID, "the exported money codecs carry another schema id than dependencies.lock");
@@ -95,6 +103,10 @@ const Layout DECODED[] = {
 // The templates this build ignores (IGNORED_TEMPLATES, same order), checked like the decoded ones and never read.
 const Layout IGNORED[] = {
     { tid::ORDER_FAULT, "OrderFault", money::OrderFault::sbeBlockLength(), 0, {}, {} },
+    { tid::SETTLEMENT_APPLIED, "SettlementApplied", money::SettlementApplied::sbeBlockLength(), 0, {}, {} },
+    { tid::SETTLE_FAULT, "SettleFault", money::SettleFault::sbeBlockLength(), 0, {}, {} },
+    { tid::SETTLEMENT_APPLIED_BATCH, "SettlementAppliedBatch", money::SettlementAppliedBatch::sbeBlockLength(), 1,
+        { money::SettlementAppliedBatch::Settlements::sbeBlockLength(), 0 }, { "settlements", "" } },
 };
 static_assert(std::size(IGNORED) == IGNORED_TEMPLATES.size(), "one layout per ignored template");
 
@@ -561,40 +573,6 @@ void deliver(const Layout &layout, const std::uint8_t *payload, std::size_t leng
     }
 }
 
-template<typename M>
-M *wrapCommand(M &encoder, std::uint8_t *buffer, std::size_t capacity) noexcept
-{
-    if (nullptr == buffer || capacity < HEADER_LENGTH + M::sbeBlockLength())
-    {
-        return nullptr;
-    }
-    encoder.wrapAndApplyHeader(reinterpret_cast<char *>(buffer), 0, capacity);
-    return &encoder;
-}
-
-template<typename M>
-std::size_t lengthOf(const M &) noexcept
-{
-    return HEADER_LENGTH + M::sbeBlockLength();
-}
-
-template<typename M>
-std::size_t encodeMoney(const MoneyCommand &c, std::uint8_t *buffer, std::size_t capacity) noexcept
-{
-    M e;
-    if (nullptr == wrapCommand(e, buffer, capacity))
-    {
-        return 0;
-    }
-    e.correlationId(c.correlationId)
-        .userId(c.userId)
-        .assetId(c.assetId)
-        .amount(c.amount)
-        .requestIdHigh(c.requestIdHigh)
-        .requestIdLow(c.requestIdLow);
-    return lengthOf(e);
-}
-
 }
 
 const char *templateName(std::uint16_t templateId) noexcept
@@ -621,86 +599,6 @@ const char *templateName(std::uint16_t templateId) noexcept
         case tid::REGISTER_SESSION: return "RegisterSession";
         default: return "unknown";
     }
-}
-
-std::size_t encodeDeposit(const MoneyCommand &command, std::uint8_t *buffer, std::size_t capacity) noexcept
-{
-    return encodeMoney<money::Deposit>(command, buffer, capacity);
-}
-
-std::size_t encodeWithdraw(const MoneyCommand &command, std::uint8_t *buffer, std::size_t capacity) noexcept
-{
-    return encodeMoney<money::Withdraw>(command, buffer, capacity);
-}
-
-std::size_t encode(const CreateOrder &c, std::uint8_t *buffer, std::size_t capacity) noexcept
-{
-    money::CreateOrder e;
-    if (nullptr == wrapCommand(e, buffer, capacity))
-    {
-        return 0;
-    }
-#ifdef GW_NC_SWAPPED_FIELD
-    // test-only control: price and quantity swapped; the golden parity row must fail naming CreateOrder
-    const std::int64_t price = c.quantity;
-    const std::int64_t quantity = c.price;
-#else
-    const std::int64_t price = c.price;
-    const std::int64_t quantity = c.quantity;
-#endif
-    e.correlationId(c.correlationId)
-        .userId(c.userId)
-        .clientOrderIdHigh(c.clientOrderIdHigh)
-        .clientOrderIdLow(c.clientOrderIdLow)
-        .requestIdHigh(c.requestIdHigh)
-        .requestIdLow(c.requestIdLow)
-        .marketId(c.marketId)
-        .side(c.side)
-        .orderType(c.orderType)
-        .timeInForce(c.timeInForce)
-        .price(price)
-        .quantity(quantity)
-        .budget(c.budget)
-        .stopPrice(c.stopPrice)
-        .trailingDelta(c.trailingDelta)
-        .displayQty(c.displayQty)
-        .expiresAtMs(c.expiresAtMs);
-    e.flags().rawValue(c.flags);
-    return lengthOf(e);
-}
-
-std::size_t encode(const CancelOrder &c, std::uint8_t *buffer, std::size_t capacity) noexcept
-{
-    money::CancelOrder e;
-    if (nullptr == wrapCommand(e, buffer, capacity))
-    {
-        return 0;
-    }
-    e.correlationId(c.correlationId)
-        .userId(c.userId)
-        .orderId(c.orderId)
-        .requestIdHigh(c.requestIdHigh)
-        .requestIdLow(c.requestIdLow)
-        .origClientOrderIdHigh(c.origClientOrderIdHigh)
-        .origClientOrderIdLow(c.origClientOrderIdLow);
-    return lengthOf(e);
-}
-
-std::size_t encode(const AmendOrder &c, std::uint8_t *buffer, std::size_t capacity) noexcept
-{
-    money::AmendOrder e;
-    if (nullptr == wrapCommand(e, buffer, capacity))
-    {
-        return 0;
-    }
-    e.correlationId(c.correlationId)
-        .userId(c.userId)
-        .orderId(c.orderId)
-        .requestIdHigh(c.requestIdHigh)
-        .requestIdLow(c.requestIdLow)
-        .newPrice(c.newPrice)
-        .newQuantity(c.newQuantity);
-    return lengthOf(e);
 }
 
 std::size_t encode(const RequestOrderSnapshot &c, std::uint8_t *buffer, std::size_t capacity) noexcept

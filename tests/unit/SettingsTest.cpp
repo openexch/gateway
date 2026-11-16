@@ -571,3 +571,61 @@ TEST(rate_and_list_helpers)
     CHECK(!splitList("a,,b").has_value());
     CHECK(!splitList("").has_value());
 }
+
+// The engine status feed's settings: node endpoint lists (unset = no node polled, that block all null), the poll, its
+// timeout, the rate cap and the body bound, each a setting with a default; a malformed list is named.
+TEST(stream_engine_settings)
+{
+    const auto d = st(streamEnv());
+    CHECK_MSG(d.ok(), joined(d.errors));
+    CHECK(d.settings.coreNodeEndpoints.empty());
+    CHECK(d.settings.meNodeEndpoints.empty());
+    CHECK(1000 == d.settings.enginePollMs);
+    CHECK(500 == d.settings.enginePollTimeoutMs);
+    CHECK(1000 == d.settings.engineFrameMinMs);
+    CHECK(1'048'576 == d.settings.engineMaxBodyBytes);
+    const auto r = st(with(streamEnv(), { { "STREAM_CORE_NODE_ENDPOINTS", "0@10.0.0.1:9700,1@10.0.0.2:9701,2@node-c:9702" },
+                                          { "STREAM_ME_NODE_ENDPOINTS", "0@10.0.1.1:9500" },
+                                          { "STREAM_ENGINE_POLL_MS", "250" },
+                                          { "STREAM_ENGINE_POLL_TIMEOUT_MS", "200" },
+                                          { "STREAM_ENGINE_FRAME_MIN_MS", "2000" } }));
+    CHECK_MSG(r.ok(), joined(r.errors));
+    CHECK(3 == r.settings.coreNodeEndpoints.size());
+    CHECK(1 == r.settings.meNodeEndpoints.size());
+    if (3 == r.settings.coreNodeEndpoints.size())
+    {
+        CHECK(0 == r.settings.coreNodeEndpoints[0].memberId);
+        CHECK("10.0.0.1" == r.settings.coreNodeEndpoints[0].host);
+        CHECK(9700 == r.settings.coreNodeEndpoints[0].port);
+        CHECK("node-c" == r.settings.coreNodeEndpoints[2].host);
+        CHECK(2 == r.settings.coreNodeEndpoints[2].memberId);
+    }
+    CHECK(250 == r.settings.enginePollMs);
+    CHECK(2000 == r.settings.engineFrameMinMs);
+    for (const std::string bad : { "0@h:0", "0@h:65536", "x@h:1", "-1@h:1", "0@:9700", "0h:9700", "0@h", "0@h:1,", "0@h:1,0@g:2",
+             "0@h:1,,1@g:2" })
+    {
+        onlyProblem(st(with(streamEnv(), { { "STREAM_CORE_NODE_ENDPOINTS", bad } })), "STREAM_CORE_NODE_ENDPOINTS");
+    }
+    onlyProblem(st(with(streamEnv(), { { "STREAM_ME_NODE_ENDPOINTS", "" } })), "STREAM_ME_NODE_ENDPOINTS");
+    onlyProblem(st(with(streamEnv(), { { "STREAM_ENGINE_POLL_MS", "0" } })), "STREAM_ENGINE_POLL_MS");
+    onlyProblem(st(with(streamEnv(), { { "STREAM_ENGINE_FRAME_MIN_MS", "-5" } })), "STREAM_ENGINE_FRAME_MIN_MS");
+    // an IPv6 literal is written in brackets; the host is the address without them
+    const auto v6 = st(with(streamEnv(), { { "STREAM_CORE_NODE_ENDPOINTS", "0@[::1]:9090,1@[fd00::2]:9091" } }));
+    CHECK_MSG(v6.ok(), joined(v6.errors));
+    if (2 == v6.settings.coreNodeEndpoints.size())
+    {
+        CHECK_MSG("::1" == v6.settings.coreNodeEndpoints[0].host,
+            "IPv6 host kept its brackets: " + v6.settings.coreNodeEndpoints[0].host);
+        CHECK(9090 == v6.settings.coreNodeEndpoints[0].port);
+        CHECK("fd00::2" == v6.settings.coreNodeEndpoints[1].host);
+    }
+    for (const std::string bad : { "0@::1:9090", "0@[::1]9090", "0@[]:9090", "0@[::1:9090" })
+    {
+        onlyProblem(st(with(streamEnv(), { { "STREAM_CORE_NODE_ENDPOINTS", bad } })), "STREAM_CORE_NODE_ENDPOINTS");
+    }
+    // a request timeout at or above the poll interval: rounds would run back to back (refused, not silently accepted)
+    onlyProblem(st(with(streamEnv(), { { "STREAM_ENGINE_POLL_MS", "250" } })), "STREAM_ENGINE_POLL_TIMEOUT_MS");
+    onlyProblem(st(with(streamEnv(), { { "STREAM_ENGINE_POLL_MS", "500" }, { "STREAM_ENGINE_POLL_TIMEOUT_MS", "500" } })),
+        "STREAM_ENGINE_POLL_TIMEOUT_MS");
+}

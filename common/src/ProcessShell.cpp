@@ -171,7 +171,8 @@ void runProcess(const ProcessIdentity &id, const ProcessInputs &in)
             view.logDropped = log.dropped();
             if (front)
             {
-                view.status.publicListenerAccepting = front->accepting();
+                (Role::GATEWAY == id.role ? view.status.publicListenerAccepting : view.status.wsListenerAccepting) =
+                    front->accepting();
                 view.frontHealth = front->healthJson();
                 view.frontMetrics = front->metrics(Role::GATEWAY == id.role ? "gateway_" : "stream_");
             }

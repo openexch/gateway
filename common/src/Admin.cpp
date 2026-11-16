@@ -182,17 +182,22 @@ std::string renderMetrics(const AdminView &v)
     gauge("session_connected", "1 while a session to a leader is open.", s.connected ? "1" : "0");
     gauge("session_registered", "1 after the registration ack of the current session.", s.registered ? "1" : "0");
     counter("session_epoch", "Sessions opened since start.", std::to_string(s.sessionEpoch));
-    if (Role::GATEWAY == v.role)
+    // the core session's counters (both binaries: each holds one GATEWAY-class session)
     {
         counter("session_registrations_total", "Registration rounds that reached REGISTERED (the AdminAck arrived).",
             std::to_string(s.registrations));
         gauge("inflight", "Requests the core session holds, offered or waiting to be offered.", std::to_string(s.inflight));
+    }
+    if (Role::GATEWAY == v.role)
+    {
         counter("reoffers_total", "Successful offers of a request after its first (re-offers after a new session or leader).",
             std::to_string(s.reoffers));
         counter("late_replies_total", "Replies for a correlation id no longer held (answered or expired), dropped.",
             std::to_string(s.lateReplies));
         counter("outcome_unknown_total", "Requests that reached their deadline offered and unanswered (504).",
             std::to_string(s.outcomeUnknown));
+    }
+    {
         counter("query_budget_wait_seconds", "Total time core queries waited for a query budget token.",
             std::to_string(static_cast<double>(s.queryBudgetWaitNs) / 1e9));
         counter("decode_refused_total", "Egress frames the money-frame decoder refused.", std::to_string(s.decodeRefused));

@@ -24,7 +24,9 @@
 // pins). One copy for both binaries.
 //
 // Encode: one plain struct per command, encode() writes header and body and returns the frame length (0 when the
-// buffer is shorter than the frame). RegisterSession is not here: the cluster-tools session registrar encodes it.
+// buffer is shorter than the frame). RegisterSession is not here: the cluster-tools session registrar encodes it. The
+// encoders of the commands that write (50, 51, 52 and the money commands 1, 2) are in OrderEntry.h, outside this file,
+// so a binary can be built without them (oe-stream).
 //
 // Decode: Decoder::decode() checks the frame before any field is read, and refuses it, counted by reason, when
 //   - it is shorter than its header, its block or a group it declares (truncated),
@@ -39,8 +41,9 @@
 // checked before the first handler call, so a refusal never leaves a handler with part of a batch. decode() never
 // throws (nothing, std::exception or not, leaves it) and never reads outside [payload, payload + length).
 //
-// Ignored templates (IGNORED_TEMPLATES): frames the core sends on a channel the gateway subscribes to that the gateway
-// has no reader for (OrderFault, a CONTROL broadcast). One that passes the same header, version and length checks is
+// Ignored templates (IGNORED_TEMPLATES): frames the core sends on a channel the gateway subscribes to, or that reach
+// it before its channel mask applies, that the gateway has no reader for (OrderFault, a CONTROL broadcast; the
+// settlement broadcasts, see below). One that passes the same header, version and length checks is
 // counted by template (DecodeCounters::ignored), delivered to no one and not refused; a malformed one is refused like
 // any other frame. Any other template stays unknown_template.
 //
@@ -90,6 +93,9 @@ inline constexpr std::uint16_t ORDER_EVENTS_PAGE = 115;
 inline constexpr std::uint16_t ORDER_EVENTS_END = 116;
 inline constexpr std::uint16_t USER_BALANCES = 117;
 inline constexpr std::uint16_t ORDER_FAULT = 113;
+inline constexpr std::uint16_t SETTLEMENT_APPLIED = 13;
+inline constexpr std::uint16_t SETTLE_FAULT = 21;
+inline constexpr std::uint16_t SETTLEMENT_APPLIED_BATCH = 24;
 inline constexpr std::uint16_t CORE_CONFIG_REPORT = 118;
 }
 
@@ -107,7 +113,11 @@ inline constexpr std::array<std::uint16_t, 19> DECODED_TEMPLATES = { tid::BALANC
     tid::ORDER_EVENTS_END, tid::USER_BALANCES, tid::CORE_CONFIG_REPORT };
 // What the core sends on the channels the gateway subscribes to (ACKS and CONTROL; every reply to a command it sends
 // is in DECODED_TEMPLATES) that the gateway does not read: CoreEventPublisher.onOrderFault, BROADCAST on CH_CONTROL.
-inline constexpr std::array<std::uint16_t, 1> IGNORED_TEMPLATES = { tid::ORDER_FAULT };
+// Also the CH_SETTLEMENTS broadcasts (SettlementApplied, SettleFault, SettlementAppliedBatch): the core opens a new
+// session with every legacy channel until its RegisterSession lands, so these can arrive before the session's real
+// mask applies.
+inline constexpr std::array<std::uint16_t, 4> IGNORED_TEMPLATES = { tid::ORDER_FAULT, tid::SETTLEMENT_APPLIED,
+    tid::SETTLE_FAULT, tid::SETTLEMENT_APPLIED_BATCH };
 
 // ---- commands (gateway -> core) ----
 
@@ -198,11 +208,8 @@ struct RequestCoreConfig
     bool operator==(const RequestCoreConfig &) const = default;
 };
 
-std::size_t encodeDeposit(const MoneyCommand &command, std::uint8_t *buffer, std::size_t capacity) noexcept;
-std::size_t encodeWithdraw(const MoneyCommand &command, std::uint8_t *buffer, std::size_t capacity) noexcept;
-std::size_t encode(const CreateOrder &command, std::uint8_t *buffer, std::size_t capacity) noexcept;
-std::size_t encode(const CancelOrder &command, std::uint8_t *buffer, std::size_t capacity) noexcept;
-std::size_t encode(const AmendOrder &command, std::uint8_t *buffer, std::size_t capacity) noexcept;
+// The writes (Deposit, Withdraw, CreateOrder, CancelOrder, AmendOrder) are encoded by OrderEntry.h, a library oe-stream
+// does not link. The reads:
 std::size_t encode(const RequestOrderSnapshot &command, std::uint8_t *buffer, std::size_t capacity) noexcept;
 std::size_t encode(const RequestOrderEvents &command, std::uint8_t *buffer, std::size_t capacity) noexcept;
 std::size_t encode(const RequestUserBalances &command, std::uint8_t *buffer, std::size_t capacity) noexcept;
