@@ -65,6 +65,28 @@ std::optional<std::string> roleName(const std::string &role)
 
 }
 
+namespace {
+
+// A snapshot state hash is the engine's unsigned decimal; anything else (a sentinel such as -1, a word, an empty text) is
+// not a hash.
+bool isDigits(const std::string &text)
+{
+    if (text.empty())
+    {
+        return false;
+    }
+    for (const char c : text)
+    {
+        if (c < '0' || c > '9')
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+}
+
 std::optional<HealthBody> parseHealth(std::string_view body)
 {
     HealthBody h;
@@ -97,6 +119,14 @@ std::optional<HealthBody> parseHealth(std::string_view body)
         else if ("recovery" == key)
         {
             h.recovery = std::string(value);
+        }
+        else if ("version" == key)
+        {
+            h.version = value.empty() ? std::nullopt : std::optional<std::string>(std::string(value));
+        }
+        else if ("build" == key)
+        {
+            h.build = value.empty() ? std::nullopt : std::optional<std::string>(std::string(value));
         }
         else if (parseInt(value, v))
         {
@@ -257,10 +287,14 @@ NodeView ClusterModel::readNode(const NodeEndpointSpec &spec, const NodeSample &
     v.term = h->term;
     v.commitPosition = h->commit;
     v.appliedPosition = h->applied;
+    v.version = h->version;
+    v.buildCommit = h->build;
+    {
+        const std::optional<std::int64_t> pos = metricInt(m, m_prefix + "snapshot_last_log_position");
+        v.snapshot.position = pos && *pos >= 0 ? pos : std::nullopt;
+    }
     if (Flavor::CORE == m_flavor)
     {
-        const std::optional<std::int64_t> pos = metricInt(m, "core_snapshot_last_log_position");
-        v.snapshot.position = pos && *pos >= 0 ? pos : std::nullopt;
         v.feedCursor = metricInt(m, "core_feed_cursor");
     }
     else
@@ -279,7 +313,7 @@ NodeView ClusterModel::readNode(const NodeEndpointSpec &spec, const NodeSample &
         v.snapshot.atMs = same ? before->snapshot.atMs : std::optional<std::int64_t>(nowMs - *age * 1000);
     }
     const auto hash = m.find(m_prefix + "snapshot_state_hash");
-    if (hash != m.end())
+    if (hash != m.end() && isDigits(hash->second))
     {
         v.snapshot.stateHash = hash->second;
     }
@@ -502,7 +536,8 @@ std::string ClusterModel::json() const
             num(n.commitPosition) + ",\"appliedPosition\":" + num(n.appliedPosition) + ",\"behindBytes\":" +
             num(n.behindBytes) + ",\"entriesBehind\":null,\"snapshot\":{\"position\":" + num(n.snapshot.position) +
             ",\"atMs\":" + num(n.snapshot.atMs) + ",\"stateHash\":" + str(n.snapshot.stateHash) + ",\"agreement\":" +
-            str(n.snapshot.agreement) + "},\"version\":null,\"buildCommit\":null,\"error\":" + str(n.error) + "}";
+            str(n.snapshot.agreement) + "},\"version\":" + str(n.version) + ",\"buildCommit\":" + str(n.buildCommit) +
+            ",\"error\":" + str(n.error) + "}";
     }
     out += "],\"lastElection\":";
     if (m_lastElection)

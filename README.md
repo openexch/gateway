@@ -199,8 +199,13 @@ name lookups included, ends by `STREAM_ENGINE_POLL_TIMEOUT_MS`, which must be be
 refuses otherwise, exit 78). A node that does not answer is `unreachable` with null values; a follower's row
 always comes from that follower. The leader is the live node (`/health` 200) that reports itself leader.
 `behindBytes` and `bridge.entriesBehind` compare two answers sampled at different instants, so they can
-briefly read negative. Fields no node supplies are null and render as a dash: snapshot state hash, version,
-build commit, entries behind, election duration, first entry position, order entry reopened. Each instance
+briefly read negative. The snapshot block reads `<prefix>snapshot_last_log_position` and
+`<prefix>snapshot_state_hash` (prefix `core_` or `match_`); the hash is a CRC32C of the snapshot payload, taken
+only when it is all digits, and nodes that report one hash at one position read `matched`. A node that cannot
+name its hash omits the series. `version` and `buildCommit` come from the `version=` and `build=` tokens at the
+end of `/health` (`commit=` stays the commit log position); an engine build without them shows null, and a
+build without a release stamp shows `unknown`. Fields no node supplies are null and render as a dash: entries
+behind, election duration, first entry position, order entry reopened. Each instance
 makes 2 x nodes HTTP requests per poll and adds nothing to the cluster log.
 
 New settings with defaults: `STREAM_REQUEST_TIMEOUT_MS` 5000, `STREAM_WS_MAX_MESSAGE_BYTES` 65536,
