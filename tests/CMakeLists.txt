@@ -4,6 +4,9 @@
 # builds and the test media driver, never published).
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
+option(GW_PG_TESTS "Run the users-store tests against PostgreSQL in a docker container" OFF)
+set(GW_PG_TEST_IMAGE "postgres:16.9-alpine@sha256:7c688148e5e156d0e86df7ba8ae5a05a2386aaec1e2ad8e6d11bdf10504b1fb7"
+    CACHE STRING "the PostgreSQL image of the users-store tests (pinned by digest)")
 
 # The codec tests read two golden corpora written by the core's Java encoders at the commit dependencies.lock pins:
 # the gateway's own (tests/golden/gateway_frames.inc, tests/golden/regen.sh) and cluster-tools' (golden_frames.inc of
@@ -48,10 +51,11 @@ if(NOT EXISTS "${GW_CT_FAKE_TRANSPORT_DIR}/FakeTransport.h")
 endif()
 
 add_executable(gw_unit_tests unit/TestMain.cpp unit/SettingsTest.cpp unit/AdminTest.cpp unit/WireGoldenTest.cpp
-    unit/WireRefusalTest.cpp unit/WireClusterToolsGoldenTest.cpp unit/SessionTest.cpp)
+    unit/WireRefusalTest.cpp unit/WireClusterToolsGoldenTest.cpp unit/SessionTest.cpp unit/AuthTest.cpp
+    unit/GatewayApiTest.cpp unit/RestTest.cpp unit/RestRoutesTest.cpp)
 target_include_directories(gw_unit_tests PRIVATE unit golden "${GW_CT_GOLDEN_DIR}" "${GW_CT_FAKE_TRANSPORT_DIR}")
 target_compile_definitions(gw_unit_tests PRIVATE ${GW_WIRE_TEST_DEFINITIONS})
-target_link_libraries(gw_unit_tests PRIVATE gw_common)
+target_link_libraries(gw_unit_tests PRIVATE oe_gateway_app gw_common)
 target_compile_options(gw_unit_tests PRIVATE ${GW_WARNINGS})
 add_test(NAME unit COMMAND gw_unit_tests)
 
@@ -116,6 +120,81 @@ foreach(control IN LISTS GW_SESSION_CONTROLS)
     set_tests_properties(${target} PROPERTIES PASS_REGULAR_EXPRESSION "${text}")
 endforeach()
 
+# Controls for the auth rows: each build compiles one source with one rule switched off (test-only defines, never in a
+# binary) and runs the case that guards it; the case must fail with the named text.
+#   GW_NC_QUERY_TOKEN        the principal resolver also reads ?token= from the URL
+#   GW_NC_HASH_ON_IO         PBKDF2 runs on the request's I/O strand instead of the hash pool
+#   GW_NC_NO_IDENTITY_CHECK  register writes the row without asking the core
+set(GW_AUTH_CONTROLS
+    "GW_NC_QUERY_TOKEN|unit/AuthTest.cpp|${PROJECT_SOURCE_DIR}/common/src/Authenticator.cpp|auth_token_never_read_from_url|token accepted from URL"
+    "GW_NC_HASH_ON_IO|unit/GatewayApiTest.cpp|${PROJECT_SOURCE_DIR}/gateway/GatewayApi.cpp|api_unauthenticated_budget|order request delayed by login burst"
+    "GW_NC_NO_IDENTITY_CHECK|unit/GatewayApiTest.cpp|${PROJECT_SOURCE_DIR}/gateway/GatewayApi.cpp|api_identity_check|new user inherited an existing account")
+foreach(control IN LISTS GW_AUTH_CONTROLS)
+    string(REPLACE "|" ";" parts "${control}")
+    list(GET parts 0 define)
+    list(GET parts 1 test_source)
+    list(GET parts 2 rule_source)
+    list(GET parts 3 case)
+    list(GET parts 4 text)
+    string(TOLOWER "${define}" target)
+    string(REPLACE "gw_nc_" "gw_auth_nc_" target "${target}")
+    set(extra_sources "")
+    if(rule_source MATCHES "GatewayApi.cpp$")
+        set(extra_sources "${PROJECT_SOURCE_DIR}/gateway/GatewayRoutes.cpp") # the rest of GatewayApi's members
+    endif()
+    add_executable(${target} unit/TestMain.cpp ${test_source} ${rule_source} ${extra_sources})
+    target_include_directories(${target} PRIVATE unit "${PROJECT_SOURCE_DIR}/gateway")
+    target_compile_definitions(${target} PRIVATE ${define})
+    target_link_libraries(${target} PRIVATE gw_common)
+    target_compile_options(${target} PRIVATE ${GW_WARNINGS})
+    add_test(NAME ${target} COMMAND ${target} ${case})
+    set_tests_properties(${target} PROPERTIES PASS_REGULAR_EXPRESSION "${text}")
+endforeach()
+
+# Controls for the REST rows: each build compiles the routes (and the status table) with one rule switched off
+# (test-only defines, never in a binary) and runs the case that guards it; the case must fail with the named text.
+#   GW_NC_KEYFINAL_INVERTED       the status table answers keyFinal inverted for every reason
+#   GW_NC_NO_CANCEL_REOFFER_RULE  a re-offered unkeyed cancel is answered by its UNKNOWN_ORDER or NOT_OPEN reject
+#   GW_NC_NO_ASSET_CHECK          a deposit is sent with an assetId the core's asset list does not hold
+#   GW_NC_RANDOM_FUNDING_ID       register funding uses a fresh random requestId per attempt
+#   GW_NC_BODY_USER               a userId in a request body is accepted, and the bulk cancel uses it
+set(GW_REST_CONTROLS
+    "GW_NC_KEYFINAL_INVERTED|unit/RestTest.cpp|rest_status_table|keyFinal wrong for [A-Z_]+"
+    "GW_NC_NO_CANCEL_REOFFER_RULE|unit/RestRoutesTest.cpp|routes_cancel_reoffer_rule|successful cancel answered NOT_FOUND"
+    "GW_NC_NO_ASSET_CHECK|unit/RestRoutesTest.cpp|routes_treasury_unknown_asset|request unanswered: decode drop"
+    "GW_NC_RANDOM_FUNDING_ID|unit/RestRoutesTest.cpp|routes_register_funding|registration funded twice"
+    "GW_NC_BODY_USER|unit/RestRoutesTest.cpp|routes_cancel_owner_binding|cancel of another user's order accepted")
+foreach(control IN LISTS GW_REST_CONTROLS)
+    string(REPLACE "|" ";" parts "${control}")
+    list(GET parts 0 define)
+    list(GET parts 1 test_source)
+    list(GET parts 2 case)
+    list(GET parts 3 text)
+    string(TOLOWER "${define}" target)
+    string(REPLACE "gw_nc_" "gw_rest_nc_" target "${target}")
+    add_executable(${target} unit/TestMain.cpp ${test_source} "${PROJECT_SOURCE_DIR}/common/src/Rest.cpp"
+        "${PROJECT_SOURCE_DIR}/common/src/Api.cpp" "${PROJECT_SOURCE_DIR}/gateway/GatewayApi.cpp"
+        "${PROJECT_SOURCE_DIR}/gateway/GatewayRoutes.cpp")
+    target_include_directories(${target} PRIVATE unit "${PROJECT_SOURCE_DIR}/gateway")
+    target_compile_definitions(${target} PRIVATE ${define})
+    target_link_libraries(${target} PRIVATE gw_common)
+    target_compile_options(${target} PRIVATE ${GW_WARNINGS})
+    add_test(NAME ${target} COMMAND ${target} ${case})
+    set_tests_properties(${target} PROPERTIES PASS_REGULAR_EXPRESSION "${text}")
+endforeach()
+
+# The users store against a real PostgreSQL in a throwaway container (docker; the image pinned by digest). Built
+# always; registered with GW_PG_TESTS=ON.
+add_executable(gw_pg_tests unit/TestMain.cpp pg/PgStoreTest.cpp)
+target_include_directories(gw_pg_tests PRIVATE unit)
+target_link_libraries(gw_pg_tests PRIVATE gw_common)
+target_compile_options(gw_pg_tests PRIVATE ${GW_WARNINGS})
+if(GW_PG_TESTS)
+    add_test(NAME pg.users COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/pg/pg_it.py"
+        --binary "$<TARGET_FILE:gw_pg_tests>" --image "${GW_PG_TEST_IMAGE}")
+    set_tests_properties(pg.users PROPERTIES TIMEOUT 300 LABELS pg RUN_SERIAL TRUE)
+endif()
+
 add_test(NAME lock COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/lock/lock_test.sh" "${PROJECT_SOURCE_DIR}" "${CMAKE_COMMAND}"
     "${CMAKE_CURRENT_BINARY_DIR}/lock-work")
 
@@ -147,9 +226,32 @@ if(GW_TEST_BUILDS)
             set_tests_properties(it.session.${mode} PROPERTIES TIMEOUT 900 LABELS t1 RUN_SERIAL TRUE)
             math(EXPR _port "${_port} + 1000")
         endforeach()
+        # the REST routes through the real oe-gateway (dev principals, no users database), the treasury lane off and on
+        set(_port 30000)
+        foreach(mode embedded external)
+            add_test(NAME it.rest.${mode}
+                COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/it/rest_it.py"
+                    --bin-dir "${PROJECT_BINARY_DIR}/bin" --core-jar "${GW_IT_CORE_JAR}" --probe-jar "${GW_IT_PROBE_JAR}"
+                    --mode ${mode} --work "${CMAKE_CURRENT_BINARY_DIR}/it-work/rest.${mode}" --port-base ${_port})
+            set_tests_properties(it.rest.${mode} PROPERTIES TIMEOUT 900 LABELS t1 RUN_SERIAL TRUE)
+            math(EXPR _port "${_port} + 1000")
+        endforeach()
+        # the auth routes through the real oe-gateway: the core cluster plus a throwaway PostgreSQL container
+        if(GW_PG_TESTS)
+            set(_port 28000)
+            foreach(mode embedded external)
+                add_test(NAME it.auth.${mode}
+                    COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/it/auth_it.py"
+                        --bin-dir "${PROJECT_BINARY_DIR}/bin" --core-jar "${GW_IT_CORE_JAR}" --probe-jar "${GW_IT_PROBE_JAR}"
+                        --image "${GW_PG_TEST_IMAGE}" --mode ${mode} --work "${CMAKE_CURRENT_BINARY_DIR}/it-work/auth.${mode}"
+                        --port-base ${_port})
+                set_tests_properties(it.auth.${mode} PROPERTIES TIMEOUT 900 LABELS t1 RUN_SERIAL TRUE)
+                math(EXPR _port "${_port} + 1000")
+            endforeach()
+        endif()
     endif()
 
-    set(GW_PROCESS_CASES config_refused config_bad_values embedded_start_stop external_start_stop
+    set(GW_PROCESS_CASES config_refused config_bad_values config_auth_files embedded_start_stop external_start_stop
         external_without_driver external_aeron_dir_missing external_driver_killed embedded_same_instance_refused admin_bind_in_use duty_stall)
     foreach(role gateway stream)
         foreach(case IN LISTS GW_PROCESS_CASES)
@@ -160,4 +262,9 @@ if(GW_TEST_BUILDS)
             set_tests_properties(process.${role}.${case} PROPERTIES TIMEOUT 120 LABELS process)
         endforeach()
     endforeach()
+    add_test(NAME process.gateway.public_bind_in_use
+        COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/process/process_test.py"
+            --bin-dir "${PROJECT_BINARY_DIR}/bin" --work "${CMAKE_CURRENT_BINARY_DIR}/process-work/gateway.public_bind_in_use"
+            gateway.public_bind_in_use)
+    set_tests_properties(process.gateway.public_bind_in_use PROPERTIES TIMEOUT 120 LABELS process)
 endif()

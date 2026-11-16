@@ -5,7 +5,7 @@ Open Exchange core. Each has its own cluster session and no shared state; run N 
 one static library, `gw_common`.
 
 This version has the process shell (settings, both media driver modes, the supervisor, the admin
-endpoints), the wire codec and `oe-gateway`'s core session. REST routes, auth and streams come next.
+endpoints), the wire codec, `oe-gateway`'s core session, auth and the REST routes. User streams come next.
 
 ## Build
 
@@ -23,6 +23,11 @@ ctest --test-dir build --output-on-failure
 core commit, id, version and sha256. `scripts/fetch-cluster-tools.sh` refuses any mismatch, and the CMake
 configure refuses a package built from another commit or carrying another schema. To re-pin:
 `scripts/repin-cluster-tools.sh <40-hex commit>`, review the diff, commit the lock.
+
+The lock also pins Boost, OpenSSL and libpq by source tarball and sha256. Build them with
+`scripts/build-deps.sh <cache> <prefix>` and pass `-DGW_DEPS_PREFIX=<prefix>`; configure checks the build stamp
+and the version headers against the lock. `-DGW_PG_TESTS=ON` runs the PostgreSQL tests in docker. A security
+fix in one of them is a re-pin of the lock.
 
 ## Run
 
@@ -86,6 +91,65 @@ Build-Sha and `sbe/money-schema.xml` sha256 match the lock.
 
 Exit codes: 0 clean stop; 70 process health (driver death or timeout, conductor heartbeat, duty watchdog, a
 stop bound hit); 75 temporary; 78 configuration (set `RestartPreventExitStatus=78`).
+
+## Auth
+
+`oe-gateway` serves `/api/v2` on `GATEWAY_HTTP_BIND` (Boost.Beast, `GATEWAY_IO_THREADS` `gw-io` threads), with
+`POST /auth/register`, `POST /auth/login`, `POST /auth/logout` and `GET /auth/me`. `GATEWAY_AUTH_MODES` takes:
+
+- `api-key`: `X-API-Key`, keys from `GATEWAY_API_KEYS_FILE` as `key:userId`.
+- `jwt`: `Authorization: Bearer`, HS256, `exp` required, `sub` is the userId, secret from
+  `GATEWAY_JWT_SECRET_FILE`.
+- `demo`: an opaque token, stored as SHA-256 in PostgreSQL (`GATEWAY_PG_URL`). The schema is `db/migration`;
+  `oe-gateway` applies it under an advisory lock and records its sha256, `oe-stream` only verifies it.
+- `dev`: only with `GATEWAY_ALLOW_DEV_AUTH=1`.
+
+A missing or bad key or secret file stops the process with exit 78. A credential is never read from a URL, and
+no request can name a user. Password hashing (PBKDF2-SHA256, `GATEWAY_PBKDF2_ITERATIONS`, default 600000; a stored hash keeps its own count) runs on `gw-hash`
+(`GATEWAY_HASH_THREADS`, `GATEWAY_HASH_QUEUE`; a full queue is 503 AUTH_BUSY). Users-store calls run on
+`gw-pg-auth`. Register and login are rate limited globally and per source address (`<n>/s` or `<n>/min` plus a
+burst; `GATEWAY_TRUSTED_PROXIES` decides the source; IPv6 sources share a budget per
+`GATEWAY_SOURCE_IPV6_PREFIX`, default 64). Registration asks the core whether the new userId already exists and
+refuses with 503 IDENTITY_STORE_INCONSISTENT when it does.
+
+Bearer tokens the gateway has not cached cost a users-database lookup, with their own budget per source:
+`GATEWAY_TOKEN_LOOKUP_RATE` (60/min) and `GATEWAY_TOKEN_LOOKUP_BURST` (20), above it 429 RATE_LIMITED. At most
+`GATEWAY_TOKEN_LOOKUP_INFLIGHT` such lookups wait at once (default half of `GATEWAY_PG_QUEUE`), so random tokens
+cannot starve login or register. After a failed database connect, calls fail at once for `GATEWAY_PG_RETRY_MS`
+(1000); cached tokens are still served stale during that time.
+
+Runbook: every refused registration (`gateway_user_id_conflict_total`) still uses up one `demo_user_seq` value.
+Alert on any rise, and after a restore set the sequence above the highest userId the core knows.
+
+## REST API
+
+- Public: `GET /markets` and `GET /status`.
+- Orders: `POST /orders` (`Idempotency-Key` required), `GET /orders?marketId=`, `GET|PUT|DELETE /orders/{orderId}`,
+  `POST /orders/cancel` (`{orderIds}` or `{all:true}`, at most `GATEWAY_BULK_CANCEL_MAX` per request).
+- `GET /balances`.
+- `POST /balances/deposit|withdraw`: only with the treasury lane, otherwise 404 FEATURE_DISABLED.
+- `/orders/history` and `/fills` answer 503 HISTORY_UNAVAILABLE for now. So does `GET /orders/{id}` for an order
+  that is not open, with `Retry-After: 60`.
+
+Money is a decimal string (at most 8 fraction digits) and ids are decimal strings. Errors are
+`{error, code, reason, detail, keyFinal}`. `keyFinal: true` appears only on a reject of a request that carried
+an `Idempotency-Key`, and means a retry with the same key gets the same answer. A 504 OUTCOME_UNKNOWN means retry
+with the same key inside `idempotencyWindowMs` (shown in `/status`).
+
+Bulk cancel takes one principal token per order id plus one, never more than one full bucket
+(`GATEWAY_PRINCIPAL_BURST`); near the bucket size it can get 429 shortly after other requests: wait for
+`Retry-After` and resend, nothing was sent. `all:true` is charged one token for the read, then at most
+`burst - 1` for the cancels.
+
+Treasury lane (demo only): `GATEWAY_TREASURY_CREDENTIAL` plus `GATEWAY_ALLOW_TREASURY_LANE=1` plus
+`GATEWAY_FAUCET_MAX_AMOUNT` (`assetId:amount,...`), rate limited by `GATEWAY_FAUCET_RATE`. A deposit or withdraw
+retried after a 504 also takes a faucet token. A TREASURY key can credit any user; the caps in the gateway only
+guard against bugs. Registration funding re-sends a deposit whose outcome is unknown only when the core's
+`idempotencyWindowMs` is longer than twice `GATEWAY_REQUEST_TIMEOUT_MS`; otherwise `funded` is false and
+nothing is re-sent, because a re-send after the window could credit twice.
+
+Known core defect: a withdrawal the core rejects currently answers 504, because the core's WithdrawReject
+frame leaves its `duplicate` field unset and the gateway refuses the frame. No money moves.
 
 ## Footprint
 

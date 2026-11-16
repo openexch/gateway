@@ -10,5 +10,14 @@
   "money_schema_path": "core-common/src/main/resources/sbe/money-schema.xml",
   "money_schema_sha256": "b78c244ddf391b77bad38fe5f4faffae100780a83a2c7dde2af82b6f86323d81",
   "money_schema_id": 2,
-  "money_schema_version": 8
+  "money_schema_version": 8,
+  "boost_version": "1.87.0",
+  "boost_url": "https://archives.boost.io/release/1.87.0/source/boost_1_87_0.tar.gz",
+  "boost_sha256": "f55c340aa49763b1925ccf02b2e83f35fdcf634c9d5164a2acb87540173c741d",
+  "openssl_version": "3.0.16",
+  "openssl_url": "https://github.com/openssl/openssl/releases/download/openssl-3.0.16/openssl-3.0.16.tar.gz",
+  "openssl_sha256": "57e03c50feab5d31b152af2b764f10379aecd8ee92f16c985983ce4a99f7ef86",
+  "libpq_version": "16.9",
+  "libpq_url": "https://ftp.postgresql.org/pub/source/v16.9/postgresql-16.9.tar.gz",
+  "libpq_sha256": "df5aaddcf7841457cbf9d31b7d79124a2057cdc7cdae47e8e0271c973546618e"
 }

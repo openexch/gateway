@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <sys/stat.h>
 
+#include <algorithm>
 #include <charconv>
 #include <set>
 
@@ -16,9 +17,19 @@
 //   GATEWAY_PRINCIPAL_RATE 50/s + _BURST 100, GATEWAY_QUERY_RATE 100/s + _BURST 200, GATEWAY_QUERY_MIN_INTERVAL_MS 250,
 //   GATEWAY_BULK_CANCEL_MAX 200, GATEWAY_READY_STALE_MS 3000, GATEWAY_READY_TIMEOUT_STREAK 5, GATEWAY_HASH_THREADS 1,
 //   GATEWAY_HASH_QUEUE 32, GATEWAY_REGISTER_RATE 1/s + GATEWAY_REGISTER_BURST 5, GATEWAY_LOGIN_RATE 10/s +
-//   GATEWAY_LOGIN_BURST 20, GATEWAY_AUTH_SOURCE_RATE 10/min, GATEWAY_TRUSTED_PROXIES none (IP or CIDR list),
+//   GATEWAY_LOGIN_BURST 20, GATEWAY_AUTH_SOURCE_RATE 10/min + GATEWAY_AUTH_SOURCE_BURST 10 (per source address,
+//   register and login together), GATEWAY_SOURCE_IPV6_PREFIX 64 (an IPv6 source's budget is shared by its /64; 1 to
+//   128, the length of an address), GATEWAY_PBKDF2_ITERATIONS 600000 (OWASP; new password hashes; a stored hash keeps its own
+//   count; at most 2^31-1, the PBKDF2 interface's bound), GATEWAY_MAX_HEADER_BYTES 8192 (the request header block,
+//   above it 431), GATEWAY_HTTP_IDLE_TIMEOUT_MS 60000 (a connection silent this long, inside or between requests, is
+//   closed), GATEWAY_TRUSTED_PROXIES none (IP or CIDR list),
 //   GATEWAY_CLIENT_IP_HEADER X-Forwarded-For, GATEWAY_CORS_ORIGINS none (explicit http(s) origins; '*' refused),
 //   GATEWAY_PG_HISTORY_POOL 4, GATEWAY_PG_AUTH_POOL 2, GATEWAY_PG_STATEMENT_TIMEOUT_MS 2000, GATEWAY_PG_QUEUE 64,
+//   GATEWAY_PG_RETRY_MS 1000 (after a failed connect, calls fail at once for this long; also the WARN interval),
+//   GATEWAY_TOKEN_LOOKUP_RATE 60/min + GATEWAY_TOKEN_LOOKUP_BURST 20 (per source address: store lookups of bearer
+//   tokens the cache does not hold), GATEWAY_TOKEN_LOOKUP_INFLIGHT half of GATEWAY_PG_QUEUE (such lookups waiting at
+//   once; with demo it must stay below GATEWAY_PG_QUEUE, the correctness reason being that the rest of the queue is
+//   what login, register and logout are guaranteed),
 //   GATEWAY_HISTORY_LIMIT_DEFAULT 100 (<= _MAX), GATEWAY_HISTORY_LIMIT_MAX 1000,
 //   GATEWAY_FAUCET_MAX_AMOUNT none (assetId:amount,...), GATEWAY_FAUCET_RATE 1/s.
 // oe-stream only:
@@ -433,6 +444,13 @@ void parseCommon(SettingsReader &r, Role role, const rt::DirProbe &probe, Common
     }
     c.tokenCacheTtlMs = r.positive("GATEWAY_TOKEN_CACHE_TTL_MS", c.tokenCacheTtlMs);
     c.tokenStaleMs = r.positive("GATEWAY_TOKEN_STALE_MS", c.tokenStaleMs);
+    // A second spelling of the stale bound must never be ignored (oe-stream would otherwise skip it silently, since
+    // it does not refuse unknown GATEWAY_ names): one name, refused by name in both binaries.
+    if (r.isSet("GATEWAY_TOKEN_CACHE_STALE_MS"))
+    {
+        r.problem("GATEWAY_TOKEN_CACHE_STALE_MS is not read: use GATEWAY_TOKEN_STALE_MS (the stale bound of the token "
+            "cache)");
+    }
     const std::string modesKey = P + "_AUTH_MODES";
     const std::string modes = r.requiredString(modesKey, "a list of demo, api-key, jwt, dev (comma-separated)");
     if (!modes.empty())
@@ -702,6 +720,26 @@ ParseResult<GatewaySettings> parseGatewaySettings(const Environment &env, const 
     g.loginRate = r.rate("GATEWAY_LOGIN_RATE", "10/s");
     g.loginBurst = r.positive("GATEWAY_LOGIN_BURST", g.loginBurst);
     g.authSourceRate = r.rate("GATEWAY_AUTH_SOURCE_RATE", "10/min");
+    g.authSourceBurst = r.positive("GATEWAY_AUTH_SOURCE_BURST", g.authSourceBurst);
+    g.sourceV6PrefixBits = r.positive("GATEWAY_SOURCE_IPV6_PREFIX", g.sourceV6PrefixBits);
+    if (g.sourceV6PrefixBits > 128)
+    {
+        r.problem("GATEWAY_SOURCE_IPV6_PREFIX is a prefix length of an IPv6 address (1 to 128), got " +
+            std::to_string(g.sourceV6PrefixBits));
+    }
+    g.pbkdf2Iterations = r.positive("GATEWAY_PBKDF2_ITERATIONS", g.pbkdf2Iterations);
+    if (g.pbkdf2Iterations > 0x7fffffffLL)
+    {
+        r.problem("GATEWAY_PBKDF2_ITERATIONS must fit PBKDF2's 31-bit round count (at most 2147483647), got " +
+            std::to_string(g.pbkdf2Iterations));
+    }
+    g.maxHeaderBytes = r.positive("GATEWAY_MAX_HEADER_BYTES", g.maxHeaderBytes);
+    if (g.maxHeaderBytes > 0xffffffffLL)
+    {
+        r.problem("GATEWAY_MAX_HEADER_BYTES must fit the parser's 32-bit header bound (at most 4294967295), got " +
+            std::to_string(g.maxHeaderBytes));
+    }
+    g.httpIdleTimeoutMs = r.positive("GATEWAY_HTTP_IDLE_TIMEOUT_MS", g.httpIdleTimeoutMs);
     checkProxies(r, r.optionalString("GATEWAY_TRUSTED_PROXIES", "a list of IP addresses or CIDR blocks"),
         g.trustedProxies);
     {
@@ -750,6 +788,27 @@ ParseResult<GatewaySettings> parseGatewaySettings(const Environment &env, const 
     g.pgAuthPool = r.positive("GATEWAY_PG_AUTH_POOL", g.pgAuthPool);
     g.pgStatementTimeoutMs = r.positive("GATEWAY_PG_STATEMENT_TIMEOUT_MS", g.pgStatementTimeoutMs);
     g.pgQueue = r.positive("GATEWAY_PG_QUEUE", g.pgQueue);
+    g.pgRetryMs = r.positive("GATEWAY_PG_RETRY_MS", g.pgRetryMs);
+    g.tokenLookupRate = r.rate("GATEWAY_TOKEN_LOOKUP_RATE", "60/min");
+    g.tokenLookupBurst = r.positive("GATEWAY_TOKEN_LOOKUP_BURST", g.tokenLookupBurst);
+    {
+        const std::string key = "GATEWAY_TOKEN_LOOKUP_INFLIGHT";
+        const std::int64_t derived = std::max<std::int64_t>(1, g.pgQueue / 2);
+        if (r.isSet(key))
+        {
+            g.tokenLookupInflight = r.positive(key, derived);
+        }
+        else
+        {
+            g.tokenLookupInflight = derived;
+            r.record(key, std::to_string(derived), "default");
+        }
+        if (0 != (g.common.authModes & auth_mode::DEMO) && g.tokenLookupInflight >= g.pgQueue)
+        {
+            r.problem(key + " (" + std::to_string(g.tokenLookupInflight) + ") must be below GATEWAY_PG_QUEUE (" +
+                std::to_string(g.pgQueue) + "): the rest of the queue is kept for login, register and logout");
+        }
+    }
     g.historyLimitDefault = r.positive("GATEWAY_HISTORY_LIMIT_DEFAULT", g.historyLimitDefault);
     g.historyLimitMax = r.positive("GATEWAY_HISTORY_LIMIT_MAX", g.historyLimitMax);
     if (g.historyLimitDefault > g.historyLimitMax)
@@ -771,11 +830,14 @@ ParseResult<GatewaySettings> parseGatewaySettings(const Environment &env, const 
             {
                 const std::size_t colon = item.find(':');
                 FaucetCap cap;
-                if (std::string::npos == colon || !parsePositiveDecimal(item.substr(0, colon), cap.assetId) ||
+                // asset 0 is a real asset id (the core accepts it), so the id is 0 or a positive decimal
+                const std::string assetText = std::string::npos == colon ? std::string() : item.substr(0, colon);
+                const bool assetOk = "0" == assetText || parsePositiveDecimal(assetText, cap.assetId);
+                if (std::string::npos == colon || !assetOk || cap.assetId > 2147483647 ||
                     !isDecimalAmount(item.substr(colon + 1)))
                 {
-                    r.problem("GATEWAY_FAUCET_MAX_AMOUNT: '" + item + "' is not assetId:amount (a positive asset id and a "
-                        "positive decimal amount, at most 8 fraction digits)");
+                    r.problem("GATEWAY_FAUCET_MAX_AMOUNT: '" + item + "' is not assetId:amount (an asset id from 0 to "
+                        "2147483647 and a positive decimal amount, at most 8 fraction digits)");
                     continue;
                 }
                 if (!seen.insert(cap.assetId).second)

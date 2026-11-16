@@ -1,5 +1,6 @@
 #include "StreamApp.h"
 
+#include "gateway/common/AuthMaterial.h"
 #include "gateway/common/Environment.h"
 #include "gateway/common/Settings.h"
 
@@ -14,7 +15,11 @@ namespace openexchange { namespace gateway {
 int streamMain(const ProcessHooks &hooks)
 {
     const SystemEnvironment env;
-    const ParseResult<StreamSettings> parsed = parseStreamSettings(env);
+    ParseResult<StreamSettings> parsed = parseStreamSettings(env);
+    // the credential files of the enabled modes, read now so a missing or bad file is listed in the same pass (78);
+    // the WebSocket router that uses them plugs in later
+    const AuthMaterial material = loadAuthMaterial(parsed.settings.common, parsed.errors);
+    (void)material;
     if (!parsed.ok())
     {
         return refuseConfiguration("oe-stream", parsed.errors);

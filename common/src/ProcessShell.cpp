@@ -157,6 +157,7 @@ void runProcess(const ProcessIdentity &id, const ProcessInputs &in)
     }
     base.driverDir = aeronDir;
 
+    std::unique_ptr<FrontWork> front = in.makeFront ? in.makeFront() : nullptr;
     rt::HttpServer admin(
         [&](const rt::HttpRequest &request) {
             AdminView view = base;
@@ -168,6 +169,12 @@ void runProcess(const ProcessIdentity &id, const ProcessInputs &in)
             view.driverReclaimed = driverReclaimed.load(std::memory_order_acquire);
             view.conductorHeartbeatAgeMs = connected ? watch->ageMs() : -1;
             view.logDropped = log.dropped();
+            if (front)
+            {
+                view.status.publicListenerAccepting = front->accepting();
+                view.frontHealth = front->healthJson();
+                view.frontMetrics = front->metrics(Role::GATEWAY == id.role ? "gateway_" : "stream_");
+            }
             return adminRoute(request, view);
         },
         id.adminBindKey);
@@ -179,6 +186,11 @@ void runProcess(const ProcessIdentity &id, const ProcessInputs &in)
     }
     std::fprintf(stderr, "%s: admin listening on %s:%u\n", id.processName, c.adminBind.host.c_str(),
         static_cast<unsigned>(admin.boundPort()));
+    if (front && !front->bind(error))
+    {
+        std::fprintf(stderr, "%s: %s: %s (exit 78)\n", id.processName, id.frontBindKey, error.c_str());
+        finish(exit_code::CONFIG);
+    }
 
     // the admin thread, serving from here on (/health and /ready read 503 with driver_connected false until the
     // driver is connected)
@@ -305,6 +317,10 @@ void runProcess(const ProcessIdentity &id, const ProcessInputs &in)
     watch = std::make_unique<rt::ConductorWatch>(aeron, c.driverTimeoutMs);
     supervisor.setLivenessCheck([&](std::int64_t, std::string &why) { return watch->check(why); });
     driverConnected.store(true, std::memory_order_release);
+    if (front)
+    {
+        front->start();
+    }
 
     const bool busy = IdleMode::BUSY == c.idle;
     const std::int64_t publishIntervalNs = c.statusIntervalMs * 1'000'000LL;
@@ -377,6 +393,13 @@ void runProcess(const ProcessIdentity &id, const ProcessInputs &in)
 
     // the stop path, every step bounded
     int exitCode = code;
+    if (front && !front->stop(c.stopTimeoutMs))
+    {
+        std::fprintf(stderr, "%s: the public listener or a worker pool did not stop within %" PRId64 " ms (exit 70)\n",
+            id.processName, c.stopTimeoutMs);
+        std::fprintf(stderr, "%s: stopped (exit %d)\n", id.processName, exit_code::SOFTWARE);
+        finish(exit_code::SOFTWARE);
+    }
     admin.shutdown();
     const std::int64_t boundNs = c.stopTimeoutMs * 1'000'000LL;
     const std::int64_t stopStart = nowNs();
