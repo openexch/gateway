@@ -125,6 +125,8 @@ Alert on any rise, and after a restore set the sequence above the highest userId
 
 ## REST API
 
+The full client reference (every route, body, status code, error string, stream frame and the migration from the OMS v1 API) is [docs/api.md](docs/api.md).
+
 - Public: `GET /markets` and `GET /status`.
 - Orders: `POST /orders` (`Idempotency-Key` required), `GET /orders?marketId=`, `GET|PUT|DELETE /orders/{orderId}`,
   `POST /orders/cancel` (`{orderIds}` or `{all:true}`, at most `GATEWAY_BULK_CANCEL_MAX` per request).
