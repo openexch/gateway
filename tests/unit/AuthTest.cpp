@@ -259,7 +259,7 @@ TEST(auth_material_jwt_secret_and_files)
     CHECK(errors.empty());
 }
 
-// ---- settings of this slice
+// ---- the auth settings
 
 TEST(settings_auth_rates_and_bounds)
 {

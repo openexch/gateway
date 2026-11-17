@@ -263,10 +263,11 @@ foreach(control IN LISTS GW_ENGINE_CONTROLS)
     set_tests_properties(${target} PROPERTIES PASS_REGULAR_EXPRESSION "${text}")
 endforeach()
 
-# 3.10: oe-stream cannot reference the encoders of CreateOrder, CancelOrder, AmendOrder (nor Deposit, Withdraw). A probe
-# that includes OrderEntry.h, built with the stream's flags, must fail to compile with OrderEntry.h's refusal; a probe
-# that declares the encoder itself and links like oe-stream must fail to link (the same probe linked with gw_order_entry
-# is the control: it links); and the finished oe-stream holds none of the symbols that oe-gateway holds.
+# No order entry in oe-stream: it cannot reference the encoders of CreateOrder, CancelOrder, AmendOrder (nor Deposit,
+# Withdraw). A probe that includes OrderEntry.h, built with the stream's flags, must fail to compile with OrderEntry.h's
+# refusal; a probe that declares the encoder itself and links like oe-stream must fail to link (the same probe linked
+# with gw_order_entry is the control: it links); and the finished oe-stream holds none of the symbols that oe-gateway
+# holds.
 add_library(gw_stream_compile_probe OBJECT EXCLUDE_FROM_ALL link/StreamOrderEntryProbe.cpp)
 target_compile_definitions(gw_stream_compile_probe PRIVATE GW_NO_ORDER_ENTRY)
 target_link_libraries(gw_stream_compile_probe PRIVATE gw_common)

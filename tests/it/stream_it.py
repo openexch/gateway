@@ -7,25 +7,25 @@ BRIDGE session that sends MeJournalTrade frames so that orders fill with no matc
 where a trade is applied as it comes). The ADMIN side (CoreConfig, risk, the gate, the limits record, the oracle dumps)
 goes through CoreProbe. The WebSocket clients are a minimal client of this file (no dependency), all on one asyncio loop.
 
-Rows (contract 4.3):
-  3.11 readiness  /ready 200 with the global gate still SUSPENDED; every core member stopped -> 503 head_probe_fresh; an
+Rows:
+  readiness  /ready 200 with the global gate still SUSPENDED; every core member stopped -> 503 head_probe_fresh; an
        open gap (a replay in pages) -> 503 event_gap
-  3.9  binding    first-frame auth; no token from a URL (400); a userId in a frame closes 4003; no frame of another user
+  binding    first-frame auth; no token from a URL (400); a userId in a frame closes 4003; no frame of another user
        ever reaches a connection (checked on every connection of every phase, the storm's included)
-  3.1  stitch     under continuous order flow (creates, partial and full fills), STITCH_CLIENTS subscribes: each client's
+  stitch     under continuous order flow (creates, partial and full fills), STITCH_CLIENTS subscribes: each client's
        final open orders equal the core's, no duplicate event, no missing fill; one user above 512 open orders with its
        orders created and filled while its pages are read
-  3.4  balances   deposits and fills racing BALANCE_CLIENTS balance subscribes: each client's final balances equal the ledger
-  3.6  cache      a second connection and a reconnect inside the linger cost no core query and get a correct snapshot; the
+  balances   deposits and fills racing BALANCE_CLIENTS balance subscribes: each client's final balances equal the ledger
+  cache      a second connection and a reconnect inside the linger cost no core query and get a correct snapshot; the
        cache is dropped on session loss (the next connection reads again)
-  3.3  resume     resume from a heartbeat after a quiet period: served from the window, no core query; resume after a
+  resume     resume from a heartbeat after a quiet period: served from the window, no core query; resume after a
        stream restart inside the core ring: one shared backfill, then served; resume older than the ring: RESUME_TOO_OLD
-  3.2  gap        the stream's session closed by the core (SIGSTOP past the session timeout) and a leader change, both
+  gap        the stream's session closed by the core (SIGSTOP past the session timeout) and a leader change, both
        mid-flow: the hole is filled by replay, no client resyncs; with the ring made small by CoreLimitsSet every client
        resyncs and converges (the storm below)
-  3.7  slow       a client that stops reading is closed 4001 at the bound; another client's frame latency and the duty max
+  slow       a client that stops reading is closed 4001 at the bound; another client's frame latency and the duty max
        cycle stay inside their bounds
-  3.5  storm      --connections connections of distinct users, forced overrun: the stream offers at most
+  storm      --connections connections of distinct users, forced overrun: the stream offers at most
        STREAM_QUERY_RATE x 1.2 snapshot queries per second (its own counter, sampled), the leader's log time advances in
        every 100 ms sample, no core session is closed at its egress ceiling, gateway orders are answered inside their
        deadline throughout, every client converges within users / rate + 20 s
@@ -711,9 +711,9 @@ def run(args, cluster, procs):
     if not check(not silent, f"every core node's /metrics answers (silent: {silent}; is a port of the base taken?)"):
         return
 
-    # ---- 3.11: ready on a genesis core, gate still SUSPENDED (the gate is not a condition of the stream)
+    # ---- readiness: ready on a genesis core, gate still SUSPENDED (the gate is not a condition of the stream)
     ok = wait_until(lambda: st.ready()[0] == 200, 60)
-    check(ok, "3.11 stream /ready 200 with the global gate SUSPENDED (genesis)", st.ready()[1])
+    check(ok, "readiness: stream /ready 200 with the global gate SUSPENDED (genesis)", st.ready()[1])
 
     for version in (1, 2):
         rc, _ = session_it.probe(args, "core-config", version=version, behavior=version, genesis=7, tick=1, min=1,
@@ -741,22 +741,22 @@ def run(args, cluster, procs):
     flow = Flow(gw, bridge, buyers, sellers)
     everyone = []
 
-    # ---- 3.9 at the edge
+    # ---- binding at the edge
     c = loop.connect(st.ws, 5001, headers={})
     loop.send(c, {"op": "auth", "token": "dev:5001"})
     loop.send(c, {"op": "subscribe", "channels": ["orders"]})
-    check(wait_until(lambda: c.snapshots == 1, 10), "3.9 first-frame auth then subscribe: snapshot")
+    check(wait_until(lambda: c.snapshots == 1, 10), "binding: first-frame auth then subscribe: snapshot")
     t = Ws(5002)
     loop.run(t.open(st.ws, {}, target="/ws/v2?token=dev:5002"))
-    check(t.status == 400, f"3.9 no token from a URL: {t.status}")
+    check(t.status == 400, f"binding: no token from a URL: {t.status}")
     s = loop.connect(st.ws, 5003, headers={"Sec-WebSocket-Protocol": "bearer, dev:5003"}, channels=["fills"])
     check(s.subprotocol == "bearer" and wait_until(lambda: any(f["type"] == "subscribed" for f in s.frames), 10),
-          "3.9 bearer subprotocol")
+          "binding: bearer subprotocol")
     u = loop.connect(st.ws, 5004)
     loop.send(u, {"op": "subscribe", "channels": ["orders"], "userId": "2001"})
-    check(wait_until(lambda: u.close_code == 4003, 10), f"3.9 a userId in a frame closes 4003 ({u.close_code})")
+    check(wait_until(lambda: u.close_code == 4003, 10), f"binding: a userId in a frame closes 4003 ({u.close_code})")
 
-    # ---- 3.1: STITCH_CLIENTS subscribes under continuous flow, plus a user above 512 open orders
+    # ---- stitch: STITCH_CLIENTS subscribes under continuous flow, plus a user above 512 open orders
     for i in range(600):
         flow.create(big, "BUY", 1)
     flow.start(rate=40)
@@ -793,14 +793,15 @@ def run(args, cluster, procs):
     time.sleep(3)
     oracle = oracle_orders(args)
     fills = oracle_fills(args, flow)
-    converged(stitch, oracle, f"3.1 {STITCH_CLIENTS} subscribes under flow: final orders equal the oracle, no duplicate, "
-                              "no missing fill", fills)
-    check(big_client is not None and len(oracle.get(big, {})) > 512, "3.1 the big user holds more than 512 open orders",
-          str(len(oracle.get(big, {}))))
-    converged([big_client], oracle, "3.1 the user above 512 open orders (changed between its pages) converges", fills)
+    converged(stitch, oracle, f"stitch: {STITCH_CLIENTS} subscribes under flow: final orders equal the oracle, "
+                              "no duplicate, no missing fill", fills)
+    check(big_client is not None and len(oracle.get(big, {})) > 512,
+          "stitch: the big user holds more than 512 open orders", str(len(oracle.get(big, {}))))
+    converged([big_client], oracle, "stitch: the user above 512 open orders (changed between its pages) converges",
+              fills)
     everyone += stitch + [big_client]
 
-    # ---- 3.6: per-user cache
+    # ---- cache: the per-user cache
     target = buyers[0]
     a1 = loop.connect(st.ws, target, ["orders", "balances"])
     wait_until(lambda: a1.snapshots == 1 and a1.balance_snapshots == 1, 10)
@@ -814,12 +815,12 @@ def run(args, cluster, procs):
     wait_until(lambda: a3.snapshots == 1, 10)
     oracle = oracle_orders(args)
     check(st.m("snapshot_queries_total") == snaps and st.m("balance_queries_total") == reads,
-          "3.6 a second connection and a reconnect inside the linger cost no core query",
+          "cache: a second connection and a reconnect inside the linger cost no core query",
           f"{snaps}->{st.m('snapshot_queries_total')}, {reads}->{st.m('balance_queries_total')}")
-    converged([a2, a3], oracle, "3.6 the cached snapshots are correct")
+    converged([a2, a3], oracle, "cache: the cached snapshots are correct")
     everyone += [a2, a3]
 
-    # ---- 3.3: resume from a heartbeat after a quiet period: the window, no core query
+    # ---- resume: resume from a heartbeat after a quiet period: the window, no core query
     quiet = 6001
     q1 = loop.connect(st.ws, quiet, ["orders", "fills"])
     wait_until(lambda: q1.snapshots == 1, 10)
@@ -834,10 +835,10 @@ def run(args, cluster, procs):
     time.sleep(1.5)
     check(q2.resyncs == [] and q2.snapshots == 0 and st.m("snapshot_queries_total") == snaps and
           st.m("backfills_total") == backfills and st.m("window_resumes_total") >= 1,
-          f"3.3 resume from heartbeat {last} after a quiet period: served from the window, no core query",
+          f"resume: resume from heartbeat {last} after a quiet period: served from the window, no core query",
           f"resyncs {q2.resyncs} snapshots {q2.snapshots}")
 
-    # ---- 3.3: a stream restart inside the core ring: one shared backfill, then served
+    # ---- resume: a stream restart inside the core ring: one shared backfill, then served
     r1 = loop.connect(st.ws, buyers[1], ["orders", "fills"])
     r2 = loop.connect(st.ws, sellers[1], ["orders", "fills"])
     wait_until(lambda: r1.snapshots == 1 and r2.snapshots == 1, 15)
@@ -857,16 +858,16 @@ def run(args, cluster, procs):
     time.sleep(3)
     oracle = oracle_orders(args)
     check(st.m("backfills_total") == 1 and r1b.resyncs == [] and r2b.resyncs == [] and r1b.snapshots == 0,
-          "3.3 resume after a stream restart inside the core ring: one shared backfill, then served",
+          "resume: resume after a stream restart inside the core ring: one shared backfill, then served",
           f"backfills {st.m('backfills_total')}, resyncs {r1b.resyncs} {r2b.resyncs}")
     everyone += [r1b, r2b]
 
-    # ---- 3.11: an open gap is 503 (a replay in pages of STREAM_REPLAY_PAGE), every core member stopped is 503
+    # ---- readiness: an open gap is 503 (a replay in pages of STREAM_REPLAY_PAGE), every core member stopped is 503
     live = loop.connect(st.ws, buyers[2], ["orders", "fills"])
     live2 = loop.connect(st.ws, sellers[2], ["orders", "fills"])
     wait_until(lambda: live.snapshots == 1 and live2.snapshots == 1, 15)
 
-    # ---- 3.2: the stream's session closed by the core mid-flow: the hole is filled by replay
+    # ---- gap: the stream's session closed by the core mid-flow: the hole is filled by replay
     flow.start(rate=60, seed=51)
     time.sleep(1)
     os.kill(st.p.pid, signal.SIGSTOP)
@@ -880,23 +881,23 @@ def run(args, cluster, procs):
             saw_gap = True
             break
         time.sleep(0.05)
-    check(saw_gap, "3.11 an open gap reads 503 event_gap")
+    check(saw_gap, "readiness: an open gap reads 503 event_gap")
     time.sleep(3)
     flow.stop()
     time.sleep(3)
     oracle = oracle_orders(args)
     fills = oracle_fills(args, flow)
-    check(live.resyncs == [] and live2.resyncs == [], "3.2 session closed by the core: no client resyncs",
+    check(live.resyncs == [] and live2.resyncs == [], "gap: session closed by the core: no client resyncs",
           f"{live.resyncs} {live2.resyncs}")
-    converged([live, live2], oracle, "3.2 session closed by the core: the hole is filled by replay", fills)
+    converged([live, live2], oracle, "gap: session closed by the core: the hole is filled by replay", fills)
     # the cache is dropped on session loss: the next connection reads its snapshot again
     snaps = st.m("snapshot_queries_total")
     a4 = loop.connect(st.ws, target, ["orders"])
     wait_until(lambda: a4.snapshots == 1, 10)
-    check(st.m("snapshot_queries_total") > snaps, "3.6 the cache is dropped on session loss")
+    check(st.m("snapshot_queries_total") > snaps, "cache: the cache is dropped on session loss")
     everyone += [a4]
 
-    # ---- 3.7: a slow client is closed 4001 at the bound; others are not delayed
+    # ---- slow: a slow client is closed 4001 at the bound; others are not delayed
     slow_user = 7001
     http(gw.public, "/api/v2/balances/deposit", "POST", {"assetId": "0", "amount": "50000000"}, user=slow_user,
          key=str(uuid.uuid4()))
@@ -915,16 +916,17 @@ def run(args, cluster, procs):
                 lat.append(time.time() - t0)
     max_cycle = st.m("duty_max_cycle_us")
     slow.resume()
-    check(wait_until(lambda: slow.close_code == 4001, 30), f"3.7 the slow client is closed 4001 at the bound "
+    check(wait_until(lambda: slow.close_code == 4001, 30), f"slow: the slow client is closed 4001 at the bound "
           f"(close {slow.close_code}, queue high water {st.m('ws_queue_high_water')})")
-    check(st.m("ws_queue_high_water") <= 64 + 64 + 1, "3.7 queue exceeded bound",
+    check(st.m("ws_queue_high_water") <= 64 + 64 + 1, "slow: queue exceeded bound",
           f"high water {st.m('ws_queue_high_water')}")
-    check(lat and max(lat) < 1.0, f"3.7 another client's create-to-frame latency stays under 1 s (max {max(lat):.3f} s)")
-    check(max_cycle is not None and max_cycle < 100_000, f"3.7 the stream's duty max cycle stays under 100 ms "
+    check(lat and max(lat) < 1.0,
+          f"slow: another client's create-to-frame latency stays under 1 s (max {max(lat):.3f} s)")
+    check(max_cycle is not None and max_cycle < 100_000, f"slow: the stream's duty max cycle stays under 100 ms "
           f"({max_cycle} us)")
     everyone += [fast]
 
-    # ---- 3.4: deposits and fills racing BALANCE_CLIENTS balance subscribes
+    # ---- balances: deposits and fills racing BALANCE_CLIENTS balance subscribes
     bal = []
     flow.start(rate=40, seed=61)
     rnd = random.Random(13)
@@ -944,10 +946,10 @@ def run(args, cluster, procs):
         got = {k: v for k, v in b.balances.items() if v != "0" or k in want}
         if want != got:
             bad.append(f"{b.user}: stale balance after snapshot (client {got}, ledger {want})")
-    check(not bad, f"3.4 {BALANCE_CLIENTS} balance subscribes racing deposits and fills: final balances equal the ledger",
-          "; ".join(bad[:5]))
+    check(not bad, f"balances: {BALANCE_CLIENTS} balance subscribes racing deposits and fills: final balances equal "
+          "the ledger", "; ".join(bad[:5]))
 
-    # ---- 3.2: a leader change mid-flow: the hole is filled, no client resyncs
+    # ---- gap: a leader change mid-flow: the hole is filled, no client resyncs
     flow.start(rate=40, seed=71)
     time.sleep(1)
     leader = leader_of(args, cluster)
@@ -958,19 +960,19 @@ def run(args, cluster, procs):
     flow.stop()
     time.sleep(4)
     oracle = oracle_orders(args)
-    if check(leader is not None, "3.2 the core leader found and killed"):
-        check(live.resyncs == [] and live2.resyncs == [], "3.2 leader change: no client resyncs", f"{live.resyncs}")
-        converged([live, live2], oracle, "3.2 leader change: the hole is filled by replay")
+    if check(leader is not None, "gap: the core leader found and killed"):
+        check(live.resyncs == [] and live2.resyncs == [], "gap: leader change: no client resyncs", f"{live.resyncs}")
+        converged([live, live2], oracle, "gap: leader change: the hole is filled by replay")
     else:
-        print("SKIP 3.2 leader change rows: no leader was killed", flush=True)
+        print("SKIP gap: leader change rows: no leader was killed", flush=True)
 
-    # ---- 3.5 storm (and 3.2 with the ring made small): N connections of distinct users, forced overrun
+    # ---- storm (and gap with the ring made small): N connections of distinct users, forced overrun
     n = args.connections
     users = list(range(100000, 100000 + n))
     t0 = time.time()
     storm = loop.connect_many(st.ws, users, ["orders"])
     check(wait_until(lambda: sum(1 for c in storm if c.snapshots >= 1) == n, max(120, n / QUERY_RATE + 60)),
-          f"3.5 {n} connections subscribed ({sum(1 for c in storm if c.snapshots >= 1)} snapshots, "
+          f"storm: {n} connections subscribed ({sum(1 for c in storm if c.snapshots >= 1)} snapshots, "
           f"{time.time() - t0:.1f} s)")
     rc, _ = session_it.probe(args, "core-limits", version=2, ttl_ms=900000, cap=100000, ring=16)
     check(rc == 0, "CoreLimitsSet: the event ring at 16")
@@ -1025,35 +1027,37 @@ def run(args, cluster, procs):
     flow.stop()
     time.sleep(3)
     oracle = oracle_orders(args)
-    check(all_resynced, f"3.2/3.5 with the ring at 16 every connection got resync "
+    check(all_resynced, f"gap/storm: with the ring at 16 every connection got resync "
           f"({sum(1 for c in storm if c.resyncs)} of {n})")
     peak = max(samples) if samples else 0
     total = (st.m("snapshot_queries_total") or 0) - pre_snap
     average = total / took if took > 0 else 0
     check(peak <= QUERY_RATE * 1.2 and average <= QUERY_RATE * 1.2,
-          f"3.5 snapshot query rate above the bound: peak {peak:.1f}/s in a 1 s sample, {average:.1f}/s over the "
+          f"storm: snapshot query rate above the bound: peak {peak:.1f}/s in a 1 s sample, {average:.1f}/s over the "
           f"re-snapshot ({total:.0f} in {took:.1f} s), bound {QUERY_RATE * 1.2:.0f}/s", str([round(x, 1) for x in samples]))
-    check(done and took <= bound, f"3.5 every client converged in {took:.1f} s (bound users / rate + 20 = {bound:.0f} s)")
+    check(done and took <= bound,
+          f"storm: every client converged in {took:.1f} s (bound users / rate + 20 = {bound:.0f} s)")
     positions = [x for x in log_times if x is not None]
     stalls = sum(1 for a, b in zip(positions, positions[1:]) if b <= a)
-    check(len(positions) > 10 and stalls == 0, f"3.5 the leader's log position advanced in every 100 ms sample "
+    check(len(positions) > 10 and stalls == 0, f"storm: the leader's log position advanced in every 100 ms sample "
           f"({len(positions)} samples, {stalls} without progress)")
     post_closed = core_ceiling_closed(args, cluster)
-    check(pre_closed is not None and post_closed == pre_closed, f"3.5 no core session closed at its egress ceiling "
+    check(pre_closed is not None and post_closed == pre_closed, f"storm: no core session closed at its egress ceiling "
           f"({pre_closed} -> {post_closed})")
-    check(not gw_late, f"3.5 gateway orders answered inside their deadline throughout ({len(gw_late)} late or failed)",
+    check(not gw_late,
+          f"storm: gateway orders answered inside their deadline throughout ({len(gw_late)} late or failed)",
           str(gw_late[:5]))
-    converged([c for c in storm[:200]] + [live, live2], oracle, "3.2/3.5 after the storm the clients converge")
+    converged([c for c in storm[:200]] + [live, live2], oracle, "gap/storm: after the storm the clients converge")
     print(f"storm: {n} connections, {st.m('snapshot_queries_total') - pre_snap:.0f} snapshot queries, {took:.1f} s",
           flush=True)
     everyone += storm + [live, live2]
 
-    # ---- 3.3: resume older than the ring (16): RESUME_TOO_OLD
+    # ---- resume: resume older than the ring (16): RESUME_TOO_OLD
     old = loop.connect(st.ws, buyers[1], ["orders"], resume=1)
     check(wait_until(lambda: old.resyncs == ["RESUME_TOO_OLD"] and old.snapshots == 1, 15),
-          f"3.3 a resume older than the core's ring: resync RESUME_TOO_OLD and a snapshot ({old.resyncs})")
+          f"resume: a resume older than the core's ring: resync RESUME_TOO_OLD and a snapshot ({old.resyncs})")
 
-    # ---- 3.11: every core member stopped: the head probe goes unanswered -> 503 head_probe_fresh
+    # ---- readiness: every core member stopped: the head probe goes unanswered -> 503 head_probe_fresh
     for pid in cluster.pids.values():
         try:
             os.kill(pid, signal.SIGSTOP)
@@ -1067,10 +1071,10 @@ def run(args, cluster, procs):
             os.kill(pid, signal.SIGCONT)
         except OSError:
             pass
-    check(saw, "3.11 head probe unanswered past STREAM_READY_STALE_MS: 503 head_probe_fresh")
+    check(saw, "readiness: head probe unanswered past STREAM_READY_STALE_MS: 503 head_probe_fresh")
 
-    # ---- 3.9 everywhere: no frame of another user reached any connection; and no frame was refused by the decoder
-    no_foreign(everyone, flow, "3.9 every connection of the run")
+    # ---- binding everywhere: no frame of another user reached any connection; and no frame was refused by the decoder
+    no_foreign(everyone, flow, "binding: every connection of the run")
     refused = metric(st.admin, "stream_decode_refused_total")
     check(refused == 0, f"the stream refused no egress frame ({refused})")
     check(not flow.errors, f"every flow create was accepted ({len(flow.errors)} not: {flow.errors[:3]})")

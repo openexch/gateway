@@ -85,6 +85,46 @@ struct ApiDeps
     std::function<std::int64_t()> nowMs; // monotonic; the steady clock when empty
 };
 
+// The idempotence window against the request deadline. A request still unanswered at GATEWAY_REQUEST_TIMEOUT_MS is
+// OUTCOME_UNKNOWN; offered again with the same id (register funding's second attempt, a client retry with its key) it
+// reaches the core up to two request timeouts after the first offer, and replays the stored decision only while the
+// core still remembers that id (idempotencyWindowMs, the request TTL of the core's limits). So the window must be above
+// twice the timeout.
+inline bool reofferFitsWindow(std::int64_t idempotencyWindowMs, std::int64_t requestTimeoutMs) noexcept
+{
+    return idempotencyWindowMs / 2 > requestTimeoutMs;
+}
+
+// The window is the core's setting and the gateway learns it from the config read, after it started: a window too
+// short for the deadline is a CRITICAL log line, not an exit. check() gives that line the first time it sees a loaded
+// config version whose window does not fit, and nothing for the same version again (the duty thread calls it every
+// cycle).
+class ReofferWindowCheck
+{
+public:
+    explicit ReofferWindowCheck(std::int64_t requestTimeoutMs) noexcept : m_requestTimeoutMs(requestTimeoutMs) {}
+
+    std::optional<std::string> check(const session::CoreConfig &config)
+    {
+        if (!config.loaded() || config.head.configVersion == m_checkedVersion)
+        {
+            return std::nullopt;
+        }
+        m_checkedVersion = config.head.configVersion;
+        if (reofferFitsWindow(config.idempotencyWindowMs(), m_requestTimeoutMs))
+        {
+            return std::nullopt;
+        }
+        return "core config version " + std::to_string(config.head.configVersion) + ": idempotencyWindowMs " +
+            std::to_string(config.idempotencyWindowMs()) + " is not above twice GATEWAY_REQUEST_TIMEOUT_MS (" +
+            std::to_string(m_requestTimeoutMs) + " ms): a re-offer can reach the core after it forgot the request id";
+    }
+
+private:
+    std::int64_t m_requestTimeoutMs;
+    std::uint32_t m_checkedVersion = 0; // 0: none checked (a loaded config has version 1 or above)
+};
+
 class GatewayApi
 {
 public:

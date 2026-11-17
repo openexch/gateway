@@ -3,7 +3,8 @@
 
 Each case starts the real binaries with a clean environment (nothing inherited but PATH) and no core cluster: the
 process shell must start, serve /health, /ready (not ready, every failing condition named), /ready/session and
-/metrics on the admin bind, stop cleanly on SIGTERM, and exit with the code of 2.10 on every failure it owns.
+/metrics on the admin bind, stop cleanly on SIGTERM, and exit with its documented code (ExitCodes.h) on every failure
+it owns.
 
 usage: process_test.py --bin-dir <build dir> --work <dir> <case> [<case> ...]
        process_test.py --bin-dir <build dir> --work <dir> footprint     (prints RSS, threads and driver dir size)

@@ -20,6 +20,7 @@
 #include "gateway/common/OrderEntry.h"
 #include "gateway/common/Settings.h"
 
+#include "GatewayApi.h"
 #include "GatewayFront.h"
 
 // oe-gateway - the REST gateway in front of the core: one GATEWAY cluster session (plus one TREASURY session when the
@@ -96,6 +97,8 @@ class GatewayDuty final : public DutyWork
 public:
     GatewayDuty(const DutyContext &context, const GatewaySettings &g, DutyBridge &bridge) :
         m_bridge(bridge),
+        m_log(context.log),
+        m_windowCheck(g.requestTimeoutMs),
         m_transport(context.aeron),
         m_client(m_transport, sessionClientSettings(g.common, "oe-gateway")),
         m_session(m_client, gatewaySessionSettings(g), [this](const session::Outcome &o) { onOutcome(m_tickets, o); },
@@ -154,7 +157,13 @@ public:
         {
             work += m_treasury->session.doWork();
         }
-        m_bridge.publishConfig(m_session.configSnapshot());
+        std::shared_ptr<const session::CoreConfig> config = m_session.configSnapshot();
+        if (const auto line = m_windowCheck.check(*config); line && nullptr != m_log)
+        {
+            m_log->push(cluster_tools::runtime::LogLevel::CRITICAL, cluster_tools::runtime::Supervisor::monotonicNs(),
+                "session: %s", line->c_str());
+        }
+        m_bridge.publishConfig(std::move(config));
         m_bridge.publishRegistered(m_session.registrar().isRegistered());
         return work;
     }
@@ -237,6 +246,8 @@ private:
     }
 
     DutyBridge &m_bridge;
+    cluster_tools::runtime::LogRing *m_log;
+    ReofferWindowCheck m_windowCheck; // the core's window against GATEWAY_REQUEST_TIMEOUT_MS, once per config version
     Tickets m_tickets;
     at::AeronTransport m_transport;
     AeronClient m_client;

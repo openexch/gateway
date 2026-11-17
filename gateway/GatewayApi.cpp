@@ -145,11 +145,15 @@ GatewayApi::GatewayApi(ApiDeps deps) :
     }
     for (const FaucetCap &cap : m_s.faucetMaxAmount)
     {
-        // the settings reader validated the form; a cap that still does not parse is left out (no faucet for it)
-        if (const auto units = rest::parseMoney(cap.amount))
+        // the settings reader refused every cap rest::parseMoney does not read, so a miss here is a defect
+        const auto units = rest::parseMoney(cap.amount);
+        if (!units)
         {
-            m_faucetCaps.emplace_back(static_cast<std::int32_t>(cap.assetId), *units);
+            frontLog(FrontLevel::CRITICAL, "faucet: the cap '%s' of asset %lld passed the settings reader but does not "
+                "parse (a defect): the asset has no faucet", cap.amount.c_str(), static_cast<long long>(cap.assetId));
+            continue;
         }
+        m_faucetCaps.emplace_back(static_cast<std::int32_t>(cap.assetId), *units);
     }
 }
 

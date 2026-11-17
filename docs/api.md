@@ -697,7 +697,7 @@ previousTerm, previousLeaderId, term, leaderId, firstEntryPosition, durationMs, 
 - `eventSeq` is the exchange-wide, dense order event sequence. The stream's watermark is the highest `eventSeq` up to
   which it has received every event. `heartbeat` and `pong` carry it, so a quiet user's position keeps moving.
 - The server sends a WebSocket ping every `STREAM_WS_PING_MS` (15000) while it is not writing. A connection that sent
-  nothing (no frame, no pong) for `STREAM_WS_IDLE_MS` (60000) is closed 1001.
+  nothing (no frame, no pong) for `STREAM_WS_IDLE_MS` (60000) is closed 1001. The ping interval is always below the idle bound.
 
 ### 5.5 Resume and resync
 
@@ -822,7 +822,7 @@ Content-Type: application/json
 | 503 | `CORE_UNAVAILABLE` | `the core config is not loaded yet` | |
 | 504 | `OUTCOME_UNKNOWN` | `the core did not answer in time` | retry with the same key; the retry also takes a faucet token |
 
-Plus 4.1 and 4.2. `GATEWAY_FAUCET_MAX_AMOUNT` is `assetId:amount,...`; an asset without an entry cannot be deposited
+Plus 4.1 and 4.2. `GATEWAY_FAUCET_MAX_AMOUNT` is `assetId:amount,...` (each amount at most 92233720368.54775807, or the gateway does not start); an asset without an entry cannot be deposited
 or withdrawn through the lane. `GATEWAY_FAUCET_RATE` (1/s) is per user; its burst is one period's count.
 
 Registration funding: when the lane is on, register deposits each capped asset of the config its cap, with a request
