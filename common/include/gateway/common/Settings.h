@@ -119,7 +119,7 @@ struct CommonSettings
 struct FaucetCap
 {
     std::int64_t assetId = 0;
-    std::string amount; // decimal text, validated for form only here
+    std::string amount; // decimal text, validated for form and range (rest::parseMoney reads it) by the reader
 };
 
 struct GatewaySettings

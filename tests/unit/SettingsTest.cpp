@@ -397,6 +397,18 @@ TEST(treasury_lane_needs_flag_credential_and_caps_together)
         "GATEWAY_FAUCET_MAX_AMOUNT");
 }
 
+TEST(faucet_cap_out_of_money_range_is_a_settings_problem)
+{
+    // the form is right but the amount is above INT64_MAX in units: the money parser the faucet route uses refuses it,
+    // so the settings pass refuses it too (no cap is left out at run time)
+    onlyProblem(gw(with(gatewayEnv(), { { "GATEWAY_FAUCET_MAX_AMOUNT", "1:99999999999999999999" } })),
+        "GATEWAY_FAUCET_MAX_AMOUNT", "out of range");
+    onlyProblem(gw(with(gatewayEnv(), { { "GATEWAY_FAUCET_MAX_AMOUNT", "1:5,2:92233720368.54775808" } })),
+        "GATEWAY_FAUCET_MAX_AMOUNT", "asset 2");
+    const auto max = gw(with(gatewayEnv(), { { "GATEWAY_FAUCET_MAX_AMOUNT", "1:92233720368.54775807" } }));
+    CHECK_MSG(max.ok() && 1 == max.settings.faucetMaxAmount.size(), joined(max.errors));
+}
+
 TEST(binds_admin_is_ipv4_and_never_the_public_listener)
 {
     onlyProblem(gw(with(gatewayEnv(), { { "GATEWAY_ADMIN_BIND", "0.0.0.0:8080" } })), "GATEWAY_ADMIN_BIND",
@@ -501,6 +513,24 @@ TEST(history_default_must_not_exceed_max)
     const auto ok = gw(with(gatewayEnv(), { { "GATEWAY_HISTORY_LIMIT_DEFAULT", "2000" },
         { "GATEWAY_HISTORY_LIMIT_MAX", "5000" } }));
     CHECK_MSG(ok.ok(), joined(ok.errors));
+}
+
+TEST(stream_timing_pairs_are_cross_checked)
+{
+    const auto d = st(streamEnv());
+    CHECK_MSG(d.ok(), joined(d.errors));
+    CHECK(d.settings.readyStaleMs > d.settings.headProbeMs && d.settings.wsPingMs < d.settings.wsIdleMs);
+    onlyProblem(st(with(streamEnv(), { { "STREAM_READY_STALE_MS", "5000" } })), "STREAM_READY_STALE_MS",
+        "above STREAM_HEAD_PROBE_MS");
+    onlyProblem(st(with(streamEnv(), { { "STREAM_HEAD_PROBE_MS", "20000" } })), "STREAM_READY_STALE_MS");
+    const auto stale = st(with(streamEnv(), { { "STREAM_HEAD_PROBE_MS", "1000" },
+        { "STREAM_READY_STALE_MS", "1001" } }));
+    CHECK_MSG(stale.ok(), joined(stale.errors));
+    onlyProblem(st(with(streamEnv(), { { "STREAM_WS_PING_MS", "60000" } })), "STREAM_WS_PING_MS",
+        "below STREAM_WS_IDLE_MS");
+    onlyProblem(st(with(streamEnv(), { { "STREAM_WS_IDLE_MS", "10000" } })), "STREAM_WS_PING_MS");
+    const auto ping = st(with(streamEnv(), { { "STREAM_WS_PING_MS", "59999" } }));
+    CHECK_MSG(ping.ok(), joined(ping.errors));
 }
 
 TEST(every_setting_is_recorded_with_its_source)

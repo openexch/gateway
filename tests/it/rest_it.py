@@ -306,7 +306,7 @@ def run(args, gateways):
     orders, _ = orders_of(args, 1002)
     check(len(orders) == 1, "the other user's order is untouched by the bulk cancels", str(orders))
 
-    # ---- stored rejects (row 2.13): keyFinal true replays under its key, keyFinal false is evaluated again
+    # ---- stored rejects: keyFinal true replays under its key, keyFinal false is evaluated again
     su = 1005
     big = dict(order, price="1", quantity="2000000")
     ks = str(uuid.uuid4())

@@ -9,6 +9,7 @@
 
 #include "cluster_tools/client/IngressEndpoints.h"
 #include "cluster_tools/runtime/DriverTimeout.h"
+#include "gateway/common/Rest.h"
 
 // oe-gateway only (defaults from the settings table; none is a limit in code):
 //   GATEWAY_TREASURY_CREDENTIAL unset (keyId:TREASURY:secretHex), GATEWAY_ALLOW_TREASURY_LANE 0: the lane is on only
@@ -37,7 +38,8 @@
 //   History is read when GATEWAY_PG_URL is set, on its own pool (GATEWAY_PG_HISTORY_POOL connections over a queue of
 //   its own, sized GATEWAY_PG_QUEUE like the auth pool's), never the auth pool's connections;
 //   GATEWAY_PG_STATEMENT_TIMEOUT_MS is also one history read's whole deadline, queue wait included,
-//   GATEWAY_FAUCET_MAX_AMOUNT none (assetId:amount,...), GATEWAY_FAUCET_RATE 1/s.
+//   GATEWAY_FAUCET_MAX_AMOUNT none (assetId:amount,...; each amount a money decimal of at most 92233720368.54775807),
+//   GATEWAY_FAUCET_RATE 1/s.
 // oe-stream only:
 //   STREAM_BALANCE_STREAM on|off (on), STREAM_EVENT_WINDOW 65536, STREAM_REPLAY_PAGE 1024, STREAM_GAP_BUFFER_EVENTS
 //   65536, STREAM_QUERY_RATE 50/s + _BURST 50, STREAM_USER_LINGER_MS 30000, STREAM_HEAD_PROBE_MS 5000,
@@ -55,6 +57,7 @@
 //   STREAM_ENGINE_POLL_TIMEOUT_MS 500 (one request's deadline; a node that misses it is unreachable for that round),
 //   STREAM_ENGINE_FRAME_MIN_MS 1000 (the rate cap of the engine frame: a changed frame waits until the last one is this
 //   old), STREAM_ENGINE_MAX_BODY_BYTES 1048576 (a node's answer above it counts as no answer).
+//   Pairs: STREAM_READY_STALE_MS above STREAM_HEAD_PROBE_MS, STREAM_WS_PING_MS below STREAM_WS_IDLE_MS.
 
 namespace openexchange { namespace gateway {
 
@@ -861,12 +864,20 @@ ParseResult<GatewaySettings> parseGatewaySettings(const Environment &env, const 
                         "2147483647 and a positive decimal amount, at most 8 fraction digits)");
                     continue;
                 }
+                cap.amount = item.substr(colon + 1);
+                // the REST layer reads the cap with the money parser; an amount it refuses (above INT64_MAX in units)
+                // is refused here, so every cap that passes this reader is one the faucet route enforces
+                if (!rest::parseMoney(cap.amount))
+                {
+                    r.problem("GATEWAY_FAUCET_MAX_AMOUNT: asset " + std::to_string(cap.assetId) + " amount '" +
+                        cap.amount + "' is out of range (at most 92233720368.54775807)");
+                    continue;
+                }
                 if (!seen.insert(cap.assetId).second)
                 {
                     r.problem("GATEWAY_FAUCET_MAX_AMOUNT: asset " + std::to_string(cap.assetId) + " is listed twice");
                     continue;
                 }
-                cap.amount = item.substr(colon + 1);
                 g.faucetMaxAmount.push_back(cap);
             }
         }
@@ -965,6 +976,19 @@ ParseResult<StreamSettings> parseStreamSettings(const Environment &env, const rt
     s.pgQueue = r.positive("STREAM_PG_QUEUE", s.pgQueue);
     s.pgStatementTimeoutMs = r.positive("STREAM_PG_STATEMENT_TIMEOUT_MS", s.pgStatementTimeoutMs);
     s.pgRetryMs = r.positive("STREAM_PG_RETRY_MS", s.pgRetryMs);
+    if (s.readyStaleMs <= s.headProbeMs)
+    {
+        // /ready counts the head probe stale after STREAM_READY_STALE_MS; at or below the probe interval a healthy
+        // process would flap not ready between two probes
+        r.problem("STREAM_READY_STALE_MS (" + std::to_string(s.readyStaleMs) + ") must be above "
+            "STREAM_HEAD_PROBE_MS (" + std::to_string(s.headProbeMs) + ")");
+    }
+    if (s.wsPingMs >= s.wsIdleMs)
+    {
+        // a quiet client answers the ping with a pong; at or above the idle bound it is closed before it is asked
+        r.problem("STREAM_WS_PING_MS (" + std::to_string(s.wsPingMs) + ") must be below STREAM_WS_IDLE_MS (" +
+            std::to_string(s.wsIdleMs) + ")");
+    }
     if (r.isSet("STREAM_WS_SEND_BUFFER_BYTES"))
     {
         s.wsSendBufferBytes = r.positive("STREAM_WS_SEND_BUFFER_BYTES", 0);

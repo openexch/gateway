@@ -44,7 +44,7 @@ void expectFills(const Client &c, const FakeCore &core, std::int64_t userId, std
 
 }
 
-// 3.1 (T0 leg; the T1 row runs against the real core): a user above one page, with orders created, filled and cancelled
+// Stitch (stream_it.py runs it against the real core): a user above one page, with orders created, filled and cancelled
 // between the pages, converges to the core's state with no duplicate and no missing event.
 TEST(stream_stitch_across_pages)
 {
@@ -96,7 +96,7 @@ TEST(stream_stitch_across_pages)
     expectFills(cl, rig.fake, user);
 }
 
-// 3.2 (T0 leg): a hole in the live stream and a new session are filled by RequestOrderEvents; no client resyncs.
+// Gap: a hole in the live stream and a new session are filled by RequestOrderEvents; no client resyncs.
 TEST(stream_gap_is_replayed)
 {
     Rig rig;
@@ -165,7 +165,7 @@ TEST(stream_overrun_resyncs_every_connection)
     CHECK(!rig.core.gapOpen());
 }
 
-// 3.3 (T0 leg): a quiet user resumes from its last heartbeat after other users' flow: served from the window, no
+// Resume: a quiet user resumes from its last heartbeat after other users' flow: served from the window, no
 // core query. Then the backfill and the too-old cases.
 TEST(stream_resume_from_heartbeat)
 {
@@ -241,7 +241,7 @@ TEST(stream_resume_backfill_and_too_old)
     expectConverged(o, rig.fake, 41, "after RESUME_TOO_OLD");
 }
 
-// 3.4 (T0 leg): a balance line older than the UserBalances reply is discarded, a newer one applies.
+// Balance stitch: a balance line older than the UserBalances reply is discarded, a newer one applies.
 TEST(stream_balance_stitch)
 {
     Rig rig;
@@ -268,7 +268,7 @@ TEST(stream_balance_stitch)
     CHECK_MSG(btc != cl.balances.end() && "2" == btc->second, "stale balance after snapshot: BTC");
 }
 
-// 3.5 (T0 leg): an overrun with many connected users re-reads them through the budget: at most the session's burst of
+// Overrun: an overrun with many connected users re-reads them through the budget: at most the session's burst of
 // snapshot queries outstanding at once, every user converges, oldest connection first.
 TEST(stream_resnapshot_is_paced)
 {
@@ -334,8 +334,8 @@ TEST(stream_resnapshot_is_paced)
     }
 }
 
-// 3.6 (T0 leg): a second connection and a reconnect inside the linger cost no core query; the cache is dropped after the
-// linger and at a new registration.
+// Per-user cache: a second connection and a reconnect inside the linger cost no core query; the cache is dropped after
+// the linger and at a new registration.
 TEST(stream_user_cache)
 {
     Rig rig;
@@ -381,7 +381,7 @@ TEST(stream_user_cache)
     expectConverged(rig.clients[e], rig.fake, user, "e");
 }
 
-// 3.7 (T0 leg): a client that stops reading is closed 4001 at the bound; order frames of one order coalesce (no close
+// Slow client: a client that stops reading is closed 4001 at the bound; order frames of one order coalesce (no close
 // below the bound); other clients are not delayed.
 TEST(stream_slow_client_bound)
 {
@@ -416,7 +416,7 @@ TEST(stream_slow_client_bound)
         " snapshot(s), " + std::to_string(rig.clients[fast].types.size()) + " frames");
 }
 
-// 3.7 (T0 leg, the direct path): a frame handed straight to the writer counts against the bound too. The writer's
+// Slow client, the direct path: a frame handed straight to the writer counts against the bound too. The writer's
 // handover holds more frames than the message bound and more bytes than the byte bound; a client that stops reading is
 // still closed 4001 at the bound. A single frame larger than the byte bound on an otherwise empty connection goes out.
 TEST(stream_slow_client_bound_direct)
@@ -547,8 +547,8 @@ TEST(stream_first_probe_retried_at_once)
     CHECK_MSG(rig.core.watermark() >= 0, "a failed first head probe is not retried before STREAM_HEAD_PROBE_MS");
 }
 
-// 3.8: N fills on one order under back-pressure: N fill frames (or a 4001 close); fills inside a folded span follow the
-// snapshot.
+// Fills: N fills on one order under back-pressure: N fill frames (or a 4001 close); fills inside a folded span follow
+// the snapshot.
 TEST(stream_fills_never_coalesce)
 {
     st::StreamCoreSettings s = settings();

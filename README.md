@@ -167,7 +167,7 @@ No order-path request touches PostgreSQL.
   connection the server dropped is retried once on a fresh connection.
 
 Treasury lane (demo only): `GATEWAY_TREASURY_CREDENTIAL` plus `GATEWAY_ALLOW_TREASURY_LANE=1` plus
-`GATEWAY_FAUCET_MAX_AMOUNT` (`assetId:amount,...`), rate limited by `GATEWAY_FAUCET_RATE`. A deposit or withdraw
+`GATEWAY_FAUCET_MAX_AMOUNT` (`assetId:amount,...`; an amount above 92233720368.54775807 stops the process at boot), rate limited by `GATEWAY_FAUCET_RATE`. A deposit or withdraw
 retried after a 504 also takes a faucet token. A TREASURY key can credit any user; the caps in the gateway only
 guard against bugs. Registration funding re-sends a deposit whose outcome is unknown only when the core's
 `idempotencyWindowMs` is longer than twice `GATEWAY_REQUEST_TIMEOUT_MS`; otherwise `funded` is false and
@@ -211,7 +211,7 @@ the blocked write and the connection ends as a socket close after `STREAM_WS_IDL
 other clients are not affected.
 
 `/ready` requires a registered session, no open event gap, a head probe answered within
-`STREAM_READY_STALE_MS` and the listener accepting. A closed admission gate does not affect it.
+`STREAM_READY_STALE_MS` and the listener accepting. A closed admission gate does not affect it. `STREAM_READY_STALE_MS` must be above `STREAM_HEAD_PROBE_MS` and `STREAM_WS_PING_MS` below `STREAM_WS_IDLE_MS`; otherwise the process stops at boot.
 
 Engine status. Every connection gets an `engine` frame on connect and again on change, at most once per
 `STREAM_ENGINE_FRAME_MIN_MS` (a held frame goes out as soon as the cap allows), and `election` frames with

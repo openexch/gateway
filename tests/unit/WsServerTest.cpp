@@ -1,7 +1,7 @@
-// T0 rows of oe-stream's WebSocket edge (3.9): the three credential paths, never a query parameter, one credential per
-// connection, the first-frame timeout, a userId in a client frame closes 4003, and no frame of another user reaches a
-// connection. The real WsServer on a loopback port, dev principals, and a duty thread driving StreamCore over the model
-// core of StreamRig.h.
+// T0 rows of oe-stream's WebSocket edge, the binding: the three credential paths, never a query parameter, one
+// credential per connection, the first-frame timeout, a userId in a client frame closes 4003, and no frame of another
+// user reaches a connection. The real WsServer on a loopback port, dev principals, and a duty thread driving StreamCore
+// over the model core of StreamRig.h.
 
 #include <sys/socket.h>
 #include <sys/time.h>

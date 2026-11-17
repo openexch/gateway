@@ -972,6 +972,26 @@ TEST(routes_treasury_unknown_asset)
 }
 
 // Register funding: the derived requestId makes a lost ack credit once; `funded` says every deposit was acked.
+TEST(reoffer_window_check_once_per_config_version)
+{
+    // the window must be above twice the request timeout; the check speaks once per loaded config version
+    CHECK(reofferFitsWindow(10'002, 5000) && !reofferFitsWindow(10'000, 5000) && !reofferFitsWindow(0, 5000));
+    ReofferWindowCheck check(5000);
+    CHECK_MSG(!check.check(session::CoreConfig{}).has_value(), "a config not yet read was checked");
+    const session::CoreConfig fits = *makeConfig(); // version 3, window 900000
+    CHECK_MSG(!check.check(fits).has_value(), "a 900000 ms window refused against a 5000 ms timeout");
+    session::CoreConfig shortWindow = fits;
+    shortWindow.head.configVersion = 4;
+    shortWindow.head.requestTtlMs = 10'000;
+    const auto line = check.check(shortWindow);
+    CHECK_MSG(line && std::string::npos != line->find("GATEWAY_REQUEST_TIMEOUT_MS") &&
+            std::string::npos != line->find("version 4"),
+        line ? *line : std::string("no line for a 10000 ms window against a 5000 ms timeout"));
+    CHECK_MSG(!check.check(shortWindow).has_value(), "the same config version reported twice");
+    shortWindow.head.configVersion = 5;
+    CHECK_MSG(check.check(shortWindow).has_value(), "a new config version with the short window not reported");
+}
+
 TEST(routes_register_funding)
 {
     Rig rig;

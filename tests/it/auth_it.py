@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""T1 rows of the auth slice through the real oe-gateway binary: a three-member core cluster (as session_it.py), a
+"""T1 rows of the auth routes through the real oe-gateway binary: a three-member core cluster (as session_it.py), a
 throwaway PostgreSQL container (the users database, the image pinned by digest), and oe-gateway in demo mode with an
 api-key file, its REST listener, its hash and store pools and its duty bridge. A heavy job: run it under the lock.
 

@@ -1616,7 +1616,7 @@ void GatewayApi::fundOne(std::int64_t userId, std::int32_t assetId, std::int64_t
                 // applied deposit would credit twice, and funded stays false instead.
                 const auto config = m_deps.config();
                 const std::int64_t window = config ? config->idempotencyWindowMs() : 0;
-                if (window / 2 > m_s.requestTimeoutMs)
+                if (reofferFitsWindow(window, m_s.requestTimeoutMs))
                 {
                     fundOne(userId, assetId, amount, attempt + 1, done);
                     return;
