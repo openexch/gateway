@@ -648,6 +648,11 @@ void parseDriverSettings(SettingsReader &r, const std::string &prefix, const rt:
     parseDriverSettingsImpl(r, prefix, probe, c);
 }
 
+void checkSessionChannel(SettingsReader &r, const std::string &name, const std::string &uri, bool response)
+{
+    checkChannel(r, name, uri, response);
+}
+
 std::optional<Bind> parseBindText(const std::string &text, bool ipv4Only, std::string &why)
 {
     return parseBind(text, ipv4Only, why);

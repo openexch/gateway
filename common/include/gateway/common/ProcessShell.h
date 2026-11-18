@@ -42,6 +42,10 @@ namespace cluster_tools { namespace runtime {
 class LogRing;
 }}
 
+namespace cluster_tools { namespace client { namespace aeron_transport {
+class AeronFatalMonitor;
+}}}
+
 namespace openexchange { namespace gateway {
 
 // The work of the duty thread (the core session and what hangs off it). Called on the duty thread only.
@@ -58,6 +62,8 @@ public:
 struct DutyContext
 {
     std::shared_ptr<aeron::Aeron> aeron;
+    // the monitor of that client: fatal once the conductor reported a fatal error (no Aeron object is touched after)
+    std::shared_ptr<cluster_tools::client::aeron_transport::AeronFatalMonitor> monitor;
     cluster_tools::runtime::LogRing *log = nullptr;
 };
 

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Builds and installs the cluster-tools package this repository pins: scripts/fetch-cluster-tools.sh fetches and
-# verifies every input, then the verified tree is configured (WITH_AERON, the embedded media driver, no tests),
-# only the package's targets are built, and `cmake --install` writes the package to <prefix>. This repository's
+# verifies every input, then the verified tree is configured (WITH_AERON, the embedded media driver, WITH_BRIDGE for
+# the archive follow library on the Aeron archive client, no tests), only the package's targets are built, and `cmake --install` writes the package to <prefix>. This repository's
 # CMake then finds it with CMAKE_PREFIX_PATH=<prefix> and checks it against the lock again (source sha, money
 # schema sha256 and version), so a stale prefix is refused at configure, never used.
 #
@@ -23,11 +23,12 @@ REF=$(printf '%s\n' "$ARGS" | sed -n 's/^-DCT_BUILD_SOURCE_SHA=//p')
 BUILD="$CACHE/build-$REF"
 
 "$CMAKE" -S "$SRC" -B "$BUILD" -DCMAKE_BUILD_TYPE=Release -DWITH_AERON=ON -DCT_BUILD_MEDIA_DRIVER=ON \
-    -DBUILD_TESTING=OFF "${CT_ARGS[@]}"
+    -DWITH_BRIDGE=ON -DBUILD_TESTING=OFF "${CT_ARGS[@]}"
 # The package's targets only (cmake/Package.cmake in the pinned tree; ct_sbe_generate makes the codec headers of the
-# interface target ct_sbe_codecs): the binaries and tests are not installed.
+# interface target ct_sbe_codecs; archive_aeron and aeron_archive_client, the archive follow library's Aeron side, with
+# WITH_BRIDGE): the binaries and tests are not installed.
 "$CMAKE" --build "$BUILD" -j"$JOBS" --target ct_client_core ct_runtime ct_archive_core ct_sbe_generate ct_client_aeron ct_runtime_aeron \
-    aeron_static aeron_driver_static
+    aeron_static aeron_driver_static ct_aeron_archive_client ct_archive_aeron
 "$CMAKE" --install "$BUILD" --prefix "$PREFIX"
 CONFIG="$PREFIX/lib/cmake/cluster_tools/cluster_toolsConfig.cmake"
 [ -f "$CONFIG" ] || CONFIG=$(find "$PREFIX" -name cluster_toolsConfig.cmake -print -quit)

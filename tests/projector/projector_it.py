@@ -158,6 +158,9 @@ class Ctx:
                "HISTORY_PROJECTOR_LOCAL_HOST": "127.0.0.1",
                "HISTORY_PROJECTOR_CLUSTER_MEMBERS": "0=127.0.0.1:9010",
                "HISTORY_PROJECTOR_CLUSTER_KEY_FILE": self.key_file,
+               "HISTORY_PROJECTOR_JOURNAL_NODE_ENDPOINTS": "-,-",
+               "HISTORY_PROJECTOR_CORE_INGRESS_CHANNEL": "aeron:udp?term-length=64k|mtu=1408",
+               "HISTORY_PROJECTOR_CORE_RESPONSE_CHANNEL": "aeron:udp?endpoint=127.0.0.1:0|term-length=64k|mtu=1408",
                "HISTORY_PROJECTOR_PG_URL": url,
                "HISTORY_PROJECTOR_LEASE_MS": str(LEASE_MS),
                "HISTORY_PROJECTOR_LEASE_POLL_MS": str(POLL_MS),
@@ -351,7 +354,7 @@ def case_config(ctx):
     check(code == 78, f"exit {code}, expected 78:\n{out}")
     required = ["DRIVER_MODE", "INSTANCE_ID", "ADMIN_BIND", "JOURNAL_ARCHIVES", "JOURNAL_CONTROL_STREAM",
                 "JOURNAL_STREAM", "JOURNAL_CHANNEL", "REPLAY_STREAM", "LOCAL_HOST", "JOURNAL_MTU", "CLUSTER_MEMBERS",
-                "CLUSTER_KEY_FILE", "PG_URL"]
+                "CLUSTER_KEY_FILE", "PG_URL", "JOURNAL_NODE_ENDPOINTS", "CORE_INGRESS_CHANNEL", "CORE_RESPONSE_CHANNEL"]
     for key in required:
         check(f"HISTORY_PROJECTOR_{key} is required" in out, f"HISTORY_PROJECTOR_{key} not named:\n{out}")
     check(f"refusing to start: {len(required)} configuration problems (exit 78)" in out, f"refusal line:\n{out}")

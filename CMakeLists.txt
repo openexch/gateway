@@ -37,7 +37,7 @@ include(GatewayDeps)
 set(GW_DEPS_PREFIX "" CACHE PATH "the prefix scripts/build-deps.sh installed Boost, OpenSSL and libpq to")
 gw_check_deps("${CMAKE_CURRENT_SOURCE_DIR}/dependencies.lock" "${GW_DEPS_PREFIX}")
 find_package(cluster_tools CONFIG REQUIRED COMPONENTS client_core runtime client client_aeron runtime_aeron sbe_codecs
-    runtime_embedded_driver archive_core)
+    runtime_embedded_driver archive_core archive_aeron aeron_archive_client)
 gw_check_cluster_tools_package()
 
 if(GW_BUILD_SOURCE_SHA)
@@ -149,9 +149,14 @@ target_compile_definitions(oe_stream_app PRIVATE GW_NO_ORDER_ENTRY)
 
 # oe-projector: built like the stream (GW_NO_ORDER_ENTRY, no gw_order_entry): it holds a GATEWAY session for its head
 # probe only and cannot encode an order or money command.
-add_library(oe_projector_app STATIC projector/ProjectorApp.cpp projector/ProjectorSettings.cpp projector/ProjectionStore.cpp)
-target_include_directories(oe_projector_app PUBLIC projector)
-target_link_libraries(oe_projector_app PUBLIC gw_common cluster_tools::archive_core)
+# It follows the core's order journal with the cluster-tools archive follow library (archive_aeron, on the Aeron archive
+# client) and reads each member node's /health with the stream's HTTP poller (stream/EnginePoller.cpp).
+set(GW_PROJECTOR_SOURCES projector/ProjectorApp.cpp projector/ProjectorSettings.cpp projector/ProjectionStore.cpp
+    projector/JournalRecord.cpp projector/FollowRules.cpp projector/HistoryWork.cpp projector/FollowDuty.cpp
+    stream/EnginePoller.cpp stream/EngineStatus.cpp)
+add_library(oe_projector_app STATIC ${GW_PROJECTOR_SOURCES})
+target_include_directories(oe_projector_app PUBLIC projector PRIVATE stream)
+target_link_libraries(oe_projector_app PUBLIC gw_common cluster_tools::archive_aeron cluster_tools::archive_core)
 target_compile_options(oe_projector_app PRIVATE ${GW_WARNINGS})
 target_compile_definitions(oe_projector_app PRIVATE GW_NO_ORDER_ENTRY)
 

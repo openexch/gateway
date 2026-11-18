@@ -20,6 +20,8 @@
 #include "gateway/common/Environment.h"
 #include "gateway/common/ExitCodes.h"
 
+#include "FollowDuty.h"
+#include "HistoryWork.h"
 #include "ProjectorSettings.h"
 
 namespace openexchange { namespace gateway {
@@ -60,16 +62,28 @@ std::string q(const std::string &text)
 class ProjectionWriter final : public FrontWork
 {
 public:
-    ProjectionWriter(const ProjectorSettings &s, ProjectorShared &shared, const ProjectorHooks &hooks) :
-        m_settings(s), m_shared(shared), m_hooks(hooks), m_lease(s.leaseMs),
-        m_work(hooks.makeWork ? hooks.makeWork() : nullptr)
+    ProjectionWriter(const ProjectorSettings &s, ProjectorShared &shared, const ProjectorHooks &hooks,
+        const projector::FollowParts &parts, projector::WriterStats &stats) :
+        m_settings(s), m_shared(shared), m_hooks(hooks), m_lease(s.leaseMs), m_parts(parts), m_stats(stats),
+        m_work(hooks.makeWork ? hooks.makeWork() : makeHistoryWork(s, parts, stats)), m_poller(s, *parts.nodes)
     {
+    }
+
+    static std::unique_ptr<FencedWork> makeHistoryWork(const ProjectorSettings &s, const projector::FollowParts &parts,
+        projector::WriterStats &stats)
+    {
+        projector::HistoryWorkSettings w;
+        w.batchEvents = s.batchEvents;
+        w.batchMs = s.batchMs;
+        w.statementTimeoutMs = s.pgStatementTimeoutMs;
+        return std::make_unique<projector::HistoryWork>(*parts.exchange, w, stats);
     }
     ~ProjectionWriter() override { stop(m_settings.common.stopTimeoutMs); }
 
     bool bind(std::string &) override { return true; } // no listener
     void start() override
     {
+        m_poller.start();
         m_thread = std::thread([this] { run(); });
     }
     bool stop(std::int64_t boundMs) override
@@ -79,6 +93,7 @@ public:
             m_stop = true;
         }
         m_wake.notify_all();
+        m_poller.stop();
         if (!m_thread.joinable())
         {
             return true;
@@ -102,8 +117,8 @@ public:
     {
         std::lock_guard<std::mutex> lock(m_viewLock);
         status.leaseHeld = leaseHeldNow(nowNs());
-        status.halted = m_view.state.haltReason.has_value();
-        status.lastBeatNs = -1; // the beat is written by the head-probe rule, which this version does not run
+        status.halted = projector::Halt::NONE != m_parts.view->get().halt.halt;
+        status.lastBeatNs = -1; // no beat is written yet: the beat rule is not part of this binary
     }
 
     std::string healthJson() const override
@@ -127,9 +142,42 @@ public:
         out += ",\"cursor\":{\"epoch\":" + (st.epoch ? std::to_string(*st.epoch) : std::string("null")) +
             ",\"appliedSeq\":" + std::to_string(st.appliedSeq) + ",\"appliedLogPosition\":" +
             std::to_string(st.appliedLogPosition) + ",\"appliedOrderId\":" + std::to_string(st.appliedOrderId) + "}";
-        out += ",\"halt\":{\"reason\":" + (st.haltReason ? q(*st.haltReason) : std::string("null")) + "}";
+        const projector::FollowView f = m_parts.view->get();
+        out += ",\"halt\":{\"reason\":" + (projector::Halt::NONE != f.halt.halt ? q(projector::nameOf(f.halt.halt))
+                : st.haltReason ? q(*st.haltReason) : std::string("null")) + ",\"detail\":" +
+            (projector::Halt::NONE != f.halt.halt ? q(f.halt.detail) : std::string("null")) + "}";
+        auto n = [](std::uint64_t x) { return std::to_string(x); };
+        auto a = [](const std::atomic<std::uint64_t> &x) { return std::to_string(x.load(std::memory_order_relaxed)); };
         out += ",\"follow\":{\"replaysOpen\":" + std::to_string(m_shared.replaysOpen.load()) + ",\"sessionOpen\":" +
-            (m_shared.sessionOpen.load() ? "true" : "false") + "}";
+            (m_shared.sessionOpen.load() ? "true" : "false");
+        out += ",\"generation\":" + n(f.generation) + ",\"source\":" +
+            (f.source ? std::to_string(*f.source) : std::string("null")) + ",\"endpoint\":" +
+            (f.endpoint.empty() ? std::string("null") : q(f.endpoint)) + ",\"archiveId\":" +
+            std::to_string(f.archiveId) + ",\"phase\":" + q(f.phase) + ",\"chainIndex\":" + n(f.chainIndex) +
+            ",\"recordingId\":" + std::to_string(f.recordingId) + ",\"lastAttachFrom\":" +
+            std::to_string(f.lastAttachFrom) + ",\"lastAttachFromMemo\":" + (f.lastAttachFromMemo ? "true" : "false");
+        out += ",\"next\":" + std::to_string(f.next) + ",\"appliedSeq\":" + std::to_string(f.appliedSeq) +
+            ",\"epoch\":" + (f.dbEpoch ? std::to_string(*f.dbEpoch) : std::string("null")) + ",\"genesisId\":" +
+            std::to_string(f.genesisId) + ",\"headSeq\":" + std::to_string(f.headSeq) + ",\"lagEvents\":" +
+            (f.headSeq >= 0 ? std::to_string(std::max<std::int64_t>(0, f.headSeq - f.appliedSeq)) : std::string("null"));
+        out += ",\"sources\":[";
+        for (std::size_t i = 0; i < f.sourceStates.size(); ++i)
+        {
+            out += (i ? "," : "") + q(f.sourceStates[i]);
+        }
+        out += "]";
+        out += ",\"counts\":{\"switches\":" + n(f.switches) + ",\"holes\":" + n(f.holes) + ",\"belowRange\":" +
+            n(f.belowRange) + ",\"payloadConflicts\":" + a(m_stats.payloadConflicts) + ",\"schemaRefusals\":" +
+            n(f.schemaRefusals) + ",\"mtuRefusals\":" + n(f.mtuRefusals) + ",\"behind\":" + n(f.behind) +
+            ",\"leaderAvoided\":" + n(f.leaderAvoided) + ",\"budgetSkips\":" + n(f.budgetSkips) +
+            ",\"refusedReplays\":" + n(f.refusedReplays) + ",\"stopRequestsAnswered\":" + n(f.stopRequestsAnswered) +
+            ",\"orphanUnknown\":" + n(f.orphanUnknown) + ",\"epochZeroRecords\":" + n(f.epochZeroRecords) +
+            ",\"foreignEpochRecordings\":" + n(f.foreignEpochRecordings) + ",\"reReads\":" + n(f.reReads) +
+            ",\"replaysStarted\":" + n(f.replaysStarted) + ",\"replayStops\":" + n(f.replayStops) +
+            ",\"recordsApplied\":" + a(m_stats.recordsApplied) + ",\"skips\":" + a(m_stats.skips) +
+            ",\"replayRows\":" + a(m_stats.replayRows) + ",\"resets\":" + a(m_stats.resets) +
+            ",\"uncertainCommits\":" + a(m_stats.uncertainCommits) + ",\"nodeRounds\":" +
+            a(m_parts.nodes->rounds) + ",\"nodeFailures\":" + a(m_parts.nodes->failures) + "}}";
         out += ",\"batches\":" + std::to_string(v.batches) + "}";
         return out;
     }
@@ -158,6 +206,29 @@ public:
         line("gauge", "applied_seq", "The cursor: every journalSeq up to it is applied (as last read or committed).",
             std::to_string(v.state.appliedSeq));
         line("gauge", "replays_open", "Replays this copy holds.", std::to_string(m_shared.replaysOpen.load()));
+        line("gauge", "session_open", "1 while this copy holds the cluster session.", m_shared.sessionOpen.load() ? "1" : "0");
+        const projector::FollowView f = m_parts.view->get();
+        line("gauge", "head_seq", "The core's head at the last answered probe (-1: none).", std::to_string(f.headSeq));
+        line("gauge", "halted", "1 while a halt is set.", projector::Halt::NONE != f.halt.halt ? "1" : "0");
+        line("counter", "records_applied_total", "Journal records applied.",
+            std::to_string(m_stats.recordsApplied.load(std::memory_order_relaxed)));
+        line("counter", "skips_total", "Records at or below the cursor compared equal with the stored bytes.",
+            std::to_string(m_stats.skips.load(std::memory_order_relaxed)));
+        line("counter", "payload_conflicts_total", "Records that differ from the stored bytes of their sequence.",
+            std::to_string(m_stats.payloadConflicts.load(std::memory_order_relaxed)));
+        line("counter", "source_switches_total", "Sources left.", std::to_string(f.switches));
+        line("counter", "holes_total", "Holes seen on memo-free reads.", std::to_string(f.holes));
+        line("counter", "below_range_total", "Memo-free reads that began above the cursor.", std::to_string(f.belowRange));
+        line("counter", "foreign_epoch_recordings_total", "Recordings of another epoch, not walked.",
+            std::to_string(f.foreignEpochRecordings));
+        line("counter", "refused_replays_total", "Replay requests a source archive refused (its replay cap).",
+            std::to_string(f.refusedReplays));
+        line("counter", "orphan_stop_requests_answered_total", "Recorded replays of an earlier writer whose stopReplay the "
+            "archive answered OK (it also answers OK for a session it no longer knows).",
+            std::to_string(f.stopRequestsAnswered));
+        line("counter", "orphan_unknown_total", "Recorded replays the archive no longer knew.", std::to_string(f.orphanUnknown));
+        line("counter", "behind_total", "Sources left for BEHIND.", std::to_string(f.behind));
+        line("counter", "leader_avoided_total", "Switches away from the leader's archive.", std::to_string(f.leaderAvoided));
         return out;
     }
 
@@ -440,6 +511,26 @@ private:
                     break;
             }
         }
+        // a clean stop: what pj-duty queued on its way out (the replay rows it forgot when it stopped them; pj-duty
+        // closes before this thread is stopped) is written in one last fenced batch, then the lease is released
+        if (m_work && m_lease.held() && m_conn.ok() && !reassert && nowNs() - lastConfirmNs < holdNs &&
+            m_work->due(nowNs()))
+        {
+            StateAdvance advance;
+            std::string error;
+            const Hold h = m_lease.commitFenced(m_conn, t,
+                [&](PgConn &c, std::string &e) { return m_work->write(c, m_lease.token(), advance, e); }, advance, error,
+                m_hooks.beforeFence, m_hooks.beforeCommit);
+            if (Hold::HELD == h)
+            {
+                m_work->committed(advance);
+            }
+            else
+            {
+                std::fprintf(stderr, "oe-projector: the last batch at stop was not written (%s): the next writer stops "
+                    "the replays still recorded\n", error.c_str());
+            }
+        }
         if (m_lease.held() && m_conn.ok())
         {
             m_lease.release(m_conn, t);
@@ -454,7 +545,10 @@ private:
     ProjectorShared &m_shared;
     const ProjectorHooks &m_hooks;
     WriterLease m_lease;
+    projector::FollowParts m_parts;
+    projector::WriterStats &m_stats;
     std::unique_ptr<FencedWork> m_work;
+    projector::NodePoller m_poller;
     PgConn m_conn;
     pg::WarnLimiter m_warn;
     std::int64_t m_nextPollNs = 0;
@@ -468,43 +562,6 @@ private:
 
     mutable std::mutex m_viewLock;
     View m_view;
-};
-
-// pj-duty: attaches to the journal sources and the head-probe session only while this copy is the writer, and only
-// inside the step-down point of pj-pg's last confirmation (writerNow), so a pj-pg blocked in a slow statement cannot
-// keep them past the lease. This version holds neither (no replay, no session); the transitions are where they start
-// and stop. On a clean stop the process shell joins pj-duty (DutyWork::close) before it stops pj-pg, so the lease is
-// released after the replays and the session are dropped.
-class ProjectorDuty final : public DutyWork
-{
-public:
-    ProjectorDuty(const DutyContext &context, ProjectorShared &shared) : m_log(context.log), m_shared(shared) {}
-
-    int doWork() override
-    {
-        const bool writer = writerNow(m_shared, nowNs());
-        if (writer == m_attached)
-        {
-            return 0;
-        }
-        m_attached = writer;
-        if (nullptr != m_log)
-        {
-            m_log->push(rt::LogLevel::INFO, nowNs(), "pj-duty: %s", writer
-                    ? "writer: the journal sources and the head-probe session may be attached"
-                    : "standby: no replay and no session are held");
-        }
-        return 1;
-    }
-
-    void fillStatus(Status &) const override {}
-    int exitCode() const override { return m_shared.fatalExit.load(std::memory_order_acquire); }
-    void close() override { m_shared.writer.store(false, std::memory_order_release); }
-
-private:
-    rt::LogRing *m_log;
-    ProjectorShared &m_shared;
-    bool m_attached = false;
 };
 
 // Sleeps `ms` unless SIGTERM or SIGINT arrives (the signals are blocked in every thread by main): true when signalled.
@@ -670,11 +727,16 @@ int projectorMain(int argc, char **argv, const ProjectorHooks &hooks)
     inputs.hooks = hooks.process;
     // live until the process exits (runProcess does not return)
     static ProjectorShared shared;
-    inputs.makeDuty = [](const DutyContext &context) -> std::unique_ptr<DutyWork> {
-        return std::make_unique<ProjectorDuty>(context, shared);
+    static projector::FollowExchange exchange(static_cast<std::size_t>(s.queueEvents));
+    static projector::NodeTable nodes(s.archive.archives.size());
+    static projector::FollowViewBox view;
+    static projector::WriterStats stats;
+    static const projector::FollowParts parts{ &exchange, &nodes, &view };
+    inputs.makeDuty = [&s](const DutyContext &context) -> std::unique_ptr<DutyWork> {
+        return projector::makeFollowDuty(context, s, shared, parts);
     };
     inputs.makeFront = [&s, &hooks]() -> std::unique_ptr<FrontWork> {
-        return std::make_unique<ProjectionWriter>(s, shared, hooks);
+        return std::make_unique<ProjectionWriter>(s, shared, hooks, parts, stats);
     };
     runProcess(identity, inputs);
 }

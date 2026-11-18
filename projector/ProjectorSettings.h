@@ -22,16 +22,32 @@
 //   AERON_DIR / _DRIVER_DIR, _DRIVER_TIMEOUT_MS 10000    by mode, as the gateway binaries
 //   _INSTANCE_ID           required: a positive int64; the embedded driver dir suffix and the process counter key
 //   _ADMIN_BIND            required: host:port (IPv4) of /health, /ready, /metrics
-//   _IDLE backoff|busy, _DUTY_WATCHDOG_MS 5000, _STOP_TIMEOUT_MS 2000, _STATUS_INTERVAL_MS 100,
+//   _IDLE backoff|busy, _DUTY_WATCHDOG_MS 10000 (above _ARCHIVE_TIMEOUT_MS), _STOP_TIMEOUT_MS 2000,
+//   _STATUS_INTERVAL_MS 100,
 //   _EMBEDDED_RETRY_MS 1000 (embedded only)
 // The journal sources (the cluster-tools archive reader rules, core order journal profile):
 //   _JOURNAL_ARCHIVES      required: archive control endpoints host:port,... in failover order
 //   _JOURNAL_CONTROL_STREAM, _JOURNAL_STREAM, _JOURNAL_CHANNEL, _REPLAY_STREAM, _JOURNAL_MTU   required, never guessed;
 //                          the MTU is checked against each recording before a replay
 //   _LOCAL_HOST            required: the routable address replays are sent to (loopback refused with remote sources)
-// The head-probe session:
+//   _JOURNAL_NODE_ENDPOINTS required: one entry per archive, in the same order: host:port of that core member's node
+//                          endpoint (its /health and /metrics: the role it reports, its readerReplayBudget and
+//                          core_archive_replays_active), or '-' for a source that is not a core member (a journal
+//                          replica: never the leader, no budget read). Readers avoid the leader with it.
+//   _NODE_POLL_MS 1000, _NODE_POLL_TIMEOUT_MS 500 (below the poll), _NODE_MAX_BODY_BYTES 1048576
+//   _NODE_FRESH_MS 3000 (above the poll): a node answer older than this is unknown (role, budget, replay count)
+//   _NODE_FIRST_ROUND_MS 3000: after a takeover no source is chosen before the first node round answered, at most
+//                          this long (a source is never chosen blind: it may be the leader)
+//   _ARCHIVE_PROBE_MS 10000   the follower's recording probe: a replay with no progress between two probes while its
+//                          recording grew is a stall (the source is left)
+// The cluster session (the genesis and the core's head):
 //   _CLUSTER_MEMBERS       required: the core members, id=host:port,...
 //   _CLUSTER_KEY_FILE      required: a file holding keyId:GATEWAY:secretHex (a GATEWAY key; another class is refused)
+//   _CORE_INGRESS_CHANNEL  required: a full aeron:udp URI naming term-length and mtu
+//   _CORE_RESPONSE_CHANNEL required: a full aeron:udp URI naming endpoint, term-length and mtu
+//   _REQUEST_TIMEOUT_MS 3000 (a head probe's deadline), _RECONNECT_DELAY_MS 1000, _REGISTER_RESEND_MS 5000
+//   _SESSION_MAX_INFLIGHT 64, _QUERY_RATE_COUNT 100, _QUERY_RATE_PERIOD_MS 1000, _QUERY_BURST 200   the session's
+//                          own bounds (the head probe sends one query at a time)
 // PostgreSQL:
 //   _PG_URL                required: postgresql:// URL of the projection database (the projector's role)
 //   _PG_STATEMENT_TIMEOUT_MS 3000, _PG_RETRY_MS 1000, _PG_IDLE_IN_TX_TIMEOUT_MS 10000 (set on the projector's session:
@@ -50,7 +66,8 @@
 // runs to its timeout still returns before the writer's own step-down point, the lease less one renewal interval);
 // _REBUILD_LOCK_TIMEOUT_MS below _PG_STATEMENT_TIMEOUT_MS. A WARN at boot, not a refusal: _PG_IDLE_IN_TX_TIMEOUT_MS
 // above _LEASE_MS (the fence still stops a stopped writer, but a takeover can then wait the idle timeout instead of at
-// most one lease).
+// most one lease); _DUTY_WATCHDOG_MS not above _ARCHIVE_TIMEOUT_MS (an archive control call that waits out its timeout
+// on pj-duty can trip the watchdog, exit 70, before the source is left).
 
 namespace openexchange { namespace gateway {
 
@@ -60,8 +77,24 @@ struct ProjectorSettings
 {
     CommonSettings common; // driver, instance id, admin bind, idle, watchdog, stop timeout, status interval
     cluster_tools::archive::ArchiveSettings archive;
+    std::vector<std::optional<Bind>> nodeEndpoints; // per archive; nullopt: not a core member
+    std::int64_t nodePollMs = 1000;
+    std::int64_t nodePollTimeoutMs = 500;
+    std::int64_t nodeMaxBodyBytes = 1'048'576;
+    std::int64_t nodeFreshMs = 3000;
+    std::int64_t nodeFirstRoundMs = 3000;
+    std::int64_t archiveProbeMs = 10'000;
     std::string clusterMembers;
     std::string clusterKeyFile;
+    std::string ingressChannel;
+    std::string responseChannel;
+    std::int64_t requestTimeoutMs = 3000;
+    std::int64_t reconnectDelayMs = 1000;
+    std::int64_t registerResendMs = 5000;
+    std::int64_t sessionMaxInflight = 64;
+    std::int64_t queryRateCount = 100;
+    std::int64_t queryRatePeriodMs = 1000;
+    std::int64_t queryBurst = 200;
     cluster_tools::client::CoreCredentials clusterCredentials;
     std::string pgUrl;
     std::int64_t pgStatementTimeoutMs = 3000;

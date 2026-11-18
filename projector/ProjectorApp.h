@@ -17,10 +17,12 @@
 // from a list of member archives) and writes the history relations oe-gateway reads. It decides nothing about money:
 // a projector that is down, slow or wrong makes history stale, never money wrong.
 //
-// Threads: main (the supervisor), pj-duty (Aeron: the journal sources and the head-probe session; never blocks), pj-pg
-// (the only thread that talks to PostgreSQL: the schema, the lease, the fenced write transactions), pj-admin (/health,
+// Threads: main (the supervisor), pj-duty (Aeron: the journal sources and the cluster session, FollowDuty.h; never waits
+// for PostgreSQL), pj-pg (the only thread that talks to PostgreSQL: the schema, the lease, the fenced write transactions,
+// HistoryWork.h), pj-node (the member nodes' /health and /metrics, while this copy is the writer), pj-admin (/health,
 // /ready, /metrics on HISTORY_PROJECTOR_ADMIN_BIND). A standby holds no replay and no cluster session: pj-duty attaches
-// only while pj-pg holds the lease (ProjectorShared::writer).
+// only while pj-pg holds the lease (ProjectorShared::writer). pj-duty and pj-pg exchange the records and what each
+// transaction committed through FollowExchange.h.
 //
 // Commands:
 //   oe-projector            the service
@@ -70,7 +72,7 @@ public:
 struct ProjectorHooks
 {
     ProcessHooks process;
-    std::function<std::unique_ptr<FencedWork>()> makeWork; // empty: no batches (this version applies no record)
+    std::function<std::unique_ptr<FencedWork>()> makeWork; // empty: the shipped batches (HistoryWork.h)
     std::function<void()> beforeFence;                     // runs inside each batch, between its writes and the fence
     std::function<void()> beforeCommit;                    // runs inside each batch, between the fence and the COMMIT
 };
