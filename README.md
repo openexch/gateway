@@ -240,6 +240,20 @@ T1: `ctest -L t1` with `-DGW_IT_CORE_JAR` and `-DGW_IT_PROBE_JAR`. `GW_IT_STREAM
 size (default 2000). The T1 suites take port bases in 24000..31299, below the usual Linux ephemeral range, and
 `it.stream` fails at start if a core node's endpoint does not answer.
 
+## History projector (`oe-projector`)
+
+`oe-projector` is the history projector, the only binary in this repo that writes a database. It follows the core's order journal from the member archives over the network and writes the relations in `sql/history_projection_v1.sql`. It applies that file at boot under a transaction-scoped advisory lock and records its sha256; a different recorded schema is refused (exit 78). The read relations are views with the exact names and types of `sql/history_read_contract_v1.sql`, so the history reads above keep working.
+
+**Single writer.** N copies run on N hosts. One holds a lease in `oe_projection_state` (`writer_token`, `lease_until`, on the database clock). Every write transaction ends with `UPDATE ... WHERE writer_token = <mine>`; zero rows rolls back and the copy becomes a standby. A standby polls every `HISTORY_PROJECTOR_LEASE_POLL_MS` and holds no replay and no session. A clean stop drops the replays first, then releases the lease.
+
+The writer treats its lease as held until the lease less one renewal interval (2/3 of `HISTORY_PROJECTOR_LEASE_MS`), counted from when its last confirming statement was sent, so it stops acting as the writer before the database can give the lease to another copy, even when a COMMIT is slow. `HISTORY_PROJECTOR_PG_STATEMENT_TIMEOUT_MS` must be below a third of the lease (default 3000 with the 10000 lease). An idle-in-transaction timeout above the lease is accepted with a WARN: the fence still stops a stopped writer, but a takeover can then wait that long. Through a transaction-mode pooler the session `SET` of `idle_in_transaction_session_timeout` is not kept: set it on the projector's role (`ALTER ROLE ... SET idle_in_transaction_session_timeout = ...`) or on the server. The fence does not depend on it. The default lease (10 s) equals the default driver timeout (10 s), so a writer paused past its lease usually exits 70 on resume rather than stepping down; both outcomes are safe.
+
+**Rebuild.** `oe-projector --rebuild` waits for the lease, then in one transaction resets the state row and truncates every base table. History answers 503 until the projection beats again. It waits at most `HISTORY_PROJECTOR_REBUILD_LOCK_TIMEOUT_MS` behind open history reads; past that it changes nothing and exits 75 (run it again). Exit codes: 0 done, 75 stopped or not committed (safe to repeat), 78 config.
+
+**Settings.** All settings use the `HISTORY_PROJECTOR_` prefix and are listed with their defaults in `projector/ProjectorSettings.h`. Both driver modes are supported. `/health`, `/ready` (with `"role"`) and `/metrics` (`projector_`) are served on `HISTORY_PROJECTOR_ADMIN_BIND`. Threads: `pj-duty`, `pj-pg`, `pj-admin`.
+
+**Tests.** `projector` (T0) and `projector.*` (T1, a PostgreSQL container, with `GW_PG_TESTS=ON` and `GW_TEST_BUILDS=ON`).
+
 ## Footprint
 
 Idle, defaults, no session yet: an embedded driver holds about 48 MB in its driver directory (`cnc.dat`

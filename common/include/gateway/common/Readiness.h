@@ -30,6 +30,13 @@
 //   event_gap           no unresolved event gap
 //   head_probe_fresh    the last head probe answered no longer ago than STREAM_READY_STALE_MS
 //   ws_listener         the WebSocket listener accepts connections
+// oe-projector /ready, all of (a standby reads not ready and says so):
+//   driver_connected    as above
+//   lease_held          this copy holds the writer lease
+//   session_registered  the head-probe session's registration ack arrived
+//   head_probe_fresh    a head probe answered no longer ago than HISTORY_PROJECTOR_HEAD_FRESH_MS
+//   not_halted          no halt is set
+//   beat_fresh          the last beat this copy committed is younger than HISTORY_PROJECTOR_READY_LAG_MS
 
 namespace openexchange { namespace gateway {
 
@@ -46,6 +53,9 @@ inline constexpr const char *PUBLIC_LISTENER = "public_listener";
 inline constexpr const char *EVENT_GAP = "event_gap";
 inline constexpr const char *HEAD_PROBE_FRESH = "head_probe_fresh";
 inline constexpr const char *WS_LISTENER = "ws_listener";
+inline constexpr const char *LEASE_HELD = "lease_held";
+inline constexpr const char *NOT_HALTED = "not_halted";
+inline constexpr const char *BEAT_FRESH = "beat_fresh";
 }
 
 struct GatewayReadyBounds
@@ -59,6 +69,12 @@ struct StreamReadyBounds
     std::int64_t readyStaleMs = 15'000;
 };
 
+struct ProjectorReadyBounds
+{
+    std::int64_t headFreshMs = 3000;
+    std::int64_t readyLagMs = 5000;
+};
+
 struct Condition
 {
     const char *name;
@@ -69,6 +85,7 @@ struct Condition
 std::vector<Condition> gatewayReadyConditions(const Status &s, std::int64_t nowNs, const GatewayReadyBounds &bounds);
 std::vector<Condition> gatewaySessionConditions(const Status &s);
 std::vector<Condition> streamReadyConditions(const Status &s, std::int64_t nowNs, const StreamReadyBounds &bounds);
+std::vector<Condition> projectorReadyConditions(const Status &s, std::int64_t nowNs, const ProjectorReadyBounds &bounds);
 
 // The names of the failing ones (empty = ready).
 std::vector<std::string> failing(const std::vector<Condition> &conditions);

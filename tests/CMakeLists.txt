@@ -328,6 +328,15 @@ if(GW_PG_TESTS)
         PASS_REGULAR_EXPRESSION "row skipped or repeated")
 endif()
 
+# oe-projector T0: settings, readiness, admin rendering.
+add_executable(gw_projector_tests unit/TestMain.cpp unit/ProjectorTest.cpp)
+target_include_directories(gw_projector_tests PRIVATE unit)
+target_link_libraries(gw_projector_tests PRIVATE cluster_tools::runtime_embedded_driver oe_projector_app gw_common)
+target_compile_options(gw_projector_tests PRIVATE ${GW_WARNINGS})
+target_compile_definitions(gw_projector_tests PRIVATE
+    GW_PROJECTION_STORE_SOURCE="${PROJECT_SOURCE_DIR}/projector/ProjectionStore.cpp")
+add_test(NAME projector COMMAND gw_projector_tests)
+
 add_test(NAME lock COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/lock/lock_test.sh" "${PROJECT_SOURCE_DIR}" "${CMAKE_COMMAND}"
     "${CMAKE_CURRENT_BINARY_DIR}/lock-work")
 
@@ -413,6 +422,64 @@ if(GW_TEST_BUILDS)
                 math(EXPR _port "${_port} + 1000")
             endforeach()
         endif()
+    endif()
+
+    # oe-projector test builds (never published): the probe writer over the shipped fence, and the controls that compile
+    # one rule of the lease off (tests/support/ProjectorFenceMain.cpp, PROJ_NC_* in projector/ProjectionStore.cpp and
+    # ProcessHooks::ignoreDriverLoss):
+    #   PROJ_NC_NO_FENCE            the takeover ignores the lease and the state update ignores the token
+    #   PROJ_NC_SELECT_FENCE        the token is checked by a SELECT before the writes, the state update is unconditional
+    #   ignore-driver-loss          the production main with the driver-loss exits switched off by a process hook
+    add_executable(oe-projector-tc-fence support/ProjectorFenceMain.cpp)
+    target_link_libraries(oe-projector-tc-fence PRIVATE cluster_tools::runtime_embedded_driver oe_projector_app)
+    foreach(define PROJ_NC_NO_FENCE PROJ_NC_SELECT_FENCE)
+        string(TOLOWER "${define}" target)
+        string(REPLACE "proj_nc_" "oe-projector-nc-" target "${target}")
+        string(REPLACE "_" "-" target "${target}")
+        add_executable(${target} support/ProjectorFenceMain.cpp "${PROJECT_SOURCE_DIR}/projector/ProjectionStore.cpp")
+        target_compile_definitions(${target} PRIVATE ${define})
+        target_link_libraries(${target} PRIVATE cluster_tools::runtime_embedded_driver oe_projector_app)
+    endforeach()
+    add_executable(oe-projector-nc-ignore-driver-loss support/ProjectorNoDriverLossMain.cpp)
+    target_link_libraries(oe-projector-nc-ignore-driver-loss PRIVATE cluster_tools::runtime_embedded_driver
+        oe_projector_app)
+    # T1: the real binaries against a throwaway PostgreSQL container, both driver modes, no core cluster
+    # (tests/projector/projector_it.py); each control runs the case its rule guards and must fail with the named text.
+    if(GW_PG_TESTS)
+        set(GW_PROJECTOR_IT Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/projector/projector_it.py"
+            --bin-dir "${PROJECT_BINARY_DIR}/bin" --image "${GW_PG_TEST_IMAGE}" --source-dir "${PROJECT_SOURCE_DIR}")
+        set(GW_PROJECTOR_CASES
+            "config|oe-projector|"
+            "schema|oe-projector|"
+            "rebuild|oe-projector|"
+            "driver_embedded|oe-projector|"
+            "driver_external_killed|oe-projector|"
+            "lease_takeover|oe-projector-tc-fence|"
+            "lease_race|oe-projector-tc-fence|"
+            "slow_commit|oe-projector-tc-fence|"
+            "hung_writer|oe-projector-tc-fence|"
+            "lease_takeover|oe-projector-nc-no-fence|two writers committed"
+            "hung_writer|oe-projector-nc-select-fence|two writers committed"
+            "driver_external_killed|oe-projector-nc-ignore-driver-loss|projector alive with a dead driver")
+        foreach(entry IN LISTS GW_PROJECTOR_CASES)
+            string(REPLACE "|" ";" parts "${entry}")
+            list(GET parts 0 case)
+            list(GET parts 1 binary)
+            list(GET parts 2 text)
+            if(text STREQUAL "")
+                set(name projector.${case})
+            else()
+                string(REPLACE "oe-projector-" "" nc "${binary}")
+                string(REPLACE "-" "_" nc "${nc}")
+                set(name projector.${nc})
+            endif()
+            add_test(NAME ${name} COMMAND ${GW_PROJECTOR_IT} --work "${CMAKE_CURRENT_BINARY_DIR}/projector-work/${name}"
+                --binary ${binary} ${case})
+            set_tests_properties(${name} PROPERTIES TIMEOUT 300 LABELS "pg;projector" RUN_SERIAL TRUE)
+            if(NOT text STREQUAL "")
+                set_tests_properties(${name} PROPERTIES PASS_REGULAR_EXPRESSION "${text}")
+            endif()
+        endforeach()
     endif()
 
     set(GW_PROCESS_CASES config_refused config_bad_values config_auth_files embedded_start_stop external_start_stop

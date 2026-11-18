@@ -263,10 +263,8 @@ void checkChannel(SettingsReader &r, const std::string &name, const std::string 
     }
 }
 
-void parseCommon(SettingsReader &r, Role role, const rt::DirProbe &probe, CommonSettings &c)
+void parseDriverSettingsImpl(SettingsReader &r, const std::string &P, const rt::DirProbe &probe, CommonSettings &c)
 {
-    const std::string P = Role::GATEWAY == role ? "GATEWAY" : "STREAM";
-
     // driver mode first, then its keys, strict in both directions
     const int mode = r.choice(P + "_DRIVER_MODE", { "embedded", "external" }, -1);
     c.driverMode = 0 == mode ? DriverMode::EMBEDDED : 1 == mode ? DriverMode::EXTERNAL : DriverMode::UNSET;
@@ -356,6 +354,13 @@ void parseCommon(SettingsReader &r, Role role, const rt::DirProbe &probe, Common
             }
         }
     }
+}
+
+void parseCommon(SettingsReader &r, Role role, const rt::DirProbe &probe, CommonSettings &c)
+{
+    const std::string P = Role::GATEWAY == role ? "GATEWAY" : "STREAM";
+
+    parseDriverSettingsImpl(r, P, probe, c);
 
     c.coreIngress = r.requiredString(P + "_CORE_INGRESS", "the core members, id=host:port,...");
     if (!c.coreIngress.empty())
@@ -636,6 +641,16 @@ bool isDecimalAmount(const std::string &s)
     return nonZero;
 }
 
+}
+
+void parseDriverSettings(SettingsReader &r, const std::string &prefix, const rt::DirProbe &probe, CommonSettings &c)
+{
+    parseDriverSettingsImpl(r, prefix, probe, c);
+}
+
+std::optional<Bind> parseBindText(const std::string &text, bool ipv4Only, std::string &why)
+{
+    return parseBind(text, ipv4Only, why);
 }
 
 const char *driverModeName(DriverMode mode) noexcept

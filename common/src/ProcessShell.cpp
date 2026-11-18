@@ -142,6 +142,7 @@ void runProcess(const ProcessIdentity &id, const ProcessInputs &in)
     base.watchdogMs = c.dutyWatchdogMs;
     base.gatewayBounds = in.gatewayBounds;
     base.streamBounds = in.streamBounds;
+    base.projectorBounds = in.projectorBounds;
     base.treasuryLane = in.treasuryLane;
     base.settings = in.records;
 
@@ -171,10 +172,17 @@ void runProcess(const ProcessIdentity &id, const ProcessInputs &in)
             view.logDropped = log.dropped();
             if (front)
             {
-                (Role::GATEWAY == id.role ? view.status.publicListenerAccepting : view.status.wsListenerAccepting) =
-                    front->accepting();
+                if (Role::GATEWAY == id.role)
+                {
+                    view.status.publicListenerAccepting = front->accepting();
+                }
+                else if (Role::STREAM == id.role)
+                {
+                    view.status.wsListenerAccepting = front->accepting();
+                }
+                front->fillStatus(view.status);
                 view.frontHealth = front->healthJson();
-                view.frontMetrics = front->metrics(Role::GATEWAY == id.role ? "gateway_" : "stream_");
+                view.frontMetrics = front->metrics(metricPrefix(id.role));
             }
             return adminRoute(request, view);
         },
@@ -224,8 +232,16 @@ void runProcess(const ProcessIdentity &id, const ProcessInputs &in)
         rt::StorageStarvation startStorage;
         for (;;)
         {
-            driver = std::make_unique<rt::EmbeddedDriver>(embeddedOptions,
-                [](const std::string &why) { rt::Supervisor::exitProcess(exit_code::SOFTWARE, why); });
+            if (in.hooks.ignoreDriverLoss)
+            {
+                // test build only: the driver's own termination is ignored
+                driver = std::make_unique<rt::EmbeddedDriver>(embeddedOptions, [](const std::string &) {});
+            }
+            else
+            {
+                driver = std::make_unique<rt::EmbeddedDriver>(embeddedOptions,
+                    [](const std::string &why) { rt::Supervisor::exitProcess(exit_code::SOFTWARE, why); });
+            }
             if (driver->start(dir, false, error))
             {
                 break;
@@ -268,7 +284,9 @@ void runProcess(const ProcessIdentity &id, const ProcessInputs &in)
         std::fprintf(stderr, "%s: embedded media driver at %s%s\n", id.processName, dir.c_str(),
             driver->reclaimed() ? " (a stale dir of this instance was reused and cleaned)" : "");
     }
-    auto monitor = std::make_shared<at::AeronFatalMonitor>(); // a fatal conductor error is _Exit(70)
+    // a fatal conductor error is _Exit(70); test build only: counted and ignored
+    auto monitor = in.hooks.ignoreDriverLoss ? std::make_shared<at::AeronFatalMonitor>([](const std::string &) {})
+                                             : std::make_shared<at::AeronFatalMonitor>();
     std::shared_ptr<aeron::Aeron> aeron;
     try
     {
@@ -316,7 +334,10 @@ void runProcess(const ProcessIdentity &id, const ProcessInputs &in)
     }
 
     watch = std::make_unique<rt::ConductorWatch>(aeron, c.driverTimeoutMs);
-    supervisor.setLivenessCheck([&](std::int64_t, std::string &why) { return watch->check(why); });
+    if (!in.hooks.ignoreDriverLoss)
+    {
+        supervisor.setLivenessCheck([&](std::int64_t, std::string &why) { return watch->check(why); });
+    }
     driverConnected.store(true, std::memory_order_release);
     if (front)
     {

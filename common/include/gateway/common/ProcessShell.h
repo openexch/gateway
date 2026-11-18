@@ -72,7 +72,8 @@ struct ProcessIdentity
     const char *frontBindKey = "GATEWAY_HTTP_BIND";
 };
 
-// The public side of a binary (oe-gateway: the REST listener and its worker pools; oe-stream: the WebSocket listener),
+// The public side of a binary (oe-gateway: the REST listener and its worker pools; oe-stream: the WebSocket listener;
+// oe-projector: no listener, its PostgreSQL writer thread),
 // run by the shell around the duty
 // thread: created and bound right after the admin bind (a bind failure is 78, naming ProcessIdentity::frontBindKey),
 // started once the driver is connected (its threads start just before the duty thread), stopped on the stop path
@@ -88,12 +89,15 @@ public:
     virtual bool accepting() const = 0;
     virtual std::string healthJson() const = 0;                    // members appended to /health: ,"name":value...
     virtual std::string metrics(const std::string &prefix) const = 0; // Prometheus text, each name starting with prefix
+    virtual void fillStatus(Status &) const {}                        // oe-projector: the writer thread's readiness part
 };
 
 // Test builds only (never set by the production binaries).
 struct ProcessHooks
 {
     std::function<void()> onDutyIteration; // runs on the duty thread at the top of every iteration
+    bool ignoreDriverLoss = false;          // a control only: the driver-loss exits (driver termination, fatal
+                                            // conductor error, conductor heartbeat) are switched off
 };
 
 struct ProcessInputs
@@ -102,6 +106,7 @@ struct ProcessInputs
     const std::vector<SettingRecord> *records = nullptr;
     GatewayReadyBounds gatewayBounds;
     StreamReadyBounds streamBounds;
+    ProjectorReadyBounds projectorBounds;
     std::string treasuryLane = "off";
     ProcessHooks hooks;
     std::function<std::unique_ptr<DutyWork>(const DutyContext &)> makeDuty; // empty = no duty work (no session)

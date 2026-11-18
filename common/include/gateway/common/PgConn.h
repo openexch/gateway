@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <libpq-fe.h>
@@ -59,9 +60,12 @@ public:
 
     // Connects, switches to non-blocking, sets statement_timeout to `timeoutMs`, then runs each of `setup` (fixed
     // statements, never user input), all inside `budgetMs` (0: `timeoutMs`; a caller with a deadline of its own passes
-    // what is left of it). False with `error` set on any failure (the connection is closed).
+    // what is left of it). `options` are libpq connection keywords given after the URL (they take precedence over the
+    // same keyword inside it), e.g. the TCP keepalive bounds. False with `error` set on any failure (the connection is
+    // closed).
     bool connect(const std::string &url, std::int64_t timeoutMs, std::string &error,
-        const std::vector<std::string> &setup = {}, std::int64_t budgetMs = 0);
+        const std::vector<std::string> &setup = {}, std::int64_t budgetMs = 0,
+        const std::vector<std::pair<std::string, std::string>> &options = {});
 
     // One statement with text parameters (or, `simple`, a script of statements without parameters). The last result
     // is kept in `out`; any error result makes the call fail with its message. After a failure lastSqlState() holds
