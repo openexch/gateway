@@ -32,8 +32,10 @@
 // before the batch, the batch is written again; equal to its last sequence, it committed; anything else, the state is
 // read again from the database and pj-duty starts over from it (a new generation).
 //
-// Test-only control (never in a published build): PROJ_NC_CURSOR_OWN_TX commits the cursor before the rows, in a
-// transaction of its own (a crash between the two then leaves the cursor ahead of the rows).
+// Test-only controls (never in a published build): PROJ_NC_CURSOR_OWN_TX commits the cursor before the rows, in a
+// transaction of its own (a crash between the two then leaves the cursor ahead of the rows); PROJ_NC_DROP_ONE
+// acknowledges one record (journalSeq PROJ_NC_DROP_SEQ from the environment, default 2) without writing any of its
+// rows, the cursor moving past it (a hole in oe_order_events).
 
 namespace openexchange { namespace gateway { namespace projector {
 

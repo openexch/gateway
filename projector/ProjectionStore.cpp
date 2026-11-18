@@ -15,7 +15,11 @@ using pg::Result;
 
 namespace {
 
+#ifdef PROJ_NC_WALLCLOCK_COLUMN
+#include "gateway/projection_schema_nc_wallclock_column.inc" // test build only: the schema plus a wall-clock column
+#else
 #include "gateway/projection_schema.inc"
+#endif
 
 // pg_advisory_xact_lock key of the schema step: the eight bytes "oeprojsc" as a big-endian int64.
 constexpr const char *SCHEMA_LOCK_KEY = "8026945547655607139";

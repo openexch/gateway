@@ -653,7 +653,7 @@ def main():
     ap.add_argument("--probe-jar", required=True)
     ap.add_argument("--mode", required=True, choices=["embedded", "external"])
     ap.add_argument("--work", required=True)
-    ap.add_argument("--port-base", type=int, default=24000)
+    ap.add_argument("--port-base", type=int, default=9800)
     ap.add_argument("--connections", type=int, default=int(os.environ.get("GW_IT_STREAM_CONNECTIONS", "2000")))
     args = ap.parse_args()
     shutil.rmtree(args.work, ignore_errors=True)

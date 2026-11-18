@@ -227,7 +227,7 @@ def main():
     ap.add_argument("--probe-jar", required=True)
     ap.add_argument("--mode", required=True, choices=["embedded", "external"])
     ap.add_argument("--work", required=True)
-    ap.add_argument("--port-base", type=int, default=26000)
+    ap.add_argument("--port-base", type=int, default=9800)
     args = ap.parse_args()
     shutil.rmtree(args.work, ignore_errors=True)
     os.makedirs(args.work)

@@ -40,6 +40,26 @@ find_package(cluster_tools CONFIG REQUIRED COMPONENTS client_core runtime client
     runtime_embedded_driver archive_core archive_aeron aeron_archive_client)
 gw_check_cluster_tools_package()
 
+# OE_PROJECTOR_CONTROL: a test build of oe-projector (never published) with one control define, or several joined by
+# "+" (PROJ_NC_* or PROJ_TC_*), compiled into every projector source of this build tree. The binary keeps its name, so
+# a fixture takes the install tree as a slot artifact; the version string carries the control (GW_VERSION+control.x).
+#   cmake -S . -B build-nc -DOE_PROJECTOR_CONTROL=PROJ_NC_DROP_ONE -DBUILD_TESTING=OFF -DGW_TEST_BUILDS=OFF ...
+#   cmake --build build-nc --target oe-projector && cmake --install build-nc --prefix <slot>
+set(OE_PROJECTOR_CONTROL "" CACHE STRING "test build only: the PROJ_NC_*/PROJ_TC_* define(s) oe-projector is built with")
+set(GW_PROJECTOR_CONTROL_DEFINITIONS "")
+if(OE_PROJECTOR_CONTROL)
+    string(REPLACE "+" ";" GW_PROJECTOR_CONTROL_DEFINITIONS "${OE_PROJECTOR_CONTROL}")
+    foreach(_define IN LISTS GW_PROJECTOR_CONTROL_DEFINITIONS)
+        if(NOT _define MATCHES "^PROJ_(NC|TC)_[A-Z0-9_]+$")
+            message(FATAL_ERROR "OE_PROJECTOR_CONTROL=${OE_PROJECTOR_CONTROL}: each define is PROJ_NC_<NAME> or PROJ_TC_<NAME>")
+        endif()
+    endforeach()
+    string(TOLOWER "${OE_PROJECTOR_CONTROL}" _control_tag)
+    string(REPLACE "_" "-" _control_tag "${_control_tag}")
+    set(GW_VERSION "${GW_VERSION}+control.${_control_tag}")
+    message(STATUS "oe-projector control build (test only, never published): ${OE_PROJECTOR_CONTROL}, version ${GW_VERSION}")
+endif()
+
 if(GW_BUILD_SOURCE_SHA)
     set(GW_SOURCE_SHA "${GW_BUILD_SOURCE_SHA}")
 else()
@@ -85,6 +105,18 @@ file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/gateway/projection_
     CONTENT "constexpr const char *PROJECTION_SCHEMA_SQL = R\"gwsql(${_projection_sql})gwsql\";\nconstexpr const char *PROJECTION_SCHEMA_SHA256 = \"${_projection_sha}\";\n"
     @ONLY)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${GW_PROJECTION_SCHEMA_FILE}")
+# The schema of the PROJ_NC_WALLCLOCK_COLUMN test build (never published): the same file plus a wall-clock column on
+# oe_orders, pinned by the sha256 of the text it applies, so its database records that sha256 and a published binary
+# refuses to open it.
+set(_projection_sql_nc_wallclock "${_projection_sql}
+-- test build only (PROJ_NC_WALLCLOCK_COLUMN): a wall-clock column, so two projections of one journal differ
+ALTER TABLE oe_orders ADD COLUMN projected_at TIMESTAMPTZ NOT NULL DEFAULT now();
+")
+string(SHA256 _projection_sha_nc_wallclock "${_projection_sql_nc_wallclock}")
+file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/gateway/projection_schema_nc_wallclock_column.inc"
+    CONTENT "constexpr const char *PROJECTION_SCHEMA_SQL = R\"gwsql(${_projection_sql_nc_wallclock})gwsql\";\nconstexpr const char *PROJECTION_SCHEMA_SHA256 = \"${_projection_sha_nc_wallclock}\";\n"
+    @ONLY)
+
 
 set(GW_WARNINGS -Wall -Wextra -Wpedantic -Werror)
 
@@ -158,7 +190,7 @@ add_library(oe_projector_app STATIC ${GW_PROJECTOR_SOURCES})
 target_include_directories(oe_projector_app PUBLIC projector PRIVATE stream)
 target_link_libraries(oe_projector_app PUBLIC gw_common cluster_tools::archive_aeron cluster_tools::archive_core)
 target_compile_options(oe_projector_app PRIVATE ${GW_WARNINGS})
-target_compile_definitions(oe_projector_app PRIVATE GW_NO_ORDER_ENTRY)
+target_compile_definitions(oe_projector_app PRIVATE GW_NO_ORDER_ENTRY ${GW_PROJECTOR_CONTROL_DEFINITIONS})
 
 # The binaries: the embedded driver first in the link list (its archive resolves the C client symbols before
 # aeron_static is scanned).
@@ -169,8 +201,12 @@ target_link_libraries(oe-stream PRIVATE cluster_tools::runtime_embedded_driver o
 target_compile_definitions(oe-stream PRIVATE GW_NO_ORDER_ENTRY)
 add_executable(oe-projector projector/main.cpp)
 target_link_libraries(oe-projector PRIVATE cluster_tools::runtime_embedded_driver oe_projector_app)
-target_compile_definitions(oe-projector PRIVATE GW_NO_ORDER_ENTRY)
-install(TARGETS oe-gateway oe-stream oe-projector RUNTIME DESTINATION bin)
+target_compile_definitions(oe-projector PRIVATE GW_NO_ORDER_ENTRY ${GW_PROJECTOR_CONTROL_DEFINITIONS})
+if(OE_PROJECTOR_CONTROL)
+    install(TARGETS oe-projector RUNTIME DESTINATION bin) # a control tree installs its oe-projector alone
+else()
+    install(TARGETS oe-gateway oe-stream oe-projector RUNTIME DESTINATION bin)
+endif()
 
 include(CTest)
 if(BUILD_TESTING)

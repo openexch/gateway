@@ -26,6 +26,10 @@
 //                                an order that existed; complete pages after the beat
 //   reader_role_prepared         the schema applied by an owner without CREATEROLE: the reader role absent, a refusal
 //                                naming it; created beforehand, the apply succeeds with the four grants
+//   projection_dense             the story applied in batches of 16: every journalSeq from 1 to applied_seq has its row
+//                                in oe_order_events (the check the fixture's dump makes)
+//   projection_byte_equal        the same story projected into two databases, a moment apart: the canonical dumps of
+//                                oe_order_events, oe_orders and oe_fills (every column, in key order) are equal
 // The control builds (tests/CMakeLists.txt) switch one rule off each and must fail with the named text.
 #include <unistd.h>
 
@@ -1402,4 +1406,92 @@ TEST(reader_role_prepared)
         "has_table_privilege('oe_history_reader', c.oid, 'UPDATE') OR has_table_privilege('oe_history_reader', c.oid, "
         "'DELETE') OR has_table_privilege('oe_history_reader', c.oid, 'TRUNCATE'))");
     CHECK_MSG(other == "0", "the reader can write " + other + " relations");
+}
+
+namespace {
+
+// The story applied into an empty database in batches of 16 (many transactions), every batch committed.
+bool projectStory(const std::string &url)
+{
+    Rig rig(url, 16);
+    if (!rig.start())
+    {
+        return false;
+    }
+    rig.epoch(EPOCH);
+    for (const auto &r : story())
+    {
+        rig.push(Item::Kind::APPLY, r);
+    }
+    while (rig.ex.pending())
+    {
+        if (Hold::HELD != rig.commit())
+        {
+            gwtest::fail(__FILE__, __LINE__, "a batch did not commit: " + rig.lastError);
+            return false;
+        }
+    }
+    rig.release();
+    return true;
+}
+
+// SHA-256 of a relation's rows in key order, every column (`full`), or every column but projected_at
+std::string dumpSha(const std::string &url, const std::string &table, const std::string &key, bool full)
+{
+    const std::string row = full ? "t::text" : "(to_jsonb(t) - 'projected_at')::text";
+    return one(url, "SELECT encode(sha256(convert_to(coalesce(string_agg(" + row + ", E'\\n' ORDER BY " + key +
+        "), ''), 'UTF8')), 'hex') FROM " + table + " t");
+}
+
+}
+
+// What the fixture's dump checks: oe_order_events dense from 1 to the cursor. A record acknowledged and not written
+// leaves a journalSeq without its row.
+TEST(projection_dense)
+{
+    const std::string url = gwtest::freshDatabase("pj_proj_dense");
+    CHECK(projectStory(url));
+    const std::int64_t applied = num(url, "SELECT applied_seq FROM oe_projection_state");
+    CHECK_MSG(applied == static_cast<std::int64_t>(story().size()), "applied_seq " + std::to_string(applied) +
+        " after the story of " + std::to_string(story().size()));
+    const std::string missing = one(url, "SELECT coalesce(string_agg(s::text, ',' ORDER BY s), '') FROM "
+        "generate_series(1, (SELECT applied_seq FROM oe_projection_state)) s WHERE NOT EXISTS (SELECT 1 FROM "
+        "oe_order_events e WHERE e.journal_seq = s)");
+    if (!missing.empty())
+    {
+        CHECK_MSG(false, "journalSeq missing in projection: " + missing + " (applied_seq " + std::to_string(applied) +
+            ")");
+    }
+    checkDense(url, static_cast<std::int64_t>(story().size()), "story in batches of 16");
+}
+
+// Two projections of one journal are byte equal (what the fixture hashes): no column depends on when it was written.
+TEST(projection_byte_equal)
+{
+    const std::string a = gwtest::freshDatabase("pj_bytes_a");
+    const std::string b = gwtest::freshDatabase("pj_bytes_b");
+    CHECK(projectStory(a));
+    sleepMs(50);
+    CHECK(projectStory(b));
+    struct Relation
+    {
+        const char *table;
+        const char *key;
+    };
+    for (const Relation &r : { Relation{ "oe_order_events", "journal_seq" }, Relation{ "oe_orders", "order_id" },
+             Relation{ "oe_fills", "trade_id, order_id" } })
+    {
+        const std::string fa = dumpSha(a, r.table, r.key, true);
+        const std::string fb = dumpSha(b, r.table, r.key, true);
+        if (fa != fb)
+        {
+            const bool onlyWallClock = dumpSha(a, r.table, r.key, false) == dumpSha(b, r.table, r.key, false);
+            CHECK_MSG(false, std::string("projection dump differs: ") + r.table + " (" + fa + " != " + fb + ")" +
+                (onlyWallClock ? "; without the column projected_at the dumps are equal" : ""));
+        }
+        else
+        {
+            std::printf("%s dump sha256 %s in both projections\n", r.table, fa.c_str());
+        }
+    }
 }
