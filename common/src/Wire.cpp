@@ -57,7 +57,7 @@ static_assert(MONEY_SCHEMA_VERSION == GW_MONEY_SCHEMA_VERSION,
 
 namespace {
 
-// GateReasons: one choice per GateReason value, bits 0..8 in money schema v8.
+// GateReasons: one choice per GateReason value, bits 0..8 in money schema v9.
 constexpr std::uint32_t GATE_REASONS_BITS = (1u << 9) - 1;
 
 struct Layout
@@ -70,7 +70,7 @@ struct Layout
     const char *groupName[2];
 };
 
-// The templates this build decodes, with the lengths of money schema v8 (from the exported codecs).
+// The templates this build decodes, with the lengths of money schema v9 (from the exported codecs).
 const Layout DECODED[] = {
     { tid::BALANCE_UPDATE, "BalanceUpdate", money::BalanceUpdate::sbeBlockLength(), 0, {}, {} },
     { tid::WITHDRAW_REJECT, "WithdrawReject", money::WithdrawReject::sbeBlockLength(), 0, {}, {} },
@@ -365,6 +365,7 @@ void deliver(const Layout &layout, const std::uint8_t *payload, std::size_t leng
             m.firstAvailableSeq = d.firstAvailableSeq();
             m.lastSeq = d.lastSeq();
             m.nextFromSeq = d.nextFromSeq();
+            m.genesisId = d.genesisId();
             h.onOrderEventsEnd(m);
             return;
         }
@@ -453,6 +454,7 @@ void deliver(const Layout &layout, const std::uint8_t *payload, std::size_t leng
             m.gateState = enumOf<money::GateState>(d.gateStateRaw(), "gateState");
             m.gateReasons = gateReasonsOf(d.gateReasons().rawValue(), "gateReasons");
             m.asOfLogPosition = d.asOfLogPosition();
+            m.genesisId = d.genesisId();
             money::CoreConfigReport::Markets &markets = d.markets();
             m.marketCount = static_cast<std::uint16_t>(markets.count());
             // the head carries both counts; the assets group starts after the markets group, so a second decoder

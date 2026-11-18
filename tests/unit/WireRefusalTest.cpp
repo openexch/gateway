@@ -194,12 +194,12 @@ TEST(wire_refuses_every_other_version_by_name)
 {
     for (const Golden &g : REPLIES)
     {
-        for (const std::uint16_t version : { 0, 5, 6, 7, 9, 0xFFFF })
+        for (const std::uint16_t version : { 0, 5, 6, 7, 8, 10, 0xFFFF })
         {
             std::vector<std::uint8_t> frame = *g.frame;
             putU16(frame, 6, version);
             expectRefused(std::string(g.name) + " version " + std::to_string(version), frame, Refusal::WRONG_VERSION,
-                "wrong_version (version " + std::to_string(version) + ", this build reads schema 2 version 8 only)");
+                "wrong_version (version " + std::to_string(version) + ", this build reads schema 2 version 9 only)");
         }
     }
 }
@@ -342,13 +342,13 @@ TEST(wire_an_ignored_template_is_still_checked)
     for (const Golden &g : IGNORED_FRAMES)
     {
         const std::string name = g.name;
-        std::vector<std::uint8_t> v7 = *g.frame;
-        putU16(v7, 6, 7);
-        expectRefused(name + " v7", v7, Refusal::WRONG_VERSION,
+        std::vector<std::uint8_t> v8 = *g.frame;
+        putU16(v8, 6, 8);
+        expectRefused(name + " v8", v8, Refusal::WRONG_VERSION,
             "template " + std::to_string(getU16(*g.frame, 2)) + " " + name);
-        std::vector<std::uint8_t> v9 = *g.frame;
-        putU16(v9, 6, 9);
-        expectRefused(name + " v9", v9, Refusal::WRONG_VERSION);
+        std::vector<std::uint8_t> v10 = *g.frame;
+        putU16(v10, 6, 10);
+        expectRefused(name + " v10", v10, Refusal::WRONG_VERSION);
         std::vector<std::uint8_t> schema = *g.frame;
         putU16(schema, 4, 1);
         expectRefused(name + " schema 1", schema, Refusal::WRONG_SCHEMA);

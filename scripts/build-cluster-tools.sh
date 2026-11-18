@@ -26,7 +26,7 @@ BUILD="$CACHE/build-$REF"
     -DBUILD_TESTING=OFF "${CT_ARGS[@]}"
 # The package's targets only (cmake/Package.cmake in the pinned tree; ct_sbe_generate makes the codec headers of the
 # interface target ct_sbe_codecs): the binaries and tests are not installed.
-"$CMAKE" --build "$BUILD" -j"$JOBS" --target ct_client_core ct_runtime ct_sbe_generate ct_client_aeron ct_runtime_aeron \
+"$CMAKE" --build "$BUILD" -j"$JOBS" --target ct_client_core ct_runtime ct_archive_core ct_sbe_generate ct_client_aeron ct_runtime_aeron \
     aeron_static aeron_driver_static
 "$CMAKE" --install "$BUILD" --prefix "$PREFIX"
 CONFIG="$PREFIX/lib/cmake/cluster_tools/cluster_toolsConfig.cmake"

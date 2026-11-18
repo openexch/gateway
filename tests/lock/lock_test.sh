@@ -47,7 +47,7 @@ write_lock() {
   "money_schema_path": "core-common/src/main/resources/sbe/money-schema.xml",
   "money_schema_sha256": "$MONEY_SHA",
   "money_schema_id": 2,
-  "money_schema_version": 8
+  "money_schema_version": 9
 }
 JSON
 }

@@ -224,7 +224,7 @@ TEST(wire_golden_corpus_is_the_pinned_core)
             "; dependencies.lock pins " + GW_MONEY_SCHEMA_REF + " (tests/golden/regen.sh)");
     CHECK(GW_MONEY_SCHEMA_ID == MONEY_SCHEMA_ID);
     CHECK(GW_MONEY_SCHEMA_VERSION == MONEY_SCHEMA_VERSION);
-    CHECK(8 == MONEY_SCHEMA_VERSION);
+    CHECK(9 == MONEY_SCHEMA_VERSION);
 }
 
 namespace {
@@ -347,7 +347,8 @@ void replyCases()
             return ok;
         });
     replyCase(tid::ORDER_EVENTS_END, JAVA_ORDER_EVENTS_END, "OrderEventsEnd", [](const Recorder &r) {
-        return r.eventsEnd == OrderEventsEnd{ v(116, 0, 1), i(116, 0, 2), v(116, 0, 3), v(116, 0, 4), v(116, 0, 5) };
+        return r.eventsEnd == OrderEventsEnd{ v(116, 0, 1), i(116, 0, 2), v(116, 0, 3), v(116, 0, 4), v(116, 0, 5),
+            v(116, 0, 6) };
     });
     replyCase(tid::ORDER_SNAPSHOT_BATCH, JAVA_ORDER_SNAPSHOT_BATCH,
         "OrderSnapshotBatch,OrderSnapshotEntry,OrderSnapshotEntry", [](const Recorder &r) {
@@ -380,7 +381,7 @@ void replyCases()
             const int t = 118;
             CoreConfigHead head{ v(t, 0, 1), static_cast<std::uint32_t>(i(t, 0, 2)), 4,
                 static_cast<std::uint32_t>(i(t, 0, 4)), v(t, 0, 5), i(t, 0, 6), i(t, 0, 7),
-                money::GateState::SUSPENDED, (1u << 0) | (1u << 5), v(t, 0, 10), 2, 2 };
+                money::GateState::SUSPENDED, (1u << 0) | (1u << 5), v(t, 0, 10), v(t, 0, 11), 2, 2 };
             bool ok = r.configHead == head && 2 == r.markets.size() && 2 == r.assets.size();
             for (int e = 1; ok && e <= 2; ++e)
             {
@@ -453,6 +454,67 @@ void ignoredCases()
     ignoredCase(tid::SETTLEMENT_APPLIED_BATCH, JAVA_SETTLEMENT_APPLIED_BATCH);
 }
 
+// Writes a little-endian int64 at a byte offset of a frame.
+void putI64(std::vector<std::uint8_t> &frame, std::size_t at, std::int64_t value)
+{
+    for (int b = 0; b < 8; ++b)
+    {
+        frame[at + b] = static_cast<std::uint8_t>(static_cast<std::uint64_t>(value) >> (8 * b));
+    }
+}
+
+// The block length a frame's header declares (little-endian u16 at byte 0).
+std::uint16_t getBlockLength(const std::vector<std::uint8_t> &frame)
+{
+    return static_cast<std::uint16_t>(frame[0] | (frame[1] << 8));
+}
+
+// Decodes one frame, returns whether it was accepted; the recorder holds what the handler saw.
+bool decodeOnce(const std::vector<std::uint8_t> &frame, Recorder &recorder)
+{
+    Decoder decoder;
+    return Refusal::NONE == decoder.decode(frame.data(), frame.size(), recorder);
+}
+
+}
+
+// v9 genesisId: OrderEventsEnd (116) field 6 at block offset 36 of 44, CoreConfigReport (118) field 11 at block offset
+// 49 of 57, right after asOfLogPosition. The golden frames carry the Java encoder's value at exactly that offset, and a
+// value written there by hand (0, the "no CoreConfig recorded" value, and a negative one) is the value decoded.
+TEST(wire_decodes_genesis_id_from_v9_frames)
+{
+    constexpr std::size_t HEADER = 8;
+    CHECK(44 == getBlockLength(JAVA_ORDER_EVENTS_END));
+    CHECK(57 == getBlockLength(JAVA_CORE_CONFIG_REPORT));
+    {
+        Recorder r;
+        CHECK(decodeOnce(JAVA_ORDER_EVENTS_END, r));
+        CHECK_MSG(v(116, 0, 6) == r.eventsEnd.genesisId, "OrderEventsEnd genesisId");
+        CHECK(v(116, 0, 5) == r.eventsEnd.nextFromSeq);
+    }
+    {
+        Recorder r;
+        CHECK(decodeOnce(JAVA_CORE_CONFIG_REPORT, r));
+        CHECK_MSG(v(118, 0, 11) == r.configHead.genesisId, "CoreConfigReport genesisId");
+        CHECK(v(118, 0, 10) == r.configHead.asOfLogPosition);
+        CHECK(2 == r.configHead.marketCount && 2 == r.configHead.assetCount);
+    }
+    for (const std::int64_t value : { std::int64_t{ 0 }, std::int64_t{ 0x0102030405060708 }, std::int64_t{ -2 } })
+    {
+        std::vector<std::uint8_t> end = JAVA_ORDER_EVENTS_END;
+        putI64(end, HEADER + 36, value);
+        Recorder a;
+        CHECK(decodeOnce(end, a));
+        CHECK_MSG(value == a.eventsEnd.genesisId, "OrderEventsEnd genesisId at offset 36: " + std::to_string(value));
+        CHECK(v(116, 0, 5) == a.eventsEnd.nextFromSeq);
+
+        std::vector<std::uint8_t> report = JAVA_CORE_CONFIG_REPORT;
+        putI64(report, HEADER + 49, value);
+        Recorder b;
+        CHECK(decodeOnce(report, b));
+        CHECK_MSG(value == b.configHead.genesisId, "CoreConfigReport genesisId at offset 49: " + std::to_string(value));
+        CHECK(v(118, 0, 10) == b.configHead.asOfLogPosition && 2 == b.markets.size() && 2 == b.assets.size());
+    }
 }
 
 TEST(wire_golden_commands)
