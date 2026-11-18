@@ -284,7 +284,7 @@ def main():
     ap.add_argument("--image", required=True)
     ap.add_argument("--mode", required=True, choices=["embedded", "external"])
     ap.add_argument("--work", required=True)
-    ap.add_argument("--port-base", type=int, default=27000)
+    ap.add_argument("--port-base", type=int, default=9800)
     ap.add_argument("--gateway-binary", default="oe-gateway")
     args = ap.parse_args()
     args.binary = "oe-projector"

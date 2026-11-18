@@ -79,6 +79,19 @@ const char *ORDER_UPSERT =
     "updated_at_ms = EXCLUDED.updated_at_ms, last_event_seq = EXCLUDED.last_event_seq, "
     "last_log_position = EXCLUDED.last_log_position WHERE oe_orders.last_event_seq < EXCLUDED.last_event_seq";
 
+#ifdef PROJ_NC_DROP_ONE
+// test build only: the journalSeq whose rows are never written (PROJ_NC_DROP_SEQ in the environment, default 2)
+std::int64_t dropSeq()
+{
+    static const std::int64_t seq = [] {
+        const char *v = std::getenv("PROJ_NC_DROP_SEQ");
+        const std::int64_t n = nullptr == v ? 0 : std::atoll(v);
+        return n > 0 ? n : 2;
+    }();
+    return seq;
+}
+#endif
+
 const char *FILL_INSERT =
     "INSERT INTO oe_fills (trade_id, order_id, user_id, market_id, side, price, quantity, maker, executed_at_ms, "
     "event_seq, core_log_position, me_epoch, me_journal_seq, me_log_position, me_timestamp_ms) "
@@ -408,7 +421,13 @@ bool HistoryWork::write(PgConn &conn, const std::string &, StateAdvance &advance
                 }
 #endif
                 expect = i.record.seq + 1;
+#ifdef PROJ_NC_DROP_ONE
+                // test build only: one record (journalSeq PROJ_NC_DROP_SEQ, default 2) is acknowledged, the cursor
+                // moves past it, and none of its rows is written
+                if (i.record.seq != dropSeq() && !store::applyRecord(conn, t, i.record, error))
+#else
                 if (!store::applyRecord(conn, t, i.record, error))
+#endif
                 {
                     return false;
                 }
@@ -458,6 +477,12 @@ bool HistoryWork::write(PgConn &conn, const std::string &, StateAdvance &advance
                 (void)mine; // test build only: a duplicate is skipped without the comparison
                 m_outcome.equal++;
 #else
+#ifdef PROJ_NC_DROP_ONE
+                if (!theirs && i.record.seq == dropSeq())
+                {
+                    theirs = mine; // test build only: the dropped record reads as stored, so it never halts a compare
+                }
+#endif
                 if (theirs && *theirs == mine)
                 {
                     m_outcome.equal++;

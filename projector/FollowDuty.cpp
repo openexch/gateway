@@ -1251,6 +1251,28 @@ private:
 
     ar::SinkAction onFrame(const ar::JournalFrame &frame) noexcept override
     {
+#ifdef PROJ_NC_PIN_RECORDING
+        // test build only: the first recording a record is read from is the only one ever read (no successor on its
+        // source, no recording of another source); any other is left at once, before a record of it is handed on
+        if (!m_pin)
+        {
+            m_pin = Pin{ frame.sourceIndex, frame.key.recordingId, frame.key.startTimestamp };
+            log(rt::LogLevel::WARN, "test build: pinned to recording " + std::to_string(frame.key.recordingId) +
+                " of source " + m_names[frame.sourceIndex]);
+        }
+        else if (m_pin->source != frame.sourceIndex || m_pin->recordingId != frame.key.recordingId ||
+            m_pin->startTimestamp != frame.key.startTimestamp)
+        {
+            if (!m_leaveRequest)
+            {
+                m_leaveRequest = LeaveRequest{ frame.sourceIndex, Mark::NONE, "test build: pinned to recording " +
+                    std::to_string(m_pin->recordingId) + " of source " + m_names[m_pin->source] + ", recording " +
+                    std::to_string(frame.key.recordingId) + " of source " + m_names[frame.sourceIndex] +
+                    " not followed", 0, 0 };
+            }
+            return ar::SinkAction::ABORT;
+        }
+#endif
         JournalRecord record;
         std::string why;
         if (!decodeRecord(frame.bytes, frame.length, record, why))
@@ -1509,6 +1531,15 @@ private:
     std::int64_t m_lastViewNs = 0;
 #ifdef PROJ_TC_SOURCE_FAULTS
     SourceFaults m_sourceFaults;
+#endif
+#ifdef PROJ_NC_PIN_RECORDING
+    struct Pin
+    {
+        std::size_t source = 0;
+        std::int64_t recordingId = -1;
+        std::int64_t startTimestamp = 0;
+    };
+    std::optional<Pin> m_pin;
 #endif
 };
 

@@ -42,7 +42,8 @@
 // against what the transaction committed.
 // Test-only controls (never in a published build): PROJ_NC_BEAT_ALWAYS sets beat_at = clock_timestamp() at every fence
 // (a beat without a fresh head); PROJ_NC_BEAT_NO_EPOCH leaves out the genesis terms of the beat (epoch = G, and an
-// EPOCH_MISMATCH halt).
+// EPOCH_MISMATCH halt); PROJ_NC_WALLCLOCK_COLUMN applies the schema with a wall-clock column on oe_orders
+// (projected_at DEFAULT now()), pinned by the sha256 of that text (CMakeLists.txt), so two projections differ.
 //
 // Rebuild (oe-projector --rebuild): with the lease held, one transaction resets the state row under the fence (epoch,
 // cursor, head, beat_at and the halt cleared) and runs a single TRUNCATE naming every base table; from that commit the

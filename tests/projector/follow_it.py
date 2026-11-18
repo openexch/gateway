@@ -21,10 +21,10 @@ Cases (one per run, each starts its own cluster):
                projection of the old genesis halts EPOCH_MISMATCH, and after --rebuild holds only the new genesis
   successor    one source only: its member killed and restarted while the projector holds a live replay of its recording
                (which then reads ACTIVE with no stop position), twice: the projector finds the successor recording and
-               reaches the head again. It passes without the timed re-list (the successor is also found on reconnect),
-               so this case has no control of its own: the re-list rules are the archive follow library's, pinned there
-               with their seam controls (JournalProfileTest.successorWhileTheOldRecordingStillReadsActive,
-               JournalProfileTest.coreChainWalkProperty, FollowPolicyTest.recordingStopsThenSuccessor)
+               reaches the head again. It passes without the timed re-list (the successor is also found on reconnect;
+               the re-list rules are the archive follow library's, pinned there with their seam controls). Its control
+               is oe-projector-nc-pin-recording: the first recording read is the only one ever read (no successor, no
+               other source's recording), so after the restart applied_seq stays where it was
   replays      the counters of /health follow the real attach and detach (replaysOpen, sessionOpen; a standby holds
                neither); the member's own replay count (core_archive_replays_active) goes back to its baseline at once
                after SIGTERM, and the clean stop leaves no replay row; after SIGKILL the copy that follows (a restart, then a standby taking over) reads other
@@ -664,7 +664,10 @@ def case_successor(args, cluster, pg, orders):
         check(acked, f"round {n}: orders acked")
         ok, took, f = caught_up(pj, CATCHUP_BOUND_S + 30, at_least=want)
         if not ok:
-            check(False, f"round {n}: projector did not follow the successor recording", json.dumps(f))
+            check(False, f"round {n}: projector did not follow the successor recording (applied_seq "
+                         f"{f.get('appliedSeq')}, head {f.get('headSeq')}, recording {rec} -> {f.get('recordingId')})",
+                  json.dumps(f))
+            break  # the next round cannot show more than this one did
         else:
             check(True, f"round {n}: the successor recording followed (recording {rec} -> {f.get('recordingId')}, "
                         f"{took:.1f} s)")
@@ -1358,7 +1361,7 @@ def main():
     ap.add_argument("--image", required=True)
     ap.add_argument("--mode", required=True, choices=["embedded", "external"])
     ap.add_argument("--work", required=True)
-    ap.add_argument("--port-base", type=int, default=27000)
+    ap.add_argument("--port-base", type=int, default=9800)
     ap.add_argument("--binary", default="oe-projector")
     ap.add_argument("--core-driver", default="embedded", choices=["embedded", "external"])
     ap.add_argument("case", choices=sorted(CASES))

@@ -243,7 +243,7 @@ New settings with defaults: `STREAM_REQUEST_TIMEOUT_MS` 5000, `STREAM_WS_MAX_MES
 `STREAM_ENGINE_POLL_TIMEOUT_MS` 500, `STREAM_ENGINE_FRAME_MIN_MS` 1000, `STREAM_ENGINE_MAX_BODY_BYTES` 1048576.
 
 T1: `ctest -L t1` with `-DGW_IT_CORE_JAR` and `-DGW_IT_PROBE_JAR`. `GW_IT_STREAM_CONNECTIONS` sets the storm
-size (default 2000). The T1 suites take port bases in 24000..31299, below the usual Linux ephemeral range, and
+size (default 2000). Each T1 case takes its own block of GW_IT_PORT_SPAN (300) ports from GW_IT_PORT_BASE (9800), all below the usual Linux ephemeral range (configure warns about a block that reaches this host's range); a control test build of oe-projector for a fixture slot is configured with -DOE_PROJECTOR_CONTROL=<PROJ_NC_...> and installs oe-projector alone, and
 `it.stream` fails at start if a core node's endpoint does not answer.
 
 ## History projector (`oe-projector`)

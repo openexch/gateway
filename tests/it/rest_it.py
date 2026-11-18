@@ -150,7 +150,7 @@ def main():
     ap.add_argument("--core-jar", required=True)
     ap.add_argument("--probe-jar", required=True)
     ap.add_argument("--work", required=True)
-    ap.add_argument("--port-base", type=int, default=30000)
+    ap.add_argument("--port-base", type=int, default=9800)
     ap.add_argument("--mode", choices=["embedded", "external"], default="embedded")
     args = ap.parse_args()
     shutil.rmtree(args.work, ignore_errors=True)

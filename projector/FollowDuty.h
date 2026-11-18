@@ -51,7 +51,8 @@
 // (an empty projection's followers keep no epoch filter), PROJ_NC_NO_MTU_CHECK (the configured MTU is not handed to
 // the library), PROJ_NC_COMPARES_NOT_DELIVERY (verified compares do not count for BEHIND), PROJ_NC_HOLE_MARKS_ALL (a
 // hole one source shows marks every source), PROJ_NC_START_AT_FIRST (an empty projection starts at the first record
-// its source holds), and the FollowRules controls. PROJ_TC_SOURCE_FAULTS (test build only) injects per-source faults in
+// its source holds), PROJ_NC_PIN_RECORDING (the first recording read is the only one ever read: no successor, no other
+// source's recording), and the FollowRules controls. PROJ_TC_SOURCE_FAULTS (test build only) injects per-source faults in
 // the frame sink: records dropped (holed or wiped sources) and a delivery rate (a slow source); see FollowDuty.cpp.
 
 namespace openexchange { namespace gateway { namespace projector {

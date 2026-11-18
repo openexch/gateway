@@ -430,6 +430,8 @@ set(GW_PROJECTOR_PG_CONTROLS
     "PROJ_NC_BEAT_ALWAYS|ProjectionStore.cpp|beat_rule|beat without a fresh head"
     "PROJ_NC_BEAT_NO_EPOCH|ProjectionStore.cpp|beat_rule|beat across genesis ids"
     "PROJ_NC_REBUILD_KEEPS_BEAT|ProjectionStore.cpp|rebuild_reads|rebuilding history served as complete"
+    "PROJ_NC_DROP_ONE|HistoryWork.cpp|projection_dense|journalSeq missing in projection: 2 [(]applied_seq [0-9]+[)]"
+    "PROJ_NC_WALLCLOCK_COLUMN|ProjectionStore.cpp|projection_byte_equal|projection dump differs: oe_orders .*without the column projected_at the dumps are equal"
     "GW_NC_VIEW_REMAINING_FROM_QUANTITY||read_contract_compat|projected history differs from the read contract"
     "GW_NC_VIEW_COLUMN_RENAMED||read_contract_compat|the gateway's absent"
     "GW_NC_SHIFTED_COLUMN||reference_equivalence|projected history differs from the reference DDL")
@@ -454,7 +456,8 @@ foreach(entry IN LISTS GW_PROJECTOR_PG_CONTROLS)
 endforeach()
 if(GW_PG_TESTS)
     foreach(case apply_story fk_order_first_records crash_points overlap_compare dense_apply one_mapping_from_postgres
-            read_contract_compat reference_equivalence beat_rule rebuild_reads reader_role_prepared)
+            read_contract_compat reference_equivalence beat_rule rebuild_reads reader_role_prepared projection_dense
+            projection_byte_equal)
         add_test(NAME pg.projector.${case} COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/pg/pg_it.py"
             --binary "$<TARGET_FILE:gw_projector_pg_tests>" --image "${GW_PG_TEST_IMAGE}" ${case})
         set_tests_properties(pg.projector.${case} PROPERTIES TIMEOUT 300 LABELS "pg;projector" RUN_SERIAL TRUE)
@@ -475,6 +478,40 @@ add_test(NAME lock COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/lock/lock_test.sh" "${PR
     "${CMAKE_CURRENT_BINARY_DIR}/lock-work")
 
 if(GW_TEST_BUILDS)
+    # T1 port bases: every T1 case gets a block of GW_IT_PORT_SPAN ports of its own, handed out in order from
+    # GW_IT_PORT_BASE, so no two cases share a port. A three-member core (stride 100) uses base+1..5, +101..105,
+    # +201..205 and its node ports base+90..92. The defaults keep every block below this host's ephemeral range (Linux:
+    # 32768 and up), where an outgoing connection or a socket of any process could hold a member's port; a block that
+    # reaches it is named by a configure warning (both are settings: a host with other listeners moves them).
+    set(GW_IT_PORT_BASE "9800" CACHE STRING "first port of the T1 port blocks")
+    set(GW_IT_PORT_SPAN "300" CACHE STRING "ports per T1 case (a three-member core needs 206)")
+    foreach(_setting GW_IT_PORT_BASE GW_IT_PORT_SPAN)
+        if(NOT "${${_setting}}" MATCHES "^[0-9]+$")
+            message(FATAL_ERROR "${_setting} must be a port number, got '${${_setting}}'")
+        endif()
+    endforeach()
+    if(GW_IT_PORT_SPAN LESS 206)
+        message(WARNING "GW_IT_PORT_SPAN ${GW_IT_PORT_SPAN} is below the 206 ports a three-member core uses, so "
+            "neighbouring T1 cases share core ports and can collide when they run together")
+    endif()
+    set(_gw_it_ephemeral 32768)
+    if(EXISTS /proc/sys/net/ipv4/ip_local_port_range)
+        file(READ /proc/sys/net/ipv4/ip_local_port_range _range)
+        if(_range MATCHES "^([0-9]+)")
+            set(_gw_it_ephemeral ${CMAKE_MATCH_1})
+        endif()
+    endif()
+    set(_gw_it_next_port ${GW_IT_PORT_BASE})
+    function(gw_it_port out name)
+        math(EXPR next "${_gw_it_next_port} + ${GW_IT_PORT_SPAN}")
+        if(next GREATER _gw_it_ephemeral)
+            message(WARNING "T1 case ${name}: ports ${_gw_it_next_port}..${next} reach this host's ephemeral range "
+                "(${_gw_it_ephemeral} and up); lower GW_IT_PORT_BASE or GW_IT_PORT_SPAN")
+        endif()
+        set(${out} ${_gw_it_next_port} PARENT_SCOPE)
+        set(_gw_it_next_port ${next} PARENT_SCOPE)
+    endfunction()
+
     add_executable(gw_test_media_driver support/TestMediaDriver.cpp)
     target_link_libraries(gw_test_media_driver PRIVATE cluster_tools::runtime_embedded_driver cluster_tools::runtime)
 
@@ -499,61 +536,54 @@ if(GW_TEST_BUILDS)
     set(GW_IT_CORE_JAR "" CACHE FILEPATH "core-cluster.jar built at the money schema commit of dependencies.lock (T1)")
     set(GW_IT_PROBE_JAR "" CACHE FILEPATH "CoreProbe.jar compiled against GW_IT_CORE_JAR (T1)")
     if(GW_IT_CORE_JAR AND GW_IT_PROBE_JAR)
-        set(_port 26000)
         foreach(mode embedded external)
+            gw_it_port(_port it.session.${mode})
             add_test(NAME it.session.${mode}
                 COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/it/session_it.py"
                     --bin-dir "${PROJECT_BINARY_DIR}/bin" --core-jar "${GW_IT_CORE_JAR}" --probe-jar "${GW_IT_PROBE_JAR}"
                     --mode ${mode} --work "${CMAKE_CURRENT_BINARY_DIR}/it-work/session.${mode}" --port-base ${_port})
             set_tests_properties(it.session.${mode} PROPERTIES TIMEOUT 900 LABELS t1 RUN_SERIAL TRUE)
-            math(EXPR _port "${_port} + 1000")
         endforeach()
         # the REST routes through the real oe-gateway (dev principals, no users database), the treasury lane off and on
-        set(_port 30000)
         foreach(mode embedded external)
+            gw_it_port(_port it.rest.${mode})
             add_test(NAME it.rest.${mode}
                 COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/it/rest_it.py"
                     --bin-dir "${PROJECT_BINARY_DIR}/bin" --core-jar "${GW_IT_CORE_JAR}" --probe-jar "${GW_IT_PROBE_JAR}"
                     --mode ${mode} --work "${CMAKE_CURRENT_BINARY_DIR}/it-work/rest.${mode}" --port-base ${_port})
             set_tests_properties(it.rest.${mode} PROPERTIES TIMEOUT 900 LABELS t1 RUN_SERIAL TRUE)
-            math(EXPR _port "${_port} + 1000")
         endforeach()
         # oe-stream through the real binary: the stitch, gaps, resume, balances, the cache, the slow client, the storm
         # (GW_IT_STREAM_CONNECTIONS connections, 2000 by default), readiness and the principal binding
         set(GW_IT_STREAM_CONNECTIONS "2000" CACHE STRING "connections of the stream's resync storm row (T1)")
-        # every port base of the T1 suites (24000..32199) stays below the usual Linux ephemeral range (32768 and up),
-        # where an outgoing connection of any process could hold a member's port
-        set(_port 24000)
         foreach(mode embedded external)
+            gw_it_port(_port it.stream.${mode})
             add_test(NAME it.stream.${mode}
                 COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/it/stream_it.py"
                     --bin-dir "${PROJECT_BINARY_DIR}/bin" --core-jar "${GW_IT_CORE_JAR}" --probe-jar "${GW_IT_PROBE_JAR}"
                     --mode ${mode} --work "${CMAKE_CURRENT_BINARY_DIR}/it-work/stream.${mode}" --port-base ${_port}
                     --connections ${GW_IT_STREAM_CONNECTIONS})
             set_tests_properties(it.stream.${mode} PROPERTIES TIMEOUT 1800 LABELS t1 RUN_SERIAL TRUE)
-            math(EXPR _port "${_port} + 1000")
         endforeach()
         # the engine status feed of oe-stream: each core member's own endpoint polled; a follower killed, the leader killed
-        set(_port 31400)
         foreach(mode embedded external)
+            gw_it_port(_port it.engine.${mode})
             add_test(NAME it.engine.${mode}
                 COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/it/engine_it.py"
                     --bin-dir "${PROJECT_BINARY_DIR}/bin" --core-jar "${GW_IT_CORE_JAR}" --probe-jar "${GW_IT_PROBE_JAR}"
                     --mode ${mode} --work "${CMAKE_CURRENT_BINARY_DIR}/it-work/engine.${mode}" --port-base ${_port})
             set_tests_properties(it.engine.${mode} PROPERTIES TIMEOUT 900 LABELS t1 RUN_SERIAL TRUE)
-            math(EXPR _port "${_port} + 500")
         endforeach()
         # the auth routes through the real oe-gateway: the core cluster plus a throwaway PostgreSQL container
         if(GW_PG_TESTS)
-            set(_port 28000)
             foreach(mode embedded external)
+                gw_it_port(_port it.auth.${mode})
                 add_test(NAME it.auth.${mode}
                     COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/it/auth_it.py"
                         --bin-dir "${PROJECT_BINARY_DIR}/bin" --core-jar "${GW_IT_CORE_JAR}" --probe-jar "${GW_IT_PROBE_JAR}"
                         --image "${GW_PG_TEST_IMAGE}" --mode ${mode} --work "${CMAKE_CURRENT_BINARY_DIR}/it-work/auth.${mode}"
                         --port-base ${_port})
                 set_tests_properties(it.auth.${mode} PROPERTIES TIMEOUT 900 LABELS t1 RUN_SERIAL TRUE)
-                math(EXPR _port "${_port} + 1000")
             endforeach()
         endif()
     endif()
@@ -624,7 +654,7 @@ if(GW_TEST_BUILDS)
             "PROJ_NC_NO_EPOCH_CHECK|FollowDuty.cpp,HistoryWork.cpp"
             "PROJ_NC_EPOCH_FROM_FIRST_RECORD|FollowDuty.cpp,HistoryWork.cpp" "PROJ_NC_NO_MTU_CHECK|FollowDuty.cpp"
             "PROJ_NC_COMPARES_NOT_DELIVERY|FollowDuty.cpp"
-            "PROJ_NC_BEAT_NO_EPOCH|FollowDuty.cpp,ProjectionStore.cpp")
+            "PROJ_NC_BEAT_NO_EPOCH|FollowDuty.cpp,ProjectionStore.cpp" "PROJ_NC_PIN_RECORDING|FollowDuty.cpp")
         string(REPLACE "|" ";" parts "${entry}")
         list(GET parts 0 define)
         list(GET parts 1 sources)
@@ -666,7 +696,6 @@ if(GW_TEST_BUILDS)
     if(GW_IT_CORE_JAR AND GW_IT_PROBE_JAR AND GW_PG_TESTS)
         # the fills gap of a stream resync closed with GET /fills (tests/projector/fills_it.py): both driver modes, and
         # the control (asOf without eventSeq)
-        set(_port 34000)
         foreach(entry "oe-gateway|" "oe-gateway-nc-no-asof-event-seq|resync fill gap not closable")
             foreach(mode embedded external)
                 string(REPLACE "|" ";" parts "${entry}")
@@ -677,6 +706,7 @@ if(GW_TEST_BUILDS)
                 else()
                     set(name it.fills_gap.nc_no_asof_event_seq.${mode})
                 endif()
+                gw_it_port(_port ${name})
                 add_test(NAME ${name}
                     COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/projector/fills_it.py"
                         --bin-dir "${PROJECT_BINARY_DIR}/bin" --core-jar "${GW_IT_CORE_JAR}" --probe-jar "${GW_IT_PROBE_JAR}"
@@ -686,10 +716,8 @@ if(GW_TEST_BUILDS)
                 if(NOT text STREQUAL "")
                     set_tests_properties(${name} PROPERTIES PASS_REGULAR_EXPRESSION "${text}")
                 endif()
-                math(EXPR _port "${_port} + 400")
             endforeach()
         endforeach()
-        set(_port 25000)
         # case|binary|failure text of a control|core driver mode
         foreach(entry "follow|oe-projector||embedded" "follow|oe-projector||external" "successor|oe-projector||embedded"
                 "replays|oe-projector||embedded" "epoch|oe-projector||embedded" "mtu|oe-projector||embedded"
@@ -709,7 +737,9 @@ if(GW_TEST_BUILDS)
                 "long_overlap|oe-projector-nc-compares-not-delivery|BEHIND left a source that was comparing the overlap|embedded"
                 "beat|oe-projector-tc-faults||embedded" "beat_epoch|oe-projector||embedded"
                 "beat|oe-projector-tc-faults-nc-beat-always|beat without a fresh head|embedded"
-                "beat_epoch|oe-projector-nc-beat-no-epoch|beat across genesis ids|embedded")
+                "beat_epoch|oe-projector-nc-beat-no-epoch|beat across genesis ids|embedded"
+                # the pin: caught up on the recording first read, the member restarted, then never past it
+                "successor|oe-projector-nc-pin-recording|PASS caught up on member [0-9] alone.*PASS round 1: member [0-9] rejoined.*PASS round 1: orders acked.*FAIL round 1: projector did not follow the successor recording|embedded")
             foreach(mode embedded external)
                 string(REPLACE "|" ";" parts "${entry}")
                 list(GET parts 0 case)
@@ -728,6 +758,7 @@ if(GW_TEST_BUILDS)
                     # in ${mode}
                     set(name ${name}.core_external)
                 endif()
+                gw_it_port(_port ${name})
                 add_test(NAME ${name}
                     COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/projector/follow_it.py"
                         --bin-dir "${PROJECT_BINARY_DIR}/bin" --core-jar "${GW_IT_CORE_JAR}" --probe-jar "${GW_IT_PROBE_JAR}"
@@ -737,7 +768,6 @@ if(GW_TEST_BUILDS)
                 if(NOT text STREQUAL "")
                     set_tests_properties(${name} PROPERTIES PASS_REGULAR_EXPRESSION "${text}")
                 endif()
-                math(EXPR _port "${_port} + 400")
             endforeach()
         endforeach()
     endif()
