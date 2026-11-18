@@ -46,6 +46,18 @@ std::vector<Condition> streamReadyConditions(const Status &s, std::int64_t nowNs
     };
 }
 
+std::vector<Condition> projectorReadyConditions(const Status &s, std::int64_t nowNs, const ProjectorReadyBounds &bounds)
+{
+    return {
+        { condition::DRIVER_CONNECTED, s.driverConnected },
+        { condition::LEASE_HELD, s.leaseHeld },
+        { condition::SESSION_REGISTERED, s.registered },
+        { condition::HEAD_PROBE_FRESH, fresh(s.lastHeadProbeNs, nowNs, bounds.headFreshMs) },
+        { condition::NOT_HALTED, !s.halted },
+        { condition::BEAT_FRESH, s.lastBeatNs >= 0 && nowNs - s.lastBeatNs < bounds.readyLagMs * 1'000'000LL },
+    };
+}
+
 std::vector<std::string> failing(const std::vector<Condition> &conditions)
 {
     std::vector<std::string> out;

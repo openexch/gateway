@@ -46,6 +46,11 @@ struct Status
     std::int64_t lastHeadProbeNs = -1;     // monotonic ns of the last answered head probe; -1 = never
     bool wsListenerAccepting = false;      // the WebSocket listener accepts connections
 
+    // oe-projector: the writer thread's part is copied in by the admin thread at request time (FrontWork::fillStatus)
+    bool leaseHeld = false;                // this copy holds the writer lease (a standby does not)
+    bool halted = false;                   // a halt is set (none is a latch: re-evaluated continuously)
+    std::int64_t lastBeatNs = -1;          // monotonic ns of the last beat this copy committed; -1 = never
+
     // process
     bool driverConnected = false;          // the Aeron client is connected and the process counter registered; set by
                                            // the process shell when the admin thread reads, not by the duty thread

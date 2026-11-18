@@ -61,7 +61,8 @@ bool PgConn::waitSocket(bool forWrite, std::int64_t deadlineNs)
 }
 
 bool PgConn::connect(const std::string &url, std::int64_t timeoutMs, std::string &error,
-    const std::vector<std::string> &setup, std::int64_t budgetMs)
+    const std::vector<std::string> &setup, std::int64_t budgetMs,
+    const std::vector<std::pair<std::string, std::string>> &options)
 {
     close();
     m_sqlState.clear();
@@ -70,9 +71,16 @@ bool PgConn::connect(const std::string &url, std::int64_t timeoutMs, std::string
     const std::int64_t deadline = nowNs() + budget * 1'000'000LL;
     // what is left of the budget for one setup statement (at least 1 ms: a passed deadline then fails it at once)
     auto left = [deadline] { return std::max<std::int64_t>(1, (deadline - nowNs()) / 1'000'000); };
-    const char *keys[] = { "dbname", nullptr };
-    const char *values[] = { url.c_str(), nullptr };
-    m_pg = PQconnectStartParams(keys, values, 1);
+    std::vector<const char *> keys{ "dbname" };
+    std::vector<const char *> values{ url.c_str() };
+    for (const auto &[key, value] : options)
+    {
+        keys.push_back(key.c_str());
+        values.push_back(value.c_str());
+    }
+    keys.push_back(nullptr);
+    values.push_back(nullptr);
+    m_pg = PQconnectStartParams(keys.data(), values.data(), 1);
     if (nullptr == m_pg || CONNECTION_BAD == PQstatus(m_pg))
     {
         error = nullptr == m_pg ? "out of memory" : PQerrorMessage(m_pg);

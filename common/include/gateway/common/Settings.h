@@ -52,8 +52,9 @@ namespace openexchange { namespace gateway {
 
 enum class Role : std::uint8_t
 {
-    GATEWAY, // oe-gateway
-    STREAM   // oe-stream
+    GATEWAY,  // oe-gateway
+    STREAM,   // oe-stream
+    PROJECTOR // oe-projector (projector/ProjectorSettings.h)
 };
 
 enum class DriverMode : std::uint8_t
@@ -230,6 +231,14 @@ ParseResult<GatewaySettings> parseGatewaySettings(const Environment &env,
     const cluster_tools::runtime::DirProbe &probe = cluster_tools::runtime::systemDirProbe());
 ParseResult<StreamSettings> parseStreamSettings(const Environment &env,
     const cluster_tools::runtime::DirProbe &probe = cluster_tools::runtime::systemDirProbe());
+
+// The media driver keys of one binary, <prefix>_DRIVER_MODE, AERON_DIR, <prefix>_DRIVER_DIR and
+// <prefix>_DRIVER_TIMEOUT_MS, with the rules listed at the top of this file (oe-projector reads them under
+// HISTORY_PROJECTOR_).
+void parseDriverSettings(SettingsReader &r, const std::string &prefix, const cluster_tools::runtime::DirProbe &probe,
+    CommonSettings &c);
+// host:port (IPv6 as [addr]:port); `ipv4Only` for an admin bind. nullopt with `why` (the expected form).
+std::optional<Bind> parseBindText(const std::string &text, bool ipv4Only, std::string &why);
 
 // The cluster session settings these values make (the client's defaults otherwise).
 cluster_tools::client::ClientSettings sessionClientSettings(const CommonSettings &settings, const char *processName);

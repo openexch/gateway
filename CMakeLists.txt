@@ -1,5 +1,6 @@
 # openexch/gateway - oe-gateway (REST) and oe-stream (WebSocket user streams), two stateless C++20 processes in front
-# of the core, sharing one static library, gw_common.
+# of the core, and oe-projector (the history projector: the core's order journal into the history relations the
+# gateway reads, the only binary here that writes a database), sharing one static library, gw_common.
 #
 # Build:
 #   scripts/build-cluster-tools.sh <cache-dir> <prefix>     (fetches, verifies and installs the pinned cluster-tools)
@@ -36,7 +37,7 @@ include(GatewayDeps)
 set(GW_DEPS_PREFIX "" CACHE PATH "the prefix scripts/build-deps.sh installed Boost, OpenSSL and libpq to")
 gw_check_deps("${CMAKE_CURRENT_SOURCE_DIR}/dependencies.lock" "${GW_DEPS_PREFIX}")
 find_package(cluster_tools CONFIG REQUIRED COMPONENTS client_core runtime client client_aeron runtime_aeron sbe_codecs
-    runtime_embedded_driver)
+    runtime_embedded_driver archive_core)
 gw_check_cluster_tools_package()
 
 if(GW_BUILD_SOURCE_SHA)
@@ -71,6 +72,19 @@ foreach(_file IN LISTS GW_MIGRATION_FILES)
 endforeach()
 file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/gateway/migrations.inc" CONTENT "${_gw_migrations}" @ONLY)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${GW_MIGRATION_FILES})
+
+# The history projection schema (sql/history_projection_v1.sql), embedded with its sha256: oe-projector applies it and
+# the database records the same sha256 (a difference refuses the start).
+set(GW_PROJECTION_SCHEMA_FILE "${CMAKE_CURRENT_SOURCE_DIR}/sql/history_projection_v1.sql")
+file(READ "${GW_PROJECTION_SCHEMA_FILE}" _projection_sql)
+file(SHA256 "${GW_PROJECTION_SCHEMA_FILE}" _projection_sha)
+if(_projection_sql MATCHES "\\)gwsql\"")
+    message(FATAL_ERROR "${GW_PROJECTION_SCHEMA_FILE} contains the embedding delimiter )gwsql\"")
+endif()
+file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/gateway/projection_schema.inc"
+    CONTENT "constexpr const char *PROJECTION_SCHEMA_SQL = R\"gwsql(${_projection_sql})gwsql\";\nconstexpr const char *PROJECTION_SCHEMA_SHA256 = \"${_projection_sha}\";\n"
+    @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${GW_PROJECTION_SCHEMA_FILE}")
 
 set(GW_WARNINGS -Wall -Wextra -Wpedantic -Werror)
 
@@ -133,6 +147,14 @@ target_link_libraries(oe_stream_app PUBLIC gw_common)
 target_compile_options(oe_stream_app PRIVATE ${GW_WARNINGS})
 target_compile_definitions(oe_stream_app PRIVATE GW_NO_ORDER_ENTRY)
 
+# oe-projector: built like the stream (GW_NO_ORDER_ENTRY, no gw_order_entry): it holds a GATEWAY session for its head
+# probe only and cannot encode an order or money command.
+add_library(oe_projector_app STATIC projector/ProjectorApp.cpp projector/ProjectorSettings.cpp projector/ProjectionStore.cpp)
+target_include_directories(oe_projector_app PUBLIC projector)
+target_link_libraries(oe_projector_app PUBLIC gw_common cluster_tools::archive_core)
+target_compile_options(oe_projector_app PRIVATE ${GW_WARNINGS})
+target_compile_definitions(oe_projector_app PRIVATE GW_NO_ORDER_ENTRY)
+
 # The binaries: the embedded driver first in the link list (its archive resolves the C client symbols before
 # aeron_static is scanned).
 add_executable(oe-gateway gateway/main.cpp)
@@ -140,7 +162,10 @@ target_link_libraries(oe-gateway PRIVATE cluster_tools::runtime_embedded_driver 
 add_executable(oe-stream stream/main.cpp)
 target_link_libraries(oe-stream PRIVATE cluster_tools::runtime_embedded_driver oe_stream_app)
 target_compile_definitions(oe-stream PRIVATE GW_NO_ORDER_ENTRY)
-install(TARGETS oe-gateway oe-stream RUNTIME DESTINATION bin)
+add_executable(oe-projector projector/main.cpp)
+target_link_libraries(oe-projector PRIVATE cluster_tools::runtime_embedded_driver oe_projector_app)
+target_compile_definitions(oe-projector PRIVATE GW_NO_ORDER_ENTRY)
+install(TARGETS oe-gateway oe-stream oe-projector RUNTIME DESTINATION bin)
 
 include(CTest)
 if(BUILD_TESTING)

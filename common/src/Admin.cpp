@@ -25,11 +25,17 @@ const char *b(bool v)
 
 std::vector<Condition> readyConditions(const AdminView &v)
 {
-    return Role::GATEWAY == v.role ? gatewayReadyConditions(v.status, v.nowNs, v.gatewayBounds)
-                                   : streamReadyConditions(v.status, v.nowNs, v.streamBounds);
+    switch (v.role)
+    {
+        case Role::GATEWAY: return gatewayReadyConditions(v.status, v.nowNs, v.gatewayBounds);
+        case Role::STREAM: return streamReadyConditions(v.status, v.nowNs, v.streamBounds);
+        case Role::PROJECTOR: break;
+    }
+    return projectorReadyConditions(v.status, v.nowNs, v.projectorBounds);
 }
 
-rt::HttpResponse readyResponse(const std::vector<Condition> &conditions)
+// `extra`: members placed after "ready" (",\"role\":\"standby\"" for a projector).
+rt::HttpResponse readyResponse(const std::vector<Condition> &conditions, const std::string &extra = "")
 {
     rt::HttpResponse r;
     const std::vector<std::string> names = failing(conditions);
@@ -37,12 +43,12 @@ rt::HttpResponse readyResponse(const std::vector<Condition> &conditions)
     {
         r.status = 200;
         r.contentType = JSON;
-        r.body = "{\"ready\":true,\"failing\":[]}\n";
+        r.body = "{\"ready\":true" + extra + ",\"failing\":[]}\n";
         return r;
     }
     r.status = 503;
     r.contentType = JSON;
-    r.body = "{\"ready\":false,\"failing\":[";
+    r.body = "{\"ready\":false" + extra + ",\"failing\":[";
     for (std::size_t i = 0; i < names.size(); ++i)
     {
         r.body += (0 == i ? "" : ",") + q(names[i]);
@@ -66,6 +72,17 @@ std::string ageMs(std::int64_t lastNs, std::int64_t nowNs)
     return lastNs < 0 ? "null" : std::to_string((nowNs - lastNs) / 1'000'000LL);
 }
 
+}
+
+const char *metricPrefix(Role role) noexcept
+{
+    switch (role)
+    {
+        case Role::GATEWAY: return "gateway_";
+        case Role::STREAM: return "stream_";
+        case Role::PROJECTOR: break;
+    }
+    return "projector_";
 }
 
 std::string jsonEscape(const std::string &text)
@@ -130,7 +147,7 @@ std::string renderHealth(const AdminView &v, int &status)
             std::to_string(s.storageStarvedSeconds) + "}";
         out += ",\"treasuryLane\":" + q(v.treasuryLane);
     }
-    else
+    else if (Role::STREAM == v.role)
     {
         out += ",\"events\":{\"gapOpen\":" + std::string(b(s.gapOpen)) + ",\"headProbeAgeMs\":" +
             ageMs(s.lastHeadProbeNs, v.nowNs) + "}";
@@ -154,7 +171,7 @@ std::string renderHealth(const AdminView &v, int &status)
 
 std::string renderMetrics(const AdminView &v)
 {
-    const std::string p = Role::GATEWAY == v.role ? "gateway_" : "stream_";
+    const std::string p = metricPrefix(v.role);
     const Status &s = v.status;
     std::string out;
     auto gauge = [&](const std::string &name, const std::string &help, const std::string &value) {
@@ -249,7 +266,9 @@ rt::HttpResponse adminRoute(const rt::HttpRequest &request, const AdminView &vie
     }
     if ("/ready" == path)
     {
-        return readyResponse(readyConditions(view));
+        return readyResponse(readyConditions(view), Role::PROJECTOR == view.role
+                ? std::string(",\"role\":") + (view.status.leaseHeld ? "\"writer\"" : "\"standby\"")
+                : std::string());
     }
     if ("/ready/session" == path)
     {
