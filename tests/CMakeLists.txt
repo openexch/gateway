@@ -85,7 +85,7 @@ set_tests_properties(wire_nc_swapped_decode_field PROPERTIES PASS_REGULAR_EXPRES
     "golden mismatch OrderEvent: decoded values")
 
 # Control for the version gate: the decoder built without its exact-version check (GW_NC_NO_VERSION_GATE, test-only)
-# must fail the version row: a v7 frame read with v8 offsets.
+# must fail the version row: a v8 frame read with v9 offsets.
 add_executable(gw_wire_nc_no_version_gate unit/TestMain.cpp unit/WireRefusalTest.cpp
     "${PROJECT_SOURCE_DIR}/common/src/Wire.cpp"
     "${PROJECT_SOURCE_DIR}/common/src/OrderEntryWire.cpp")

@@ -223,7 +223,7 @@ public final class GoldenGateway {
 
         final OrderEventsEndEncoder eventsEnd = new OrderEventsEndEncoder().wrapAndApplyHeader(BUF, 0, HEADER)
                 .correlationId(v(116, 0, 1)).count(i(116, 0, 2)).firstAvailableSeq(v(116, 0, 3))
-                .lastSeq(v(116, 0, 4)).nextFromSeq(v(116, 0, 5));
+                .lastSeq(v(116, 0, 4)).nextFromSeq(v(116, 0, 5)).genesisId(v(116, 0, 6));
         print("JAVA_ORDER_EVENTS_END", eventsEnd.encodedLength());
 
         final UserBalancesEncoder balances = new UserBalancesEncoder().wrapAndApplyHeader(BUF, 0, HEADER)
@@ -245,7 +245,7 @@ public final class GoldenGateway {
         final CoreConfigReportEncoder report = new CoreConfigReportEncoder().wrapAndApplyHeader(BUF, 0, HEADER)
                 .correlationId(v(t, 0, 1)).configVersion(i(t, 0, 2)).behaviorVersion(4).limitsVersion(i(t, 0, 4))
                 .requestTtlMs(v(t, 0, 5)).requestPerUserCap(i(t, 0, 6)).orderEventRingCapacity(i(t, 0, 7))
-                .gateState(GateState.SUSPENDED).asOfLogPosition(v(t, 0, 10));
+                .gateState(GateState.SUSPENDED).asOfLogPosition(v(t, 0, 10)).genesisId(v(t, 0, 11));
         report.gateReasons().clear().admin(true).genesis(true);
         final CoreConfigReportEncoder.MarketsEncoder markets = report.marketsCount(2);
         final String[] symbols = { "BTC-USDT", "ETH-USDT-PERP-01" };

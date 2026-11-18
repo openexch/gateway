@@ -31,7 +31,7 @@
 // Decode: Decoder::decode() checks the frame before any field is read, and refuses it, counted by reason, when
 //   - it is shorter than its header, its block or a group it declares (truncated),
 //   - its header names another schema id (wrong_schema) or any version other than the exact one this build speaks
-//     (wrong_version: a v7 or a v9 frame is refused by name, never read with v8 offsets),
+//     (wrong_version: a v8 or a v10 frame is refused by name, never read with v9 offsets),
 //   - its template is neither one the gateway reads nor one it ignores (unknown_template),
 //   - its block length or a group's entry block length differs from the schema's (wrong_block_length,
 //     wrong_group_block_length: the version is exact, so the lengths are too),
@@ -151,7 +151,7 @@ struct CreateOrder
     std::int64_t trailingDelta = 0;
     std::int64_t displayQty = 0;
     std::int64_t expiresAtMs = 0;
-    std::uint32_t flags = 0; // OrderFlags: every bit reserved in v8, the core refuses a nonzero value
+    std::uint32_t flags = 0; // OrderFlags: every bit reserved in v9, the core refuses a nonzero value
     bool operator==(const CreateOrder &) const = default;
 };
 
@@ -366,6 +366,7 @@ struct OrderEventsEnd
     std::int64_t firstAvailableSeq = 0;
     std::int64_t lastSeq = 0;
     std::int64_t nextFromSeq = 0;
+    std::int64_t genesisId = 0; // v9: the genesisId of the core's recorded CoreConfig, 0 while none is recorded
     bool operator==(const OrderEventsEnd &) const = default;
 };
 
@@ -409,6 +410,7 @@ struct CoreConfigHead
     money::GateState::Value gateState = money::GateState::OPEN;
     std::uint32_t gateReasons = 0;
     std::int64_t asOfLogPosition = 0;
+    std::int64_t genesisId = 0;    // v9: the genesisId of the core's recorded CoreConfig, 0 while none is recorded
     std::uint16_t marketCount = 0; // onCoreConfigMarket calls that follow
     std::uint16_t assetCount = 0;  // then onCoreConfigAsset calls
     bool operator==(const CoreConfigHead &) const = default;
@@ -553,7 +555,7 @@ struct RefusalRecord
 };
 
 // One line naming the reason and what the frame carried, e.g.
-// "money frame refused: wrong_version (version 7, this build reads schema 2 version 8 only), template 110 AdminAck,
+// "money frame refused: wrong_version (version 8, this build reads schema 2 version 9 only), template 110 AdminAck,
 // 24 bytes".
 std::string describe(const RefusalRecord &record);
 
