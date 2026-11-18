@@ -20,13 +20,29 @@ const char *ORDER_COLUMNS = "order_id, client_order_id::text, market_id, side, t
     "quantity, filled_quantity, remaining_quantity, status, reason, me_reason, me_order_id, hold_asset_id, hold_amount, "
     "hold_remaining, created_at_ms, updated_at_ms";
 const char *FILL_COLUMNS = "trade_id, order_id, market_id, side, price, quantity, maker, executed_at_ms";
+const char *TRAIL_COLUMNS = "order_id, event_seq, event, status, core_log_position, me_epoch, me_log_position, "
+    "me_journal_seq, liquidity, trade_id, last_price, last_qty, hold_remaining, at_ms";
 
 const std::array<const char *, 10> STATUSES = { "NEW", "PARTIALLY_FILLED", "FILLED", "CANCELLED", "REJECTED", "EXPIRED",
     "PENDING_NEW", "PENDING_TRIGGER", "PENDING_CANCEL", "PENDING_REPLACE" };
 
 const char *tagOf(Kind kind)
 {
-    return Kind::ORDERS == kind ? "o1" : "f1";
+    return Kind::ORDERS == kind ? "o1" : Kind::FILLS == kind ? "f1" : "t1";
+}
+
+std::string param(std::vector<std::string> &params, std::string value);
+
+// The owner filter of the trail statements: the principal's user id, in the statement itself.
+std::string trailOwner(std::vector<std::string> &params, std::int64_t userId)
+{
+#ifdef GW_NC_TRAIL_NO_OWNER
+    (void)params;
+    (void)userId;
+    return "TRUE"; // test build only: no owner filter
+#else
+    return "user_id = " + param(params, std::to_string(userId)) + "::bigint";
+#endif
 }
 
 std::string binding(Kind kind, const Filter &f)
@@ -169,8 +185,46 @@ bool knownStatus(std::string_view name)
 
 // Each placeholder is numbered by its own statement (never two param() calls in one expression: the operands of +
 // are unsequenced, and the numbers would follow the compiler's order instead of the text's).
+namespace {
+
+// A trail page: the caller's records of one order, oldest first, by event_seq and by nothing else.
+Statement trailStatement(const PageRequest &r)
+{
+    Statement s;
+    s.sql = std::string("SELECT ") + TRAIL_COLUMNS + " FROM gateway_order_trail_v1 WHERE ";
+    s.sql += trailOwner(s.params, r.userId);
+    s.sql += " AND order_id = ";
+    s.sql += param(s.params, std::to_string(r.filter.orderId)) + "::bigint";
+    if (r.after)
+    {
+        s.sql += " AND event_seq > ";
+        s.sql += param(s.params, std::to_string(r.after->a)) + "::bigint";
+    }
+    s.sql += " ORDER BY event_seq LIMIT ";
+    const std::int64_t fetch = r.limit < INT64_MAX ? r.limit + 1 : r.limit;
+    s.sql += param(s.params, std::to_string(fetch)) + "::bigint";
+    return s;
+}
+
+}
+
+Statement trailExistsStatement(std::int64_t userId, std::int64_t orderId)
+{
+    Statement s;
+    s.sql = "SELECT 1 FROM gateway_order_trail_v1 WHERE ";
+    s.sql += trailOwner(s.params, userId);
+    s.sql += " AND order_id = ";
+    s.sql += param(s.params, std::to_string(orderId)) + "::bigint";
+    s.sql += " LIMIT 1";
+    return s;
+}
+
 Statement pageStatement(const PageRequest &r)
 {
+    if (Kind::TRAIL == r.kind)
+    {
+        return trailStatement(r);
+    }
     Statement s;
     const bool orders = Kind::ORDERS == r.kind;
     s.sql = std::string("SELECT ") + (orders ? ORDER_COLUMNS : FILL_COLUMNS) + " FROM " +
@@ -265,12 +319,12 @@ CursorError decodeCursor(std::string_view text, Kind kind, const Filter &filter,
     }
     const std::vector<std::string_view> parts = split(*raw, '|');
     const std::string_view tag = parts.front();
-    if (tag != "o1" && tag != "f1")
+    if (tag != "o1" && tag != "f1" && tag != "t1")
     {
         return CursorError::MALFORMED;
     }
-    const Kind of = "o1" == tag ? Kind::ORDERS : Kind::FILLS;
-    if (parts.size() != (Kind::ORDERS == of ? 4u : 5u) || 16 != parts[1].size())
+    const Kind of = "o1" == tag ? Kind::ORDERS : "f1" == tag ? Kind::FILLS : Kind::TRAIL;
+    if (parts.size() != (Kind::FILLS == of ? 5u : 4u) || 16 != parts[1].size())
     {
         return CursorError::MALFORMED;
     }
@@ -389,6 +443,47 @@ bool fillJson(const Row &row, std::string &json, Key &key, std::string &problem)
     json += ",\"executedAt\":" + std::to_string(executedAt);
     json += "}";
     key = Key{ executedAt, tradeId, orderId };
+    return true;
+}
+
+bool trailJson(const Row &row, std::string &json, Key &key, std::string &problem)
+{
+    Reader r{ row, problem };
+    const std::int64_t orderId = r.number(0, "order_id");
+    const std::int64_t eventSeq = r.number(1, "event_seq");
+    const std::string event = r.text(2, "event");
+    const std::string status = r.text(3, "status");
+    const std::int64_t coreLogPosition = r.number(4, "core_log_position");
+    const std::int64_t meEpoch = r.number(5, "me_epoch");
+    const std::int64_t meLogPosition = r.number(6, "me_log_position");
+    const std::int64_t meJournalSeq = r.number(7, "me_journal_seq");
+    const std::string liquidity = r.text(8, "liquidity");
+    const std::int64_t tradeId = r.number(9, "trade_id");
+    const std::int64_t lastPrice = r.number(10, "last_price");
+    const std::int64_t lastQty = r.number(11, "last_qty");
+    const std::int64_t holdRemaining = r.number(12, "hold_remaining");
+    const std::int64_t at = r.number(13, "at_ms");
+    if (!problem.empty())
+    {
+        problem += " (row order_id " + r.raw(0) + ", event_seq " + r.raw(1) + ")";
+        return false;
+    }
+    json = "{\"eventSeq\":" + std::to_string(eventSeq);
+    json += ",\"event\":" + api::quote(event);
+    json += ",\"status\":" + api::quote(status);
+    json += ",\"coreLogPosition\":" + std::to_string(coreLogPosition);
+    json += ",\"me\":" + (0 == meEpoch ? std::string("null")
+                                         : "{\"epoch\":" + id(meEpoch) + ",\"logPosition\":" + std::to_string(meLogPosition) +
+                                             ",\"journalSeq\":" + std::to_string(meJournalSeq) + "}");
+    json += ",\"liquidity\":" + ("NONE" == liquidity ? std::string("null") : api::quote(liquidity));
+    const bool trade = 0 != tradeId;
+    json += ",\"tradeId\":" + (trade ? id(tradeId) : std::string("null"));
+    json += ",\"lastPrice\":" + (trade ? money(lastPrice) : std::string("null"));
+    json += ",\"lastQty\":" + (trade ? money(lastQty) : std::string("null"));
+    json += ",\"holdRemaining\":" + money(holdRemaining);
+    json += ",\"at\":" + std::to_string(at);
+    json += "}";
+    key = Key{ eventSeq, orderId, 0 };
     return true;
 }
 

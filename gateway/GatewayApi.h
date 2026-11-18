@@ -198,7 +198,9 @@ private:
     void moneyCommand(const Ex &ex, bool deposit);
     void ordersHistory(const Ex &ex);
     void fills(const Ex &ex);
-    void historyPage(const Ex &ex, history::Kind kind);
+    void orderTrail(const Ex &ex, std::int64_t orderId);
+    // orders, fills, or the trail of `orderId` (GET /orders/{orderId}/trail: the caller's own order only)
+    void historyPage(const Ex &ex, history::Kind kind, std::int64_t orderId = 0);
     void orderFromHistory(const Ex &ex, std::int64_t userId, std::int64_t orderId);
     // Runs `job` on the history pool with the read's one deadline (steady clock ns, stamped now:
     // GATEWAY_PG_STATEMENT_TIMEOUT_MS); false (and 503 HISTORY_BUSY answered) when its queue is full. A job that

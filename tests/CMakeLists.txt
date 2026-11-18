@@ -303,7 +303,8 @@ target_compile_options(gw_pg_tests PRIVATE ${GW_WARNINGS})
 # The history read layer against the same container, seeded from the read contract's reference DDL
 # (sql/history_read_contract_v1.sql): the keyset walk under concurrent inserts, the routes over the real users and
 # history stores, pool exhaustion while login answers, and the causes of 503 HISTORY_UNAVAILABLE.
-set(GW_HISTORY_CONTRACT_DEFINITION GW_HISTORY_CONTRACT_SQL="${PROJECT_SOURCE_DIR}/sql/history_read_contract_v1.sql")
+set(GW_HISTORY_CONTRACT_DEFINITION GW_HISTORY_CONTRACT_SQL="${PROJECT_SOURCE_DIR}/sql/history_read_contract_v1.sql"
+    GW_HISTORY_PROJECTION_SQL="${PROJECT_SOURCE_DIR}/sql/history_projection_v1.sql")
 add_executable(gw_pg_history_tests unit/TestMain.cpp pg/HistoryPgTest.cpp)
 target_include_directories(gw_pg_history_tests PRIVATE unit pg)
 target_compile_definitions(gw_pg_history_tests PRIVATE ${GW_HISTORY_CONTRACT_DEFINITION})
@@ -316,17 +317,20 @@ target_include_directories(gw_pg_nc_offset_paging PRIVATE unit pg)
 target_compile_definitions(gw_pg_nc_offset_paging PRIVATE ${GW_HISTORY_CONTRACT_DEFINITION} GW_NC_OFFSET_PAGING)
 target_link_libraries(gw_pg_nc_offset_paging PRIVATE oe_gateway_app gw_common)
 target_compile_options(gw_pg_nc_offset_paging PRIVATE ${GW_WARNINGS})
-# Controls for the freshness rows of the history read (stale label, epoch check, health probe, read order): the test
-# built with one rule off in the source named (test-only defines, never in a binary); the case must fail with the text.
+# Controls for the freshness rows of the history read (stale label, epoch check, health probe, read order) and the
+# trail's owner filter: the test built with one rule off in the source named (test-only defines, never in a binary);
+# the case must fail with the text.
 #   GW_NC_NO_STALE_LABEL          asOf carries no stale field
 #   GW_NC_NO_EPOCH_CHECK          the heartbeat's epoch is not compared with the gateway's last CoreConfigReport
 #   GW_NC_NO_HISTORY_PROBE        no probe: /health shows what the last successful read found
 #   GW_NC_ROWS_BEFORE_HEARTBEAT   a page reads its rows first and the heartbeat after them
+#   GW_NC_TRAIL_NO_OWNER          the trail statements have no owner filter (user_id)
 set(GW_HISTORY_PG_CONTROLS
     "GW_NC_NO_STALE_LABEL|gateway/GatewayRoutes.cpp|history_stale_label|stale label missing"
     "GW_NC_NO_EPOCH_CHECK|common/src/PgHistoryStore.cpp|history_epoch_check|history of another genesis served"
     "GW_NC_NO_HISTORY_PROBE|gateway/GatewayRoutes.cpp|history_health_probe|health shows fresh history without a probe"
-    "GW_NC_ROWS_BEFORE_HEARTBEAT|common/src/PgHistoryStore.cpp|history_read_order_under_concurrent_apply|asOf.eventSeq claims rows the page lacks")
+    "GW_NC_ROWS_BEFORE_HEARTBEAT|common/src/PgHistoryStore.cpp|history_read_order_under_concurrent_apply|asOf.eventSeq claims rows the page lacks"
+    "GW_NC_TRAIL_NO_OWNER|common/src/History.cpp|history_order_trail|trail of another user's order")
 set(GW_HISTORY_PG_CONTROL_TESTS "")
 foreach(entry IN LISTS GW_HISTORY_PG_CONTROLS)
     string(REPLACE "|" ";" parts "${entry}")
@@ -450,7 +454,7 @@ foreach(entry IN LISTS GW_PROJECTOR_PG_CONTROLS)
 endforeach()
 if(GW_PG_TESTS)
     foreach(case apply_story fk_order_first_records crash_points overlap_compare dense_apply one_mapping_from_postgres
-            read_contract_compat reference_equivalence beat_rule rebuild_reads)
+            read_contract_compat reference_equivalence beat_rule rebuild_reads reader_role_prepared)
         add_test(NAME pg.projector.${case} COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/pg/pg_it.py"
             --binary "$<TARGET_FILE:gw_projector_pg_tests>" --image "${GW_PG_TEST_IMAGE}" ${case})
         set_tests_properties(pg.projector.${case} PROPERTIES TIMEOUT 300 LABELS "pg;projector" RUN_SERIAL TRUE)

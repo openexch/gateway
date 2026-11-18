@@ -18,8 +18,13 @@
 //   POST   /api/v2/balances/deposit, /withdraw   the treasury lane: 404 FEATURE_DISABLED when it is off
 //   GET    /api/v2/orders/history?limit&cursor&marketId&status   the caller's orders in history, newest first
 //   GET    /api/v2/fills?limit&cursor&marketId&orderId           the caller's fills in history, newest first
-//          200 {items, nextCursor, asOf:{ageMs}}; keyset pages (History.h), limit GATEWAY_HISTORY_LIMIT_DEFAULT, above
-//          GATEWAY_HISTORY_LIMIT_MAX 400; a cursor of another route or filter, or a malformed one, 400 VALIDATION
+//   GET    /api/v2/orders/{orderId}/trail?limit&cursor           the caller's own order, one item per journal record,
+//                                          oldest first by eventSeq: 200 {orderId, items, nextCursor, asOf}; unknown
+//                                          and another user's order one 404 NOT_FOUND; above applied_order_id with no
+//                                          row the 503 of GET /orders/{orderId} (not projected yet)
+//          200 {items, nextCursor, asOf:{ageMs, stale, eventSeq}}; keyset pages (History.h), limit
+//          GATEWAY_HISTORY_LIMIT_DEFAULT, above GATEWAY_HISTORY_LIMIT_MAX 400; a cursor of another route, order or
+//          filter, or a malformed one, 400 VALIDATION
 //
 // History reads run on the history pool (gw-pg-hist, GATEWAY_PG_HISTORY_POOL connections of their own over a queue of
 // GATEWAY_PG_QUEUE): a full queue is 503 HISTORY_BUSY (Retry-After GATEWAY_HISTORY_BUSY_RETRY_AFTER_MS). One read has
@@ -1301,13 +1306,15 @@ bool GatewayApi::runHistory(const Ex &ex, const char *route, const char *query,
     return false;
 }
 
-void GatewayApi::historyPage(const Ex &ex, history::Kind kind)
+void GatewayApi::historyPage(const Ex &ex, history::Kind kind, std::int64_t orderId)
 {
     const bool orders = history::Kind::ORDERS == kind;
-    const char *route = orders ? "orders_history" : "fills";
-    const char *query = orders ? "orders" : "fills";
+    const bool trail = history::Kind::TRAIL == kind;
+    const char *route = orders ? "orders_history" : trail ? "orders_trail" : "fills";
+    const char *query = orders ? "orders" : trail ? "trail" : "fills";
     ApiResponse bad;
     const bool known = orders ? api::readQuery(*ex, { "limit", "cursor", "marketId", "status" }, bad)
+        : trail               ? api::readQuery(*ex, { "limit", "cursor" }, bad)
                               : api::readQuery(*ex, { "limit", "cursor", "marketId", "orderId" }, bad);
     if (!known)
     {
@@ -1355,6 +1362,10 @@ void GatewayApi::historyPage(const Ex &ex, history::Kind kind)
     {
         request.filter.orderId = f.idOf("orderId", *v);
     }
+    if (trail)
+    {
+        request.filter.orderId = orderId; // from the path; the cursor is bound to it
+    }
     if (!f.ok())
     {
         finish(ex, route, f.bad());
@@ -1375,8 +1386,9 @@ void GatewayApi::historyPage(const Ex &ex, history::Kind kind)
                 finish(ex, route, validation("invalid cursor", "the cursor belongs to another route"));
                 return;
             case history::CursorError::OTHER_FILTER:
-                finish(ex, route, validation("invalid cursor",
-                    "the cursor was issued for another filter: keep marketId, status and orderId as on the first page"));
+                finish(ex, route, validation("invalid cursor", trail
+                        ? "the cursor was issued for another order"
+                        : "the cursor was issued for another filter: keep marketId, status and orderId as on the first page"));
                 return;
         }
     }
@@ -1395,16 +1407,26 @@ void GatewayApi::historyPage(const Ex &ex, history::Kind kind)
         runHistory(ex, route, query, [this, ex, route, query, request, expect](int worker, std::int64_t deadlineNs) {
             HistoryPage page;
             const HistoryAnswer a = m_deps.history->page(worker, request, page, deadlineNs, expect);
+            if (HistoryStatus::NOT_FOUND == a.status && history::Kind::TRAIL == request.kind)
+            {
+                // the caller has no such order: unknown and another user's order get this one answer
+                countHistory(query, "not_found");
+                finish(ex, route, api::error(404, api::code::NOT_FOUND, "not found"));
+                return;
+            }
             if (HistoryStatus::OK != a.status)
             {
-                finish(ex, route, historyUnavailable(a.cause, query));
+                finish(ex, route, historyUnavailable(HistoryStatus::NOT_FOUND == a.status ? HistoryCause::ERROR : a.cause,
+                    query));
                 return;
             }
             countHistory(query, "ok");
 #ifdef GW_NC_NO_HISTORY_PROBE
             noteHistory(HistoryCause::NONE, page.ageMs, page.eventSeq); // test build only: a read stands in for the probe
 #endif
-            std::string out = "{\"items\":[";
+            std::string out = history::Kind::TRAIL == request.kind
+                ? "{\"orderId\":" + api::quote(std::to_string(request.filter.orderId)) + ",\"items\":["
+                : std::string("{\"items\":[");
             for (std::size_t i = 0; i < page.items.size(); ++i)
             {
                 out += (0 == i ? "" : ",") + page.items[i];
@@ -1467,6 +1489,11 @@ void GatewayApi::ordersHistory(const Ex &ex)
 void GatewayApi::fills(const Ex &ex)
 {
     historyPage(ex, history::Kind::FILLS);
+}
+
+void GatewayApi::orderTrail(const Ex &ex, std::int64_t orderId)
+{
+    historyPage(ex, history::Kind::TRAIL, orderId);
 }
 
 // ---------------------------------------------------------------- balances and the treasury lane

@@ -14,8 +14,8 @@
 //   one_mapping_from_postgres    the history JSON of each projected order and fill equals the stream's JSON of its last
 //                                event (fills: maker is null live)
 //   read_contract_compat         the gateway's history store (PgHistoryStore) over the projected views: orders page, one
-//                                order, fills page, LAGGING, no heartbeat; the views have the read contract's columns
-//                                and types (sql/history_read_contract_v1.sql)
+//                                order, fills page, LAGGING, no heartbeat; the views (the trail too) have the read
+//                                contract's columns and types (sql/history_read_contract_v1.sql)
 //   reference_equivalence        the same logical rows in the reference tables and as projected records render the same
 //                                JSON for every case
 //   beat_rule                    the beat statement against what the transaction committed: a probe whose head is
@@ -24,6 +24,8 @@
 //   rebuild_reads                the gateway's store reading during an in-place rebuild and the re-projection after it:
 //                                503 cause heartbeat from the truncate until the first beat, never a page, never 404 for
 //                                an order that existed; complete pages after the beat
+//   reader_role_prepared         the schema applied by an owner without CREATEROLE: the reader role absent, a refusal
+//                                naming it; created beforehand, the apply succeeds with the four grants
 // The control builds (tests/CMakeLists.txt) switch one rule off each and must fail with the named text.
 #include <unistd.h>
 
@@ -900,7 +902,7 @@ TEST(read_contract_compat)
     // the views against the reference DDL: names and types
     const std::string ref = gwtest::freshDatabase("pj_compat_ref");
     gwtest::sql(ref, readFile(GW_HISTORY_CONTRACT_SQL));
-    for (const char *relation : { "gateway_order_history_v1", "gateway_fills_v1" })
+    for (const char *relation : { "gateway_order_history_v1", "gateway_fills_v1", "gateway_order_trail_v1" })
     {
         const std::string mine = shapeOf(url, relation);
         const std::string theirs = shapeOf(ref, relation);
@@ -1345,4 +1347,59 @@ TEST(rebuild_reads)
             "with rows and " + std::to_string(notFound) + " with 404 between the truncate and the first beat");
     }
     CHECK_MSG(0 == incompleteAfter, std::to_string(incompleteAfter) + " reads after the beat were not complete");
+}
+
+// The schema applied by an owner role without CREATEROLE: with oe_history_reader absent the apply fails and names the
+// role; with the role created beforehand by an administrator it succeeds and grants exactly the four read relations.
+TEST(reader_role_prepared)
+{
+    const std::string admin = gwtest::env("GW_TEST_PG_ADMIN_URL");
+    CHECK_MSG(gwtest::sql(admin, "SELECT count(*) FROM pg_roles WHERE rolname = 'oe_history_reader'") == "0",
+        "oe_history_reader exists before the case: the case needs a server of its own");
+    gwtest::sql(admin, "CREATE ROLE pj_owner LOGIN PASSWORD 'pj-owner' NOCREATEROLE NOSUPERUSER");
+    auto ownedBy = [&](const std::string &name) {
+        const std::string url = gwtest::freshDatabase(name);
+        gwtest::sql(admin, "ALTER DATABASE " + name + " OWNER TO pj_owner");
+        return "postgresql://pj_owner:pj-owner" + url.substr(url.find('@'));
+    };
+    auto apply = [&](const std::string &url, std::string &detail) {
+        PgConn conn;
+        PgOptions o;
+        o.url = url;
+        o.statementTimeoutMs = T;
+        std::string error;
+        if (!connectProjection(conn, o, error))
+        {
+            detail = "connect: " + error;
+            return SchemaVerdict::FAILED;
+        }
+        return migrate(conn, T, detail);
+    };
+    {
+        std::string detail;
+        const SchemaVerdict v = apply(ownedBy("pj_role_absent"), detail);
+        // a refusal (the process exits; no retry loop), not a transient failure
+        CHECK_MSG(SchemaVerdict::FOREIGN == v, "the apply without CREATEROLE and without the role: " + detail);
+        CHECK_MSG(std::string::npos != detail.find("oe_history_reader") &&
+            std::string::npos != detail.find("CREATEROLE"), "the refusal does not name the role: " + detail);
+        CHECK(gwtest::sql(admin, "SELECT count(*) FROM pg_roles WHERE rolname = 'oe_history_reader'") == "0");
+        std::printf("  refused: %s\n", detail.c_str());
+    }
+    gwtest::sql(admin, "CREATE ROLE oe_history_reader NOLOGIN");
+    const std::string url = ownedBy("pj_role_prepared");
+    std::string detail;
+    const SchemaVerdict v = apply(url, detail);
+    CHECK_MSG(SchemaVerdict::APPLIED == v, "the apply with the role created beforehand: " + detail);
+    const std::string base = gwtest::env("GW_TEST_PG_URL");
+    const std::string superUrl = base.substr(0, base.rfind('/') + 1) + "pj_role_prepared";
+    const std::string select = gwtest::sql(superUrl, "SELECT coalesce(string_agg(c.relname, ',' ORDER BY c.relname), "
+        "'') FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND "
+        "has_table_privilege('oe_history_reader', c.oid, 'SELECT')");
+    CHECK_MSG(select == "gateway_fills_v1,gateway_history_heartbeat_v1,gateway_order_history_v1,gateway_order_trail_v1",
+        "the reader can SELECT: " + select);
+    const std::string other = gwtest::sql(superUrl, "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = "
+        "c.relnamespace WHERE n.nspname = 'public' AND (has_table_privilege('oe_history_reader', c.oid, 'INSERT') OR "
+        "has_table_privilege('oe_history_reader', c.oid, 'UPDATE') OR has_table_privilege('oe_history_reader', c.oid, "
+        "'DELETE') OR has_table_privilege('oe_history_reader', c.oid, 'TRUNCATE'))");
+    CHECK_MSG(other == "0", "the reader can write " + other + " relations");
 }

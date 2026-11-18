@@ -62,7 +62,8 @@ HUNG_BOUND_S = (max(LEASE_MS, HUNG_IDLE_IN_TX_MS) + LEASE_MS + POLL_MS + PG_RETR
 HOLD_MS = LEASE_MS - LEASE_MS // 3
 REBUILD_LOCK_TIMEOUT_MS = 200
 DRIVER_TIMEOUT_MS = 3000
-CONTRACT_RELATIONS = ["gateway_order_history_v1", "gateway_fills_v1", "gateway_history_heartbeat_v1"]
+CONTRACT_RELATIONS = ["gateway_order_history_v1", "gateway_fills_v1", "gateway_history_heartbeat_v1",
+                      "gateway_order_trail_v1"]
 
 
 class Failure(Exception):

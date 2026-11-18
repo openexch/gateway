@@ -252,6 +252,7 @@ Base path `/api/v2`. Any other path (the old `/api/v1` included) is 404 `NOT_FOU
 | POST | `/orders/cancel` | yes | not read | ids + 1, at most one full bucket |
 | GET | `/orders/history` | yes | | 1 |
 | GET | `/fills` | yes | | 1 |
+| GET | `/orders/{orderId}/trail` | yes | | 1 |
 | GET | `/balances` | yes | | 1 (0 from the read cache) |
 | POST | `/balances/deposit` | yes | required | 1 + 1 faucet token |
 | POST | `/balances/withdraw` | yes | required | 1 + 1 faucet token |
@@ -554,7 +555,7 @@ not both`, `must be a non-empty array of order ids`, `must hold decimal strings`
 
 ### 4.6 History
 
-`GET /api/v2/orders/history`, `GET /api/v2/fills` and the not-open case of `GET /api/v2/orders/{orderId}` read the
+`GET /api/v2/orders/history`, `GET /api/v2/fills` , `GET /api/v2/orders/{orderId}/trail` and the not-open case of `GET /api/v2/orders/{orderId}` read the
 history projection, a PostgreSQL read model written by a separate projector. They are served when `GATEWAY_PG_URL` is
 set and the projection's relations exist; otherwise they answer 503 `HISTORY_UNAVAILABLE`. No order or balance route
 touches PostgreSQL.
@@ -594,6 +595,32 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMDA3IiwiZXhwIjoxNzYzMzgwM
 | 503 | `HISTORY_BUSY` | `too many history reads at once` (queue `GATEWAY_PG_QUEUE` 64 full, or the read waited past its deadline) | `GATEWAY_HISTORY_BUSY_RETRY_AFTER_MS` (1000) |
 | 503 | `HISTORY_UNAVAILABLE` | `history is not available` (no URL, no relations, no heartbeat, unreachable, timeout, another core genesis, older than `GATEWAY_HISTORY_MAX_AGE_MS` when set) | `GATEWAY_HISTORY_RETRY_AFTER_MS` (60000) |
 | 503 | `HISTORY_UNAVAILABLE` | same text, for an order not projected yet | `GATEWAY_HISTORY_LAG_RETRY_AFTER_MS` (1000) |
+
+#### GET /api/v2/orders/{orderId}/trail
+
+Every record the core journalled for one of the caller's orders, oldest first, ordered by `eventSeq` only (a log
+position is not unique: the fills of one trade batch share one). Query: `limit`, `cursor` (keyset, as above; a cursor
+of another order or route is 400). Answer `{orderId, items, nextCursor, asOf}`; each item:
+
+| Field | Meaning |
+|---|---|
+| `eventSeq` | the core's event sequence (integer) |
+| `event`, `status` | the record's kind (`ACCEPTED`, `DISPATCHED`, `ACK_NEW`, `FILL`, `CANCELLED`, ...) and the order's status after it |
+| `coreLogPosition` | core log position of the entry that applied it (integer) |
+| `me` | `{epoch, logPosition, journalSeq}` of the matching-engine record that caused it (`epoch` a string, the others integers), or null |
+| `liquidity` | `TAKER`, `MAKER` or null |
+| `tradeId`, `lastPrice`, `lastQty` | the trade, or null when the record has none |
+| `holdRemaining`, `at` | the hold left after the record; core cluster time (ms) |
+
+Stages: core accepted with its hold = `ACCEPTED`; forwarded to the matching engine = the `coreLogPosition` of
+`ACCEPTED` for a new order (the core forwards it in the same entry; a stop order is forwarded when it triggers),
+`DISPATCHED` for an amend or a cancel the core sends on its own; booked = `ACK_NEW` (`me`); matched = `FILL` (`me`);
+settled by the core = that `FILL`'s `coreLogPosition`. "Accepted by the gateway" has no log position: keep your own
+time for it.
+
+Refusals: an unknown order and another user's order are the same 404 `NOT_FOUND`; an id above the projection's
+`applied_order_id` with no row is 503 `HISTORY_UNAVAILABLE` with `GATEWAY_HISTORY_LAG_RETRY_AFTER_MS` (1000); every
+other 400 and 503 of this section applies; a method other than GET is 405.
 
 ### 4.7 Balances
 
@@ -871,7 +898,7 @@ of `config`, `storage` and `treasuryLane`. Secrets in `settings` are redacted.
 
 Prometheus text, prefix `gateway_` or `stream_`. Among them: `requests_total{route,code}`, `principal_rate_limited_total`,
 `read_cache_hits_total`, `cancel_reoffered_not_open_total`, `outcome_unknown_total`, `reoffers_total`,
-`late_replies_total`, `history_reads_total{query,result,cause}` (causes add `epoch`, `stale`), `history_age_ms`, `user_id_conflict_total`, `inflight`, `ready`,
+`late_replies_total`, `history_reads_total{query,result,cause}` (query adds `trail`; causes add `epoch`, `stale`), `history_age_ms`, `user_id_conflict_total`, `inflight`, `ready`,
 `ready_condition{name}`; for the stream `resync_total{reason}`, `ws_closed_total{code}`, `ws_closed_at_bound_total`,
 `ws_queue_high_water`, `watermark`, `window_first_seq`, `users_cached`.
 

@@ -145,9 +145,12 @@ Bulk cancel takes one principal token per order id plus one, never more than one
 `Retry-After` and resend, nothing was sent. `all:true` is charged one token for the read, then at most
 `burst - 1` for the cancels.
 
-History. The three history reads come from the history projection's relations, defined in
-`sql/history_read_contract_v1.sql`; the projection owns them and the gateway's role needs SELECT on those three
-relations only. They are read when `GATEWAY_PG_URL` is set, on `GATEWAY_PG_HISTORY_POOL` read-only connections of
+History. The four history reads come from the history projection's relations, defined in
+`sql/history_read_contract_v1.sql`; the projection owns them and the gateway's role needs SELECT on those four
+relations only. `sql/history_projection_v1.sql` grants them to the role `oe_history_reader`: make the gateway's login
+role a member (`GRANT oe_history_reader TO <gateway role>`). The schema creates that role when the projector's role
+has CREATEROLE; otherwise create it first (`CREATE ROLE oe_history_reader NOLOGIN`), or the projector refuses to start
+and names the role. They are read when `GATEWAY_PG_URL` is set, on `GATEWAY_PG_HISTORY_POOL` read-only connections of
 their own with their own queue (sized by `GATEWAY_PG_QUEUE`), so a history storm never takes a connection from login.
 No order-path request touches PostgreSQL.
 
@@ -160,6 +163,9 @@ No order-path request touches PostgreSQL.
 - `GET /orders/{orderId}` of an order that is not open answers from history; an unknown order and another user's
   order both answer the same 404. An id above the projection's `applied_order_id` with no row yet answers 503
   HISTORY_UNAVAILABLE with `Retry-After` from `GATEWAY_HISTORY_LAG_RETRY_AFTER_MS` (1000), never 404.
+- `GET /orders/{orderId}/trail` lists every journal record of the caller's own order, oldest first by `eventSeq`
+  (keyset pages, the same limits), with `asOf`. Unknown and another user's order are the same 404; the lag rule above
+  applies.
 - Each read has one deadline, `GATEWAY_PG_STATEMENT_TIMEOUT_MS`, counted from when it is queued. A full queue, or a
   read still queued at its deadline, is 503 HISTORY_BUSY (`Retry-After` from `GATEWAY_HISTORY_BUSY_RETRY_AFTER_MS`,
   1000). No URL, no projection, no heartbeat, an unreachable database or a timeout is 503 HISTORY_UNAVAILABLE
