@@ -16,6 +16,10 @@ resync: every fill of the user exactly once across the stream and /fills.
 
 Control: oe-gateway-nc-no-asof-event-seq (asOf without eventSeq) must fail with "resync fill gap not closable".
 
+Then the trail of the user's first buy order from the same projection (GET /api/v2/orders/{orderId}/trail): its
+records in eventSeq order from ACCEPTED, its four fills in trade order; the seller's order answers the user 404, an id
+far above every order 503 (not projected yet).
+
 usage: fills_it.py --bin-dir <build>/bin --core-jar <core-cluster.jar> --probe-jar <CoreProbe.jar> --image <pg image>
                    --mode embedded|external --work <dir> [--port-base N] [--gateway-binary oe-gateway]
 """
@@ -140,6 +144,36 @@ def anchor_after_resync(ws, kind):
     return None
 
 
+def check_trail(port, order, others):
+    """The trail of `order` (USER's, four fills of trades 1..4) once the projection holds the four fills."""
+    path = f"/api/v2/orders/{order}/trail?limit=100"
+    seen = {}
+
+    def ready():
+        seen["rc"], seen["body"] = get(port, path, USER)
+        items = (seen["body"] or {}).get("items") or []
+        return seen["rc"] == 200 and len([i for i in items if i.get("event") == "FILL"]) >= 4
+    if not fi.wait_for(ready, 20, 0.2):
+        check(False, f"trail of order {order}: {seen.get('rc')} {seen.get('body')}")
+        return
+    items = seen["body"]["items"]
+    seqs = [int(i["eventSeq"]) for i in items]
+    fills = [i for i in items if i["event"] == "FILL"]
+    check(seqs == sorted(seqs) and len(set(seqs)) == len(seqs) and items[0]["event"] == "ACCEPTED" and
+          [f["tradeId"] for f in fills] == ["1", "2", "3", "4"] and all(f["coreLogPosition"] for f in fills) and
+          "eventSeq" in seen["body"]["asOf"] and seen["body"]["orderId"] == str(order),
+          f"trail of order {order}: {[i['event'] for i in items]} at eventSeq {seqs}, fills "
+          f"{[(f['tradeId'], f['coreLogPosition'], f['me']) for f in fills]}", f"{seen['body']}")
+    rc, other = get(port, f"/api/v2/orders/{others}/trail", USER)
+    check(rc == 404 and (other or {}).get("code") == "NOT_FOUND", f"the seller's order is 404 to the user: {rc}",
+          f"{other}")
+    if rc == 200:
+        check(False, "trail of another user's order")
+    rc, lag = get(port, f"/api/v2/orders/{10**15}/trail", USER)
+    check(rc == 503 and (lag or {}).get("code") == "HISTORY_UNAVAILABLE", f"an id above every order is 503: {rc}",
+          f"{lag}")
+
+
 def run(args, cluster, pg, orders, procs):
     import stream_it  # noqa: E402  (the WebSocket client)
     url = pg.fresh("pj_fills")
@@ -235,6 +269,7 @@ def run(args, cluster, pg, orders, procs):
               f"missing {missing} extra {extra} stream duplicates {ws.dup_fills} /fills repeated {repeated}")
     if not closable:
         check(False, "resync fill gap not closable")
+    check_trail(gw_http, buys[0], sells[0])
     loop.close(both)
     loop.close(only)
     bridge.quit()

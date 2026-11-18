@@ -8,7 +8,11 @@
 //   - an absent relation, a projection that never reported, an unreachable server and a statement timeout answer 503
 //     HISTORY_UNAVAILABLE, each cause in the metrics, one public body; the next read reconnects;
 //   - a closed-order lookup above the projection's applied_order_id is 503 (not projected yet), never 404;
-//   - one deadline per read, queue wait included; a connection the server dropped is retried once.
+//   - one deadline per read, queue wait included; a connection the server dropped is retried once;
+//   - over the projection's own schema (sql/history_projection_v1.sql) read as a member of its reader role: an order's
+//     trail (own order, another user's, unknown, lagging, five fills, an order filled inside a 64-trade batch; control:
+//     GW_NC_TRAIL_NO_OWNER must fail with "trail of another user's order"), and the reader role can SELECT exactly the
+//     four read relations and nothing else.
 #include <atomic>
 #include <functional>
 #include <chrono>
@@ -306,7 +310,9 @@ struct HttpRig
         std::atomic_store(&config, std::shared_ptr<const session::CoreConfig>(std::move(c)));
     }
 
-    HttpRig(const std::string &url, int historyWorkers, std::size_t historyQueue, std::int64_t timeoutMs)
+    // `historyUrl`: the history store's own URL (another role), "" for `url`
+    HttpRig(const std::string &url, int historyWorkers, std::size_t historyQueue, std::int64_t timeoutMs,
+        const std::string &historyUrl = "")
     {
         g.common.authModes = auth_mode::DEMO;
         g.common.ioThreads = 4;
@@ -323,7 +329,8 @@ struct HttpRig
         ps.workers = 2;
         ps.statementTimeoutMs = timeoutMs;
         users = std::make_unique<PgUserStore>(ps);
-        history = std::make_unique<PgHistoryStore>(historySettings(url, historyWorkers, timeoutMs));
+        history = std::make_unique<PgHistoryStore>(historySettings(historyUrl.empty() ? url : historyUrl, historyWorkers,
+            timeoutMs));
         storePool = std::make_unique<WorkPool>("t-pg-auth", 2, 64);
         hashPool = std::make_unique<WorkPool>("t-hash", 1, 32);
         historyPool = std::make_unique<WorkPool>("t-pg-hist", historyWorkers, historyQueue);
@@ -1099,4 +1106,291 @@ TEST(history_read_order_under_concurrent_apply)
         CHECK_MSG(false, "asOf.eventSeq claims rows the page lacks: " + std::to_string(lacking) + " pages, first " +
             example);
     }
+}
+
+// ---- the order trail and the reader role, over the projection's own schema
+
+namespace {
+
+constexpr const char *READER = "gw_history_login";      // a login role made a member of oe_history_reader
+constexpr const char *READER_PASSWORD = "reader-secret";
+
+// A fresh database with the projection's schema applied as the server's owner role (it creates oe_history_reader and
+// grants it the read relations), and READER a member of that role; the database URL and the reader's URL.
+std::pair<std::string, std::string> projectionDatabase(const std::string &name)
+{
+    const std::string url = freshDatabase(name);
+    std::ifstream in(GW_HISTORY_PROJECTION_SQL);
+    std::stringstream ddl;
+    ddl << in.rdbuf();
+    CHECK_MSG(!ddl.str().empty(), std::string("cannot read ") + GW_HISTORY_PROJECTION_SQL);
+    sql(url, ddl.str());
+    sql(url, std::string("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '") + READER + "') THEN "
+        "CREATE ROLE " + READER + " LOGIN PASSWORD '" + READER_PASSWORD + "'; END IF; END $$; GRANT oe_history_reader TO " +
+        READER);
+    return { url, "postgresql://" + std::string(READER) + ":" + READER_PASSWORD + url.substr(url.find('@')) };
+}
+
+// One journal record of an order in oe_order_events (the payload is not this test's concern: zero bytes).
+std::string event(std::int64_t seq, std::int64_t order, std::int64_t user, const char *kind, const char *status,
+    std::int64_t logPosition, const char *liquidity = "NONE", std::int64_t meEpoch = 0, std::int64_t meSeq = 0,
+    std::int64_t meLog = 0, std::int64_t trade = 0, std::int64_t qty = 0)
+{
+    return "(" + std::to_string(seq) + ", " + std::to_string(order) + ", " + std::to_string(user) + ", '" + kind + "', '" +
+        status + "', " + std::to_string(logPosition) + ", '" + liquidity + "', " + std::to_string(meEpoch) + ", " +
+        std::to_string(meSeq) + ", " + std::to_string(meLog) + ", " + std::to_string(0 == meEpoch ? 0 : T0 + seq) + ", " +
+        std::to_string(trade) + ", " + std::to_string(0 == trade ? 0 : 10000000000) + ", " + std::to_string(qty) +
+        ", 500000000, " + std::to_string(T0 + seq) + ", decode(repeat('00', 216), 'hex'))";
+}
+
+std::string insertEvents(const std::vector<std::string> &rows)
+{
+    std::string values;
+    for (const std::string &r : rows)
+    {
+        values += (values.empty() ? "" : ", ") + r;
+    }
+    // stored in random order: the trail's order must come from event_seq, not from the heap
+    return "INSERT INTO oe_order_events (journal_seq, order_id, user_id, event, status, core_log_position, liquidity, "
+        "me_epoch, me_journal_seq, me_log_position, me_timestamp_ms, trade_id, last_price, last_qty, hold_remaining, "
+        "at_ms, payload) SELECT * FROM (VALUES " + values + ") v ORDER BY random()";
+}
+
+// Every page of a trail through HTTP (limit per page); the items in order, false when a page is not 200.
+bool walkTrail(HttpRig &rig, const std::vector<std::pair<std::string, std::string>> &h, std::int64_t order, int limit,
+    std::vector<json::object> &items, json::object &lastPage)
+{
+    std::string target = "/api/v2/orders/" + std::to_string(order) + "/trail?limit=" + std::to_string(limit);
+    for (int pages = 0; pages < 100; ++pages)
+    {
+        const HttpResult r = rig.get(target, h);
+        if (200 != r.status)
+        {
+            CHECK_MSG(false, "trail page " + target + ": " + what(r));
+            return false;
+        }
+        lastPage = json::parse(r.body).as_object();
+        CHECK_MSG(lastPage.at("orderId").as_string() == std::to_string(order), r.body);
+        for (const json::value &v : lastPage.at("items").as_array())
+        {
+            items.push_back(v.as_object());
+        }
+        if (lastPage.at("nextCursor").is_null())
+        {
+            return true;
+        }
+        target = "/api/v2/orders/" + std::to_string(order) + "/trail?limit=" + std::to_string(limit) + "&cursor=" +
+            std::string(lastPage.at("nextCursor").as_string());
+    }
+    CHECK_MSG(false, "trail walk did not end");
+    return false;
+}
+
+std::int64_t seqOf(const json::object &item)
+{
+    return item.at("eventSeq").as_int64();
+}
+
+}
+
+TEST(history_order_trail)
+{
+    const auto [url, readerUrl] = projectionDatabase("gw_hist_trail");
+    HttpRig rig(url, 1, 16, 2000, readerUrl); // history read as a member of the reader role only
+    const std::int64_t alice = rig.user("alice", "secret-alice");
+    const std::int64_t bob = rig.user("bob", "secret-bob");
+    std::vector<std::string> rows;
+    std::int64_t q = 0;
+    // order 1 (alice): accepted with its hold, forwarded, booked, five fills
+    rows.push_back(event(++q, 1, alice, "ACCEPTED", "NEW", 1000));
+    rows.push_back(event(++q, 1, alice, "DISPATCHED", "NEW", 1100));
+    rows.push_back(event(++q, 1, alice, "ACK_NEW", "NEW", 1200, "NONE", 5, 7, 70000));
+    rows.push_back(event(++q, 2, bob, "ACCEPTED", "NEW", 1250)); // order 2: bob's
+    for (int k = 0; k < 5; ++k)
+    {
+        rows.push_back(event(++q, 1, alice, "FILL", 4 == k ? "FILLED" : "PARTIALLY_FILLED", 1300 + k,
+            0 == k % 2 ? "TAKER" : "MAKER", 5, 8 + k, 70100 + 10 * k, 11 + k, 20000000));
+    }
+    // order 3 (alice) filled inside one 64-trade batch against bob's makers 100..163: one core log position for all
+    // 128 FILL records
+    rows.push_back(event(++q, 3, alice, "ACCEPTED", "NEW", 2000));
+    rows.push_back(event(++q, 3, alice, "DISPATCHED", "NEW", 2100));
+    for (int k = 0; k < 64; ++k)
+    {
+        rows.push_back(event(++q, 100 + k, bob, "ACCEPTED", "NEW", 2200 + k));
+    }
+    for (int k = 0; k < 64; ++k)
+    {
+        rows.push_back(event(++q, 3, alice, "FILL", 63 == k ? "FILLED" : "PARTIALLY_FILLED", 900000, "TAKER", 5, 100 + k,
+            80000, 1000 + k, 1000000));
+        rows.push_back(event(++q, 100 + k, bob, "FILL", "FILLED", 900000, "MAKER", 5, 100 + k, 80000, 1000 + k, 1000000));
+    }
+    sql(url, insertEvents(rows));
+    sql(url, "UPDATE oe_projection_state SET epoch = " + std::to_string(GENESIS) + ", applied_seq = " + std::to_string(q) +
+        ", applied_order_id = 163, beat_at = clock_timestamp()");
+    const auto a = rig.bearer("alice", "secret-alice");
+    const auto b = rig.bearer("bob", "secret-bob");
+
+    // own order with five fills: every record in event_seq order, with its positions and me_epoch
+    std::vector<json::object> items;
+    json::object page;
+    CHECK(walkTrail(rig, a, 1, 100, items, page));
+    const std::vector<std::string> kinds = { "ACCEPTED", "DISPATCHED", "ACK_NEW", "FILL", "FILL", "FILL", "FILL", "FILL" };
+    CHECK_MSG(items.size() == kinds.size(), std::to_string(items.size()) + " items");
+    for (std::size_t i = 0; i < std::min(items.size(), kinds.size()); ++i)
+    {
+        CHECK_MSG(items[i].at("event").as_string() == kinds[i], json::serialize(items[i]));
+        CHECK(i == 0 || seqOf(items[i]) > seqOf(items[i - 1]));
+        CHECK(items[i].contains("coreLogPosition") && items[i].contains("holdRemaining") && items[i].contains("at"));
+    }
+    if (items.size() == kinds.size())
+    {
+        CHECK_MSG(items[0].at("me").is_null() && items[0].at("tradeId").is_null() && items[0].at("liquidity").is_null(),
+            json::serialize(items[0]));
+        CHECK_MSG(items[2].at("me").as_object().at("epoch").as_string() == "5" &&
+            items[2].at("me").as_object().at("logPosition").as_int64() == 70000 &&
+            items[2].at("me").as_object().at("journalSeq").is_int64(), json::serialize(items[2]));
+        for (int k = 0; k < 5; ++k)
+        {
+            const json::object &f = items[3 + static_cast<std::size_t>(k)];
+            CHECK_MSG(f.at("tradeId").as_string() == std::to_string(11 + k) && f.at("lastQty").as_string() == "0.2" &&
+                f.at("lastPrice").as_string() == "100" && f.at("coreLogPosition").as_int64() == 1300 + k &&
+                f.at("me").as_object().at("epoch").as_string() == "5" &&
+                f.at("me").as_object().at("logPosition").as_int64() == 70100 + 10 * k &&
+                f.at("liquidity").as_string() == (0 == k % 2 ? "TAKER" : "MAKER"), json::serialize(f));
+        }
+        CHECK(items[7].at("status").as_string() == "FILLED");
+    }
+    const json::object asOf = page.at("asOf").as_object();
+    CHECK_MSG(asOf.at("eventSeq").as_int64() == q && !asOf.at("stale").as_bool() && asOf.at("ageMs").as_int64() >= 0,
+        json::serialize(asOf));
+
+    // another user's order and an unknown one (at or below applied_order_id): one 404, the same body
+    const HttpResult other = rig.get("/api/v2/orders/2/trail", a);
+    const HttpResult unknown = rig.get("/api/v2/orders/50/trail", a);
+    if (200 == other.status)
+    {
+        CHECK_MSG(false, "trail of another user's order: " + other.body);
+    }
+    CHECK_MSG(404 == other.status && "NOT_FOUND" == codeOf(other), what(other));
+    CHECK_MSG(404 == unknown.status && unknown.body == other.body, what(unknown) + " | " + what(other));
+    // the owner reads it
+    {
+        std::vector<json::object> own;
+        CHECK(walkTrail(rig, b, 2, 10, own, page) && 1 == own.size());
+    }
+    // lagging: above applied_order_id with no row is 503 with the short Retry-After, never 404
+    HttpResult r = rig.get("/api/v2/orders/500/trail", a);
+    CHECK_MSG(503 == r.status && "HISTORY_UNAVAILABLE" == codeOf(r) && r.headers["retry-after"] == "1", what(r));
+
+    // an order filled inside a 64-trade batch, walked in pages of 10: 66 records, event_seq order, one core log
+    // position for its 64 fills, trades in order
+    items.clear();
+    CHECK(walkTrail(rig, a, 3, 10, items, page));
+    CHECK_MSG(66 == items.size(), std::to_string(items.size()) + " items");
+    int fills = 0;
+    for (std::size_t i = 0; i < items.size(); ++i)
+    {
+        CHECK(i == 0 || seqOf(items[i]) > seqOf(items[i - 1]));
+        if (items[i].at("event").as_string() == "FILL")
+        {
+            CHECK_MSG(items[i].at("coreLogPosition").as_int64() == 900000 &&
+                items[i].at("tradeId").as_string() == std::to_string(1000 + fills) &&
+                items[i].at("liquidity").as_string() == "TAKER", json::serialize(items[i]));
+            fills++;
+        }
+    }
+    CHECK_MSG(64 == fills, std::to_string(fills) + " fills");
+    // a maker of that batch: its owner sees ACCEPTED and its one fill; alice gets the 404
+    {
+        std::vector<json::object> maker;
+        CHECK(walkTrail(rig, b, 140, 10, maker, page) && 2 == maker.size() &&
+            maker.back().at("liquidity").as_string() == "MAKER");
+        const HttpResult m = rig.get("/api/v2/orders/140/trail", a);
+        if (200 == m.status)
+        {
+            CHECK_MSG(false, "trail of another user's order: " + m.body);
+        }
+        CHECK_MSG(404 == m.status && m.body == other.body, what(m));
+    }
+
+    // refusals of the request itself
+    r = rig.get("/api/v2/orders/3/trail?limit=100000", a);
+    CHECK_MSG(400 == r.status, what(r));
+    {
+        const HttpResult first = rig.get("/api/v2/orders/3/trail?limit=10", a);
+        const std::string cursor(json::parse(first.body).as_object().at("nextCursor").as_string());
+        r = rig.get("/api/v2/orders/1/trail?cursor=" + cursor, a); // a cursor of another order
+        CHECK_MSG(400 == r.status && "VALIDATION" == codeOf(r), what(r));
+        r = rig.get("/api/v2/orders/history?cursor=" + cursor, a); // of another route
+        CHECK_MSG(400 == r.status, what(r));
+    }
+    r = rig.get("/api/v2/orders/1/trail?marketId=1", a);
+    CHECK_MSG(400 == r.status, what(r));
+    r = httpCall(rig.port, "DELETE", "/api/v2/orders/1/trail", "", a);
+    CHECK_MSG(405 == r.status && r.headers["allow"] == "GET", what(r));
+    r = rig.get("/api/v2/orders/0/trail", a);
+    CHECK_MSG(400 == r.status, what(r));
+
+    // the freshness rules of the other history routes: stale label, another genesis
+    sql(url, "UPDATE oe_projection_state SET beat_at = clock_timestamp() - interval '10 minutes'");
+    r = rig.get("/api/v2/orders/1/trail", a);
+    CHECK_MSG(200 == r.status && json::parse(r.body).as_object().at("asOf").as_object().at("stale").as_bool(), what(r));
+    rig.setGenesis(GENESIS + 1);
+    r = rig.get("/api/v2/orders/1/trail", a);
+    CHECK_MSG(503 == r.status && "HISTORY_UNAVAILABLE" == codeOf(r), what(r));
+    rig.setGenesis(GENESIS);
+
+    const std::string m = rig.api->metrics("gw_");
+    for (const char *line : { "history_reads_total{query=\"trail\",result=\"not_found\",cause=\"none\"} 3",
+             "history_reads_total{query=\"trail\",result=\"unavailable\",cause=\"lagging\"} 1",
+             "history_reads_total{query=\"trail\",result=\"unavailable\",cause=\"epoch\"} 1" })
+    {
+        CHECK_MSG(m.find(line) != std::string::npos, std::string(line) + " not in\n" + m);
+    }
+}
+
+TEST(history_reader_grant)
+{
+    const auto [url, readerUrl] = projectionDatabase("gw_hist_grant");
+    // every relation of the database the reader can do anything with, by privilege
+    auto granted = [&](const char *privilege) {
+        return sql(url, std::string("SELECT coalesce(string_agg(c.relname, ',' ORDER BY c.relname), '') FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') "
+            "AND n.nspname NOT LIKE 'pg_toast%' AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f') AND "
+            "has_table_privilege('") + READER + "', c.oid, '" + privilege + "')");
+    };
+    const std::string select = granted("SELECT");
+    CHECK_MSG(select == "gateway_fills_v1,gateway_history_heartbeat_v1,gateway_order_history_v1,gateway_order_trail_v1",
+        "the reader can SELECT: " + select);
+    for (const char *privilege : { "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES", "TRIGGER" })
+    {
+        const std::string any = granted(privilege);
+        CHECK_MSG(any.empty(), std::string("the reader has ") + privilege + " on: " + any);
+    }
+    CHECK_MSG(sql(url, std::string("SELECT has_schema_privilege('") + READER + "', 'public', 'CREATE')") == "f",
+        "the reader can create in the public schema");
+    // and through a connection of its own: the four answer, a base table is refused
+    PGconn *c = PQconnectdb(readerUrl.c_str());
+    CHECK_MSG(CONNECTION_OK == PQstatus(c), PQerrorMessage(c));
+    auto run = [&](const std::string &statement) {
+        PGresult *r = PQexec(c, statement.c_str());
+        const std::string state = PQresultErrorField(r, PG_DIAG_SQLSTATE) ? PQresultErrorField(r, PG_DIAG_SQLSTATE) : "";
+        const bool ok = PGRES_TUPLES_OK == PQresultStatus(r) || PGRES_COMMAND_OK == PQresultStatus(r);
+        PQclear(r);
+        return ok ? std::string("ok") : state;
+    };
+    for (const char *relation : { "gateway_order_history_v1", "gateway_fills_v1", "gateway_history_heartbeat_v1",
+             "gateway_order_trail_v1" })
+    {
+        CHECK_MSG(run(std::string("SELECT count(*) FROM ") + relation) == "ok", relation);
+    }
+    for (const char *statement : { "SELECT count(*) FROM oe_order_events", "SELECT count(*) FROM oe_projection_state",
+             "SELECT count(*) FROM oe_orders", "DELETE FROM gateway_fills_v1",
+             "UPDATE oe_projection_state SET beat_at = now()" })
+    {
+        const std::string got = run(statement);
+        CHECK_MSG("42501" == got, std::string(statement) + ": " + got);
+    }
+    PQfinish(c);
 }

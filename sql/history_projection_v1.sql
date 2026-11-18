@@ -7,8 +7,10 @@
 --
 -- oe-projector applies this file at boot, in one transaction, under a transaction-scoped advisory lock (N copies may
 -- start at once), and records it in oe_projection_schema with its sha256; a recorded sha256 that differs from the
--- binary's own copy refuses the start. The projector's role owns every relation. The gateway's role is granted SELECT
--- on the read relations and nothing else.
+-- binary's own copy refuses the start. The projector's role owns every relation. The read relations are granted SELECT
+-- to the role oe_history_reader and nothing else is granted to it; the gateway's login role is made a member of it
+-- (GRANT oe_history_reader TO <gateway role>). This file creates oe_history_reader when it does not exist, which needs
+-- CREATEROLE; a projector role without it needs the role created beforehand (CREATE ROLE oe_history_reader NOLOGIN).
 --
 -- Rules:
 --   - a projected row is a function of the journal bytes only: no wall clock, host, source name or arrival order
@@ -157,9 +159,32 @@ CREATE VIEW gateway_fills_v1 AS
     SELECT trade_id, order_id, user_id, market_id, side, price, quantity, maker, executed_at_ms
       FROM oe_fills;
 
+-- One row per journal record of an order, ordered by event_seq and by nothing else (core_log_position is not unique).
+-- oe_order_events_order_key (order_id, journal_seq) serves the gateway's trail read.
+CREATE VIEW gateway_order_trail_v1 AS
+    SELECT order_id, user_id, journal_seq AS event_seq, event, status, core_log_position, me_epoch, me_log_position,
+           me_journal_seq, liquidity, trade_id, last_price, last_qty, hold_remaining, at_ms
+      FROM oe_order_events;
+
 -- No row until this projection's first beat: the gateway answers 503 HISTORY_UNAVAILABLE while there is none (also
 -- for the whole of a rebuild, which clears beat_at in the same transaction as the truncate).
 CREATE VIEW gateway_history_heartbeat_v1 AS
     SELECT singleton, beat_at, applied_order_id, applied_seq AS applied_event_seq, epoch
       FROM oe_projection_state
      WHERE beat_at IS NOT NULL;
+
+-- The reader role: SELECT on the four read relations, nothing else. Roles belong to the server, not the database, so
+-- two projections on one server share it; a concurrent create by the other one is not an error.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'oe_history_reader') THEN
+        BEGIN
+            CREATE ROLE oe_history_reader NOLOGIN;
+        EXCEPTION WHEN duplicate_object OR unique_violation THEN
+            NULL;
+        END;
+    END IF;
+END
+$$;
+GRANT SELECT ON gateway_order_history_v1, gateway_fills_v1, gateway_history_heartbeat_v1, gateway_order_trail_v1
+    TO oe_history_reader;

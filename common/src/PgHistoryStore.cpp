@@ -259,7 +259,9 @@ HistoryAnswer PgHistoryStore::pageOn(PgConn &c, const history::PageRequest &requ
         return why;
     }
 #endif
-    const char *what = history::Kind::ORDERS == request.kind ? "orders page" : "fills page";
+    const char *what = history::Kind::ORDERS == request.kind ? "orders page"
+        : history::Kind::FILLS == request.kind                ? "fills page"
+                                                              : "trail page";
     std::int64_t ms = 0;
     if (!left(deadlineNs, what, ms, why))
     {
@@ -290,7 +292,8 @@ HistoryAnswer PgHistoryStore::pageOn(PgConn &c, const history::PageRequest &requ
         std::string problem;
         const history::Row row = rowOf(r.get(), i);
         const bool ok = history::Kind::ORDERS == request.kind ? history::orderJson(row, json, last, problem)
-                                                              : history::fillJson(row, json, last, problem);
+            : history::Kind::FILLS == request.kind            ? history::fillJson(row, json, last, problem)
+                                                              : history::trailJson(row, json, last, problem);
         if (!ok)
         {
             return unavailable(HistoryCause::BAD_ROW, what, problem);
@@ -301,6 +304,37 @@ HistoryAnswer PgHistoryStore::pageOn(PgConn &c, const history::PageRequest &requ
     if (static_cast<std::size_t>(rows) > limit)
     {
         out.nextCursor = history::nextCursor(request, last, out.items.size());
+    }
+    if (history::Kind::TRAIL == request.kind && out.items.empty())
+    {
+        // no row of the caller on this page: a later page of the caller's own order is an empty page; no row of the
+        // caller for this order at all is the rule of GET /orders/{orderId} (the heartbeat was read first)
+        bool exists = false;
+        if (request.after)
+        {
+            if (!left(deadlineNs, "trail lookup", ms, why))
+            {
+                return why;
+            }
+            const history::Statement e = history::trailExistsStatement(request.userId, request.filter.orderId);
+            Result x;
+            if (Exec::OK != c.exec(e.sql, e.params, ms, x, error))
+            {
+                return failed(c, "trail lookup", error);
+            }
+            exists = PQntuples(x.get()) > 0;
+        }
+        if (!exists)
+        {
+            {
+                std::lock_guard<std::mutex> lock(m_stateMutex);
+                m_state = "ready";
+            }
+            out.nextCursor.reset();
+            return HistoryAnswer{ request.filter.orderId > asOf.appliedOrderId ? HistoryStatus::UNAVAILABLE
+                                                                               : HistoryStatus::NOT_FOUND,
+                request.filter.orderId > asOf.appliedOrderId ? HistoryCause::LAGGING : HistoryCause::NONE };
+        }
     }
     {
         std::lock_guard<std::mutex> lock(m_stateMutex);

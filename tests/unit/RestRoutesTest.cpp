@@ -1218,6 +1218,15 @@ TEST(routes_history_validation)
         const HttpResult r = rig.call("GET", target, "", as(7));
         CHECK_MSG(400 == r.status && str(body(r), "code") == "VALIDATION", target + " (" + why + "): " + what(r));
     }
+    // a trail cursor of another order: the hint names the order, not query fields the trail does not take
+    {
+        history::Filter order3;
+        order3.orderId = 3;
+        const HttpResult r = rig.call("GET", "/api/v2/orders/1/trail?cursor=" + cursorFor(history::Kind::TRAIL, order3),
+            "", as(7));
+        CHECK_MSG(400 == r.status && str(body(r), "code") == "VALIDATION" &&
+            str(body(r), "detail") == "the cursor was issued for another order", what(r));
+    }
     CHECK_MSG(0 == stub.calls.load(), "a refused request reached the store");
     // the same cursor with its own filter is accepted
     const HttpResult ok = rig.call("GET", "/api/v2/orders/history?marketId=1&cursor=" +

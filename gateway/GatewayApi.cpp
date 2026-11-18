@@ -269,13 +269,20 @@ void GatewayApi::handle(Ex ex)
             matchedName = r.name;
         }
     }
-    // /api/v2/orders/{orderId}: GET, PUT, DELETE
+    // /api/v2/orders/{orderId}: GET, PUT, DELETE; /api/v2/orders/{orderId}/trail: GET
     static constexpr std::string_view ORDER_PREFIX = "/api/v2/orders/";
+    static constexpr std::string_view TRAIL_SUFFIX = "/trail";
     if (nullptr == matchedName && 0 == path.rfind(ORDER_PREFIX, 0))
     {
-        const std::string_view idText = path.substr(ORDER_PREFIX.size());
-        const char *name = "GET" == method ? "orders_get" : "PUT" == method ? "orders_amend" : "DELETE" == method
-            ? "orders_cancel" : "orders_id";
+        std::string_view idText = path.substr(ORDER_PREFIX.size());
+        const bool trail = idText.size() > TRAIL_SUFFIX.size() &&
+            0 == idText.compare(idText.size() - TRAIL_SUFFIX.size(), TRAIL_SUFFIX.size(), TRAIL_SUFFIX);
+        if (trail)
+        {
+            idText.remove_suffix(TRAIL_SUFFIX.size());
+        }
+        const char *name = trail ? "orders_trail" : "GET" == method ? "orders_get" : "PUT" == method ? "orders_amend"
+            : "DELETE" == method ? "orders_cancel" : "orders_id";
         std::int64_t orderId = 0;
         bool good = !idText.empty() && '0' != idText[0];
         for (const char c : idText)
@@ -293,7 +300,19 @@ void GatewayApi::handle(Ex ex)
                 "the path's orderId must be a positive decimal integer"));
             return;
         }
-        if ("GET" == method)
+        if (trail)
+        {
+            if ("GET" == method)
+            {
+                orderTrail(ex, orderId);
+                return;
+            }
+            ApiResponse resp = api::error(405, api::code::METHOD_NOT_ALLOWED, "method not allowed",
+                "/api/v2/orders/{orderId}/trail takes GET");
+            resp.headers.emplace_back("Allow", "GET");
+            finish(ex, name, std::move(resp));
+        }
+        else if ("GET" == method)
         {
             getOrder(ex, orderId);
         }
@@ -766,7 +785,7 @@ std::string GatewayApi::metrics(const std::string &p) const
             "# TYPE " + p + "pg_auth_refused_total counter\n" + p + "pg_auth_refused_total " +
             std::to_string(m_deps.storePool->refused()) + "\n";
     }
-    out += "# HELP " + p + "history_reads_total History reads by query (orders, fills, order), result (ok, not_found, "
+    out += "# HELP " + p + "history_reads_total History reads by query (orders, fills, order, trail), result (ok, not_found, "
         "busy, unavailable) and the cause (busy: none for a full queue, expired for a read that waited past its "
         "deadline; unavailable: unconfigured, absent, unreachable, timeout, no_heartbeat, bad_row, error, lagging, epoch, "
         "stale).\n# TYPE " + p + "history_reads_total counter\n";

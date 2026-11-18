@@ -14,6 +14,10 @@
 // Read contract v1 (the DDL file is the reference):
 //   gateway_order_history_v1  the Order columns plus user_id; key (updated_at_ms, order_id), newest first
 //   gateway_fills_v1          the Fill columns plus user_id; key (executed_at_ms, trade_id, order_id), newest first
+//   gateway_order_trail_v1    one row per journal record of an order (order_id, user_id, event_seq, event, status, the
+//                             core and matching-engine positions, the trade, hold_remaining, at_ms); key event_seq,
+//                             oldest first. Ordered by event_seq and by nothing else: a log position is not unique (the
+//                             FILL records of one trade batch share one)
 //   gateway_history_heartbeat_v1 (beat_at timestamptz, applied_order_id bigint, applied_event_seq bigint, epoch
 //                             bigint): beat_at is the instant as of which the projection holds every event of its
 //                             genesis (it beats only when it has applied the core's head as a cluster probe read it);
@@ -39,33 +43,43 @@
 // served by that walk at all (skipped, not met again); a walk that starts over from the top serves it. This follows
 // from the contract's key and is the documented behaviour of the orders route.
 //
-// Cursor: base64url (unpadded) of "<tag>|<binding>|<key...>": tag o1 (orders) or f1 (fills), binding the first 8 bytes
-// of SHA-256 over the tag and the filter (marketId, status, orderId) as hex. A cursor of another route or another
+// Cursor: base64url (unpadded) of "<tag>|<binding>|<key...>": tag o1 (orders), f1 (fills) or t1 (an order's trail: key
+// event_seq, then the order id), binding the first 8 bytes of SHA-256 over the tag and the filter (marketId, status,
+// orderId) as hex. A cursor of another route or another
 // filter, or one that does not decode, is refused (the route answers 400 VALIDATION). The cursor carries no user: the
 // user is always the principal's, so a cursor only ever positions a walk inside the caller's own rows.
 //
 // Every statement is a fixed text with $n placeholders; the values travel as parameters, never inside the text.
 //
-// Test-only control (never in a published build): GW_NC_OFFSET_PAGING pages with OFFSET (the cursor carries the
+// The trail of an order (GET /api/v2/orders/{orderId}/trail): the caller's own order only, the owner filter in the
+// statement (user_id = the principal), never in the gateway after the rows. An empty trail page is checked with
+// trailExistsStatement: no row of the caller for that order is NOT_FOUND at or below applied_order_id (unknown and
+// another user's order: one answer) and LAGGING above it, as GET /orders/{orderId}.
+//
+// Test-only controls (never in a published build): GW_NC_OFFSET_PAGING pages with OFFSET (the cursor carries the
 // count of rows served) instead of the key; the PG test history_keyset_walk_under_concurrent_inserts must then fail
-// with "row skipped or repeated". The store's and the routes' controls are named in PgHistoryStore.h and GatewayApi.h.
+// with "row skipped or repeated". GW_NC_TRAIL_NO_OWNER drops the owner filter of the trail statements; the PG test
+// history_order_trail must then fail with "trail of another user's order". The store's and the routes' controls are
+// named in PgHistoryStore.h and GatewayApi.h.
 
 namespace openexchange { namespace gateway { namespace history {
 
 enum class Kind : std::uint8_t
 {
     ORDERS,
-    FILLS
+    FILLS,
+    TRAIL
 };
 
 struct Filter
 {
     std::int32_t marketId = 0;  // 0: any
     std::string status;         // "": any (orders only)
-    std::int64_t orderId = 0;   // 0: any (fills only)
+    std::int64_t orderId = 0;   // 0: any (fills); the order of a trail (always set)
 };
 
-// orders: a = updated_at_ms, b = order_id; fills: a = executed_at_ms, b = trade_id, c = order_id
+// orders: a = updated_at_ms, b = order_id; fills: a = executed_at_ms, b = trade_id, c = order_id; trail: a = event_seq,
+// b = order_id
 struct Key
 {
     std::int64_t a = 0;
@@ -88,8 +102,10 @@ struct Statement
     std::vector<std::string> params;
 };
 
-// The page statement (LIMIT limit + 1).
+// The page statement (LIMIT limit + 1). A trail page is oldest first, by event_seq only.
 Statement pageStatement(const PageRequest &request);
+// Whether the user has any trail row of the order (one row "1", or none).
+Statement trailExistsStatement(std::int64_t userId, std::int64_t orderId);
 // One order of the user by id (GET /orders/{orderId} of an order the core does not hold open).
 Statement orderStatement(std::int64_t userId, std::int64_t orderId);
 // One row: the projection's age in milliseconds, its applied_order_id, applied_event_seq and the lowest and highest
@@ -118,6 +134,10 @@ using Row = std::vector<std::optional<std::string>>;
 // and the row's key as stored (order_id, or trade_id and order_id), so an operator can find the row.
 bool orderJson(const Row &row, std::string &json, Key &key, std::string &problem);
 bool fillJson(const Row &row, std::string &json, Key &key, std::string &problem);
+// One trail row: eventSeq, event, status, coreLogPosition, me {epoch, logPosition, journalSeq} (null when the record
+// has no matching-engine cause, me_epoch 0), liquidity (null for NONE), tradeId, lastPrice, lastQty (all three null
+// when trade_id is 0), holdRemaining, at.
+bool trailJson(const Row &row, std::string &json, Key &key, std::string &problem);
 
 }
 
@@ -191,6 +211,8 @@ public:
     virtual ~HistoryStore() = default;
     virtual HistoryAnswer page(int worker, const history::PageRequest &request, HistoryPage &out,
         std::int64_t deadlineNs, const HistoryExpect &expect) = 0;
+    // A trail page (Kind::TRAIL) answers NOT_FOUND or LAGGING by the rule of order() below when the user has no trail
+    // row of that order.
     // NOT_FOUND when the user has no such order (unknown, or another user's: one answer for both) and the id is at or
     // below the projection's applied_order_id; above it, UNAVAILABLE with cause LAGGING. `asOf` is the heartbeat the
     // lookup was checked against (the answer's asOf)

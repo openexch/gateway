@@ -1,9 +1,10 @@
 -- History read contract, version 1.
 --
--- The relations oe-gateway reads for GET /api/v2/orders/history, GET /api/v2/fills and GET /api/v2/orders/{orderId}
--- of an order the core no longer holds open. The gateway only reads them, on read-only connections; it never creates,
--- migrates or writes them. The history projection owns them and may provide each one as a table or as a view with
--- exactly these column names and types. This file is the reference: the gateway's tests seed from it.
+-- The relations oe-gateway reads for GET /api/v2/orders/history, GET /api/v2/fills, GET /api/v2/orders/{orderId} of an
+-- order the core no longer holds open, and GET /api/v2/orders/{orderId}/trail. The gateway only reads them, on
+-- read-only connections; it never creates, migrates or writes them. The history projection owns them and may provide
+-- each one as a table or as a view with exactly these column names and types. This file is the reference: the
+-- gateway's tests seed from it.
 --
 -- Types:
 --   ids            BIGINT (market and asset ids INTEGER), rendered as decimal strings
@@ -13,15 +14,23 @@
 --   enums          TEXT holding the core's names (the money schema's)
 --   NULL           the REST null of that field; a column marked NOT NULL never holds one
 --
--- Paging is keyset only, newest first: orders by (updated_at_ms, order_id) DESC, fills by
--- (executed_at_ms, trade_id, order_id) DESC. The indexes below serve every filter the routes offer; a projection that
--- provides views must give the planner equivalent indexes on the underlying tables.
+-- Paging is keyset only: orders newest first by (updated_at_ms, order_id) DESC, fills newest first by
+-- (executed_at_ms, trade_id, order_id) DESC, an order's trail oldest first by event_seq. The indexes below serve every
+-- filter the routes offer; a projection that provides views must give the planner equivalent indexes on the underlying
+-- tables.
 --
 -- Orders: the projection writes every order from its creation on (an open order too, updated in place as it changes),
 -- not only terminal ones, so that GET /api/v2/orders/{orderId} can tell "no such order" from "not projected yet" (see
 -- applied_order_id below). An order updated while a client walks the pages takes a newer updated_at_ms: if the walk
 -- has not reached it yet, it moves above the cursor and that walk never serves it (a walk that starts over from the top
 -- does). Rows whose key does not change are served exactly once.
+--
+-- Trail: one row per journal record of an order (every record, from the first; event_seq is the core's eventSeq),
+-- ordered by event_seq and by nothing else: core_log_position is not unique (the FILL records of one trade batch share
+-- one), and the matching-engine fields are attributes of the record, always with me_epoch beside them (me_epoch 0: the
+-- record has no matching-engine cause). The trail of an order and its row in gateway_order_history_v1 are written in
+-- the same transaction. GET /api/v2/orders/{orderId}/trail reads the caller's rows only (user_id in the statement);
+-- an order with no row of the caller follows the applied_order_id rule below (404 at or below it, 503 above it).
 --
 -- Heartbeat: beat_at means "every event of this genesis is applied as of this instant". The projection moves it only
 -- when it has applied the core's head as a cluster probe answered it, with the genesisId of that answer equal to its
@@ -38,8 +47,10 @@
 -- short Retry-After (the order may exist and not be projected yet), never 404.
 --
 -- Roles: the history projection owns these relations (creates, migrates and writes them). The gateway's role is
--- granted SELECT on these three relations and nothing else, for example:
---   GRANT SELECT ON gateway_order_history_v1, gateway_fills_v1, gateway_history_heartbeat_v1 TO <gateway role>;
+-- granted SELECT on these four relations and nothing else, for example:
+--   GRANT SELECT ON gateway_order_history_v1, gateway_fills_v1, gateway_history_heartbeat_v1, gateway_order_trail_v1
+--       TO <gateway role>;
+-- (sql/history_projection_v1.sql grants them to the role oe_history_reader, of which the gateway's role is a member.)
 -- The gateway also opens its history connections read-only (default_transaction_read_only), but that is a session
 -- default, not a privilege: the grant is what keeps the gateway from writing.
 
@@ -105,3 +116,25 @@ CREATE TABLE gateway_history_heartbeat_v1 (
     applied_event_seq   BIGINT      NOT NULL CHECK (applied_event_seq >= 0), -- every event up to it is in the rows
     epoch               BIGINT      NOT NULL CHECK (epoch <> 0)             -- the core genesisId projected
 );
+
+-- One row per journal record of an order, oldest first by event_seq.
+CREATE TABLE gateway_order_trail_v1 (
+    order_id            BIGINT      NOT NULL CHECK (order_id > 0),
+    user_id             BIGINT      NOT NULL,
+    event_seq           BIGINT      NOT NULL PRIMARY KEY CHECK (event_seq > 0),
+    event               TEXT        NOT NULL,                   -- the core's EventKind name (ACCEPTED, FILL, ...)
+    status              TEXT        NOT NULL,                   -- the order's OrderStatus after the record
+    core_log_position   BIGINT      NOT NULL,                   -- the core log position of the applying entry
+    me_epoch            BIGINT      NOT NULL,                   -- 0: no matching-engine cause
+    me_log_position     BIGINT      NOT NULL,
+    me_journal_seq      BIGINT      NOT NULL,
+    liquidity           TEXT        NOT NULL CHECK (liquidity IN ('NONE', 'TAKER', 'MAKER')),
+    trade_id            BIGINT      NOT NULL,                   -- 0: no trade
+    last_price          BIGINT      NOT NULL,
+    last_qty            BIGINT      NOT NULL,
+    hold_remaining      BIGINT      NOT NULL,
+    at_ms               BIGINT      NOT NULL                    -- the record's updatedAtMs (core cluster time)
+);
+
+CREATE INDEX gateway_order_trail_v1_order_key
+    ON gateway_order_trail_v1 (order_id, event_seq);

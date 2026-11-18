@@ -31,6 +31,7 @@
 // A page reads the heartbeat first, then the rows: the rows are at least as new as the age they are answered with, and
 // every row of an event at or below the heartbeat's applied_event_seq is on the page (the projection commits that
 // cursor in the same transaction as the rows it covers). The heartbeat is checked (History.h) before any row is read.
+// A trail page with no row of the caller is NOT_FOUND or LAGGING by applied_order_id, read in that same heartbeat.
 //
 // Test-only controls (never in a published build): GW_NC_NO_EPOCH_CHECK skips the epoch check (history of another
 // genesis is served); GW_NC_ROWS_BEFORE_HEARTBEAT reads the rows first and the heartbeat after them.
