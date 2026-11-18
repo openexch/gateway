@@ -43,9 +43,16 @@ std::string rowJson(const std::variant<wire::OrderSnapshotEntry, wire::OrderEven
     return std::visit([](const auto &row) { return rest::orderJson(row); }, v);
 }
 
+// A fill frame is a trade of the user: a FILL with tradeId 0 (the core closing an order whose fills inside a replace
+// window reached its quantity) names none and goes out as an order frame only, so a user's fill frames and the user's
+// fills rows are the same set.
 bool isFill(const wire::OrderEvent &e)
 {
-    return wire::money::EventKind::FILL == e.eventKind;
+#ifdef GW_NC_FILL_ZERO_TRADE
+    return wire::money::EventKind::FILL == e.eventKind; // test build only: every FILL is a fill frame
+#else
+    return wire::money::EventKind::FILL == e.eventKind && e.tradeId > 0;
+#endif
 }
 
 }

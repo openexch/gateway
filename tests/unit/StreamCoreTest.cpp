@@ -603,6 +603,65 @@ TEST(stream_fills_never_coalesce)
     expectConverged(rig.clients[d], rig.fake, user2, "folded fills");
 }
 
+// A FILL event with tradeId 0 (the core closing an order whose fills inside a replace window reached its quantity)
+// names no trade: an order frame only, never a fill frame, live and on the folded span of a snapshot, so the fill frames
+// of a user and the user's fills rows are the same set.
+TEST(stream_no_fill_frame_without_a_trade)
+{
+    st::StreamCoreSettings s = settings();
+    Rig rig(s);
+    rig.start();
+    const std::int64_t user = 85;
+    const std::size_t c = rig.connect(user, ch::ORDERS | ch::FILLS);
+    const std::size_t f = rig.connect(user, ch::FILLS);
+    rig.step(4);
+    const std::int64_t o = rig.fake.create(user, 10 * SCALE);
+    rig.step(2);
+    rig.fake.fill(o, 4 * SCALE);
+    rig.step(2);
+    const std::size_t ordersBefore = rig.clients[c].count("order");
+    rig.fake.closeWithoutTrade(o);
+    rig.step(3);
+    for (const std::size_t k : { c, f })
+    {
+        const Client &cl = rig.clients[k];
+        if (0 != cl.fills.count(0) || cl.count("fill") != 1)
+        {
+            CHECK_MSG(false, "fill frame with tradeId 0 (live, " + std::to_string(cl.count("fill")) + " fill frames)");
+        }
+    }
+    CHECK_MSG(rig.clients[c].count("order") == ordersBefore + 1, "the closing FILL reaches the client as an order frame");
+    // the folded span of a snapshot: the closing FILL between the pages
+    rig.fake.pageSize = 1;
+    const std::int64_t user2 = 86;
+    std::vector<std::int64_t> mine;
+    for (int i = 0; i < 3; ++i)
+    {
+        mine.push_back(rig.fake.create(user2, 10 * SCALE));
+    }
+    rig.step(2);
+    rig.autoAnswer = false;
+    const std::size_t d = rig.connect(user2, ch::ORDERS | ch::FILLS);
+    for (int page = 0; page < 3; ++page)
+    {
+        rig.core.doWork(rig.now);
+        rig.fake.answerOnly(wire::tid::REQUEST_ORDER_SNAPSHOT);
+        rig.fake.deliver(rig.core, rig.now);
+        if (1 == page)
+        {
+            rig.fake.closeWithoutTrade(mine[0]);
+        }
+        rig.step(1);
+    }
+    rig.autoAnswer = true;
+    rig.step(4);
+    if (0 != rig.clients[d].fills.count(0) || 0 != rig.clients[d].count("fill"))
+    {
+        CHECK_MSG(false, "fill frame with tradeId 0 (folded span)");
+    }
+    expectConverged(rig.clients[d], rig.fake, user2, "closing FILL in the folded span");
+}
+
 // Unsubscribe and resubscribe; a FEATURE_DISABLED balances channel; admission frames to every connection.
 TEST(stream_channels_and_admission)
 {

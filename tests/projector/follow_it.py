@@ -47,6 +47,12 @@ On oe-projector-tc-faults (the frame sink drops or delays records of a configure
                follower closes the lag
   writer_reset the writer starts a generation while the source is attached and the cluster idle: it is read again at
                once, the head reached well inside the BEHIND window
+  beat         the beat rule through six states of one projection (on the fault build: a slow source keeps the cursor
+               below the head): beats while idle and under continuous load, none while the cursor is below the head,
+               while the probe goes unanswered (every member frozen for 3 s), while the session is down (two members
+               killed: no quorum), while halted (a copy with another journal MTU: halt MTU at the head)
+  beat_epoch   a database of another genesis whose cursor is far above this core's head: EPOCH_MISMATCH, no beat,
+               not ready
 follow also fills a crossing pair through a BRIDGE session (gw_stream_it_bridge), so the projection holds fill rows,
 and the cases on the fault build check that one switch is counted once (never more switches than attaches).
 
@@ -1109,10 +1115,239 @@ def case_writer_reset(args, cluster, pg, orders):
     pj.stop()
 
 
+def beat_row(pg, db):
+    """(beat_at as text or None, applied_seq, the database clock less beat_at in ms or None, halt_reason)."""
+    row = pg.sql(db, "SELECT coalesce(beat_at::text, '-') || '|' || applied_seq || '|' || coalesce((extract(epoch FROM "
+                     "clock_timestamp() - beat_at) * 1000)::bigint::text, '-') || '|' || coalesce(halt_reason, '-') "
+                     "FROM oe_projection_state")
+    beat, applied, age, halt = row.split("|")
+    return (None if beat == "-" else beat), int(applied), (None if age == "-" else int(age)), (None if halt == "-" else halt)
+
+
+def stop_members(cluster, sig):
+    for i in range(3):
+        p = cluster.procs.get(i)
+        if p is not None and p.poll() is None:
+            os.kill(p.pid, sig)
+
+
+def no_beat_over(pg, db, seconds, what, settle=0.6):
+    """beat_at does not move for `seconds` (after `settle` for a beat already in flight); the values seen."""
+    time.sleep(settle)
+    first = beat_row(pg, db)[0]
+    end = time.monotonic() + seconds
+    moved = None
+    while time.monotonic() < end:
+        now = beat_row(pg, db)[0]
+        if now != first:
+            moved = now
+            break
+        time.sleep(0.2)
+    if moved is not None:
+        check(False, f"beat without a fresh head ({what}: beat_at moved from {first} to {moved})")
+        return False
+    check(True, f"{what}: no beat over {seconds:.1f} s (beat_at {first})")
+    return True
+
+
+def case_beat(args, cluster, pg, orders):
+    """The beat rule, one projection of one follower through six states: beats while idle and under continuous load;
+    none while the cursor is below the core's head, while the probe goes unanswered, while the session is down, while
+    a halt is set. Under load the distance between beat_at and the database clock is recorded as data."""
+    leader = cluster.leader()
+    f1 = next(i for i in range(3) if i != leader)
+    check(orders.create(200) == 200, "200 orders acked")
+    db = "pj_beat"
+    url = pg.fresh(db)
+    probe_ms = 200
+    extra = faults("0:rate=25")  # the one source delivers 25 records a second: the catch-up of the backlog is slow
+    extra.update({"HISTORY_PROJECTOR_HEAD_PROBE_MS": str(probe_ms), "HISTORY_PROJECTOR_HEAD_FRESH_MS": "1000",
+                  "HISTORY_PROJECTOR_READY_LAG_MS": "1500", "HISTORY_PROJECTOR_SOURCE_BEHIND_MS": "60000",
+                  "HISTORY_PROJECTOR_REQUEST_TIMEOUT_MS": "1000"})
+    pj = Projector(args, cluster, url, 31, "beat", archives=[f1], extra=extra).start()
+    check(wait_for(lambda: pg.sql(db, "SELECT to_regclass('oe_projection_state') IS NOT NULL") == "t", 30, 0.2),
+          "the projection schema applied")
+    # 1. applied below head: the backlog is read at 25 a second, the head stays where it is; no beat until the cursor
+    # reaches a probed head
+    samples = 0
+    below = 0
+    early = None
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 30:
+        f = pj.follow()
+        beat, applied, age, halt = beat_row(pg, db)
+        head = f.get("headSeq", -1)
+        if head > 0 and applied < head:
+            below += 1
+            if beat is not None and early is None:
+                early = (beat, applied, head)
+            if pj.ready():
+                early = early or ("ready", applied, head)
+        samples += 1
+        if head > 0 and applied >= head:
+            break
+        time.sleep(0.25)
+    if below < 10:
+        check(False, f"INCONCLUSIVE: the cursor was below the head in {below} samples only (precondition)")
+    elif early is not None:
+        check(False, f"beat without a fresh head (applied below head: beat_at {early[0]} at applied_seq {early[1]}, "
+                     f"head {early[2]})")
+    else:
+        check(True, f"applied below head: no beat and not ready in {below} samples while the cursor was below the head")
+    ok, took, f = caught_up(pj, 30, at_least=200)
+    beat_seen = wait_for(lambda: beat_row(pg, db)[0] is not None, 5, 0.1)
+    check(ok and beat_seen, f"at the head: the first beat ({took:.1f} s)", json.dumps(f))
+    # 2. idle: beats keep coming, young, and /ready is true
+    values = set()
+    ages = []
+    for _ in range(15):
+        beat, applied, age, halt = beat_row(pg, db)
+        values.add(beat)
+        ages.append(age)
+        time.sleep(0.2)
+    ready = wait_for(pj.ready, 5, 0.2)
+    check(len(values) >= 5 and max(a for a in ages if a is not None) < 1500 and ready,
+          f"idle: {len(values)} distinct beats in 3 s, ages {min(ages)}..{max(ages)} ms, ready {ready}")
+    # 3. continuous load (about 12 orders a second, below the source's 25): beats occur, lag never has to reach zero
+    stop = threading.Event()
+
+    def load():
+        while not stop.is_set():
+            orders.create(3)
+            time.sleep(0.25)
+    loader = threading.Thread(target=load, daemon=True)
+    loader.start()
+    time.sleep(1.0)
+    values = set()
+    distances = []
+    lag_events = []
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 6:
+        beat, applied, age, halt = beat_row(pg, db)
+        values.add(beat)
+        distances.append(age)
+        f = pj.follow()
+        lag_events.append(max(0, f.get("headSeq", 0) - f.get("appliedSeq", 0)))
+        time.sleep(0.2)
+    stop.set()
+    loader.join(timeout=30)
+    dist = [d for d in distances if d is not None]
+    print(f"DATA under load: beat_at distance to the database clock ms min {min(dist)} median "
+          f"{sorted(dist)[len(dist) // 2]} max {max(dist)}; lag in events max {max(lag_events)}", flush=True)
+    check(len(values) >= 5, f"continuous load: {len(values)} distinct beats in 6 s")
+    ok, took, f = caught_up(pj, 30, at_least=200)
+    check(ok, "at the head after the load", json.dumps(f))
+    # 4. probe unanswered: every member frozen for 3 s (no answer to a probe sent meanwhile)
+    stop_members(cluster, signal.SIGSTOP)
+    try:
+        answered_before = pj.follow().get("headSeq")
+        no_beat_over(pg, db, 2.4, "probe unanswered")
+        not_ready = not pj.ready()
+    finally:
+        stop_members(cluster, signal.SIGCONT)
+    check(not_ready, "probe unanswered: not ready")
+    check(wait_for(lambda: cluster.leader() is not None, 60, 0.5), "the cluster answers again")
+    check(wait_for(lambda: beat_row(pg, db)[2] is not None and beat_row(pg, db)[2] < 1500, 30, 0.3),
+          "beats again after the freeze")
+    # 5. session down: two members killed (no quorum: no leader, the session cannot stay registered) until the session
+    # has read down for 2 s; the member the projector reads stays up. Then both restart and the cluster elects again.
+    # (Freezing every member for this long costs the cluster its recovery in this rig, which is not this row.)
+    victims = [i for i in range(3) if i != f1]
+    for i in victims:
+        cluster.kill(i)
+    session_down = None
+    time.sleep(0.6)
+    first = beat_row(pg, db)[0]
+    moved = None
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 30:
+        h = pj.health() or {}
+        s = h.get("session") or {}
+        if session_down is None and (s.get("registered") is False or s.get("connected") is False):
+            session_down = time.monotonic() - t0
+        now = beat_row(pg, db)[0]
+        if now != first:
+            moved = now
+            break
+        if session_down is not None and time.monotonic() - t0 > session_down + 2:
+            break
+        time.sleep(0.2)
+    down_ready = pj.ready()
+    print(f"DATA session read down {session_down} s after the quorum was lost", flush=True)
+    for i in victims:
+        cluster.start(i)
+    if moved is not None:
+        check(False, f"beat without a fresh head (session down: beat_at moved from {first} to {moved})")
+    elif session_down is None:
+        check(False, "INCONCLUSIVE: the session never read down in 30 s without a quorum (precondition)")
+    else:
+        check(not down_ready, f"session down: no beat, not ready (beat_at {first})")
+    check(wait_for(lambda: cluster.leader() is not None, 120, 0.5), "the cluster elects again")
+    check(wait_for(lambda: beat_row(pg, db)[2] is not None and beat_row(pg, db)[2] < 1500, 90, 0.3),
+          "beats again after the session came back", json.dumps(pj.follow()))
+    # 6. halt: the same projection under a copy whose journal MTU differs (every source refused: halt MTU) while the
+    # cluster answers its probes and the cursor is at the head
+    pj.stop()
+    extra2 = dict(extra)
+    extra2["HISTORY_PROJECTOR_JOURNAL_MTU"] = str(JOURNAL_MTU * 2)
+    pj2 = Projector(args, cluster, url, 32, "beat-mtu", archives=[f1], extra=extra2).start()
+    halted = wait_for(lambda: beat_row(pg, db)[3] == "MTU", 60, 0.3)
+    f = pj2.follow()
+    probed = wait_for(lambda: pj2.follow().get("headSeq", -1) >= 0 and
+                      pj2.follow().get("appliedSeq", 0) >= pj2.follow().get("headSeq", 0), 10, 0.2)
+    if not halted or not probed:
+        check(False, f"INCONCLUSIVE: halt {beat_row(pg, db)[3]}, probe answered at the head {probed} (precondition)",
+              json.dumps(f))
+    else:
+        no_beat_over(pg, db, 3.0, "halt MTU with the probe answered at the head")
+        check(not pj2.ready(), "halted: not ready")
+    pj2.stop()
+
+
+def case_beat_epoch(args, cluster, pg, orders):
+    """A database of the old genesis whose cursor is far above the new genesis's head: EPOCH_MISMATCH, no beat, not
+    ready, however the two sequences compare."""
+    check(orders.create(10) == 10, "10 orders acked")
+    db = "pj_beat_epoch"
+    url = pg.fresh(db)
+    pj = Projector(args, cluster, url, 33, "be").start()
+    ok, took, f = caught_up(pj, 45, at_least=10)
+    check(ok, "a projection at the head", json.dumps(f))
+    pj.stop()
+    # the projection of another genesis: its epoch another id, its cursor far above anything this core emitted
+    pg.sql(db, "UPDATE oe_projection_state SET epoch = 4242, applied_seq = 1000000, applied_order_id = 1000000, "
+               "beat_at = clock_timestamp() - interval '1 hour', halt_reason = NULL, halt_detail = NULL, lease_until = NULL")
+    pj = Projector(args, cluster, url, 34, "be2").start()
+    halted = wait_for(lambda: ((pj.health() or {}).get("projector", {}).get("halt") or {}).get("reason") ==
+                      "EPOCH_MISMATCH", 60, 0.3)
+    probed = wait_for(lambda: 0 <= pj.follow().get("headSeq", -1) < 1000000, 10, 0.2)
+    f = pj.follow()
+    if not halted or not probed:
+        check(False, f"INCONCLUSIVE: halt EPOCH_MISMATCH {halted}, probe answered {probed} (precondition)", json.dumps(f))
+    else:
+        first = beat_row(pg, db)[0]
+        moved = None
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 4:
+            now = beat_row(pg, db)[0]
+            if now != first:
+                moved = now
+                break
+            time.sleep(0.2)
+        if moved is not None:
+            check(False, f"beat across genesis ids (beat_at moved from {first} to {moved}; the cluster's genesis "
+                         f"{f.get('genesisId')}, the projection's epoch {f.get('epoch')}, head {f.get('headSeq')}, "
+                         f"applied {f.get('appliedSeq')})")
+        else:
+            check(not pj.ready(), f"EPOCH_MISMATCH: no beat in 4 s and not ready (head {f.get('headSeq')} far below "
+                                  f"applied {f.get('appliedSeq')})", json.dumps(f))
+    pj.stop()
+
+
 CASES = {"follow": case_follow, "successor": case_successor, "replays": case_replays, "epoch": case_epoch,
          "mtu": case_mtu, "replay_cap": case_replay_cap, "long_overlap": case_long_overlap,
          "regenesis": case_regenesis, "holes": case_holes, "above_one": case_above_one, "slow": case_slow,
-         "writer_reset": case_writer_reset}
+         "writer_reset": case_writer_reset, "beat": case_beat, "beat_epoch": case_beat_epoch}
 
 
 def main():

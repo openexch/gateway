@@ -511,6 +511,13 @@ bool HistoryWork::write(PgConn &conn, const std::string &, StateAdvance &advance
                 }
                 m_outcome.halt = i.halt;
                 break;
+            case Item::Kind::BEAT:
+                // the newest probe of the batch: the beat statement runs after the fence (ProjectionStore.h)
+                if (!advance.beat || i.sentAtNs > advance.beat->sentAtNs)
+                {
+                    advance.beat = BeatCandidate{ i.head, i.epoch, i.sentAtNs };
+                }
+                break;
         }
     }
     for (const auto &[source, row] : memo)

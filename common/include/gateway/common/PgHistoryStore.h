@@ -28,7 +28,12 @@
 // when a call on a reused connection finds it lost (and not by the deadline), the read is run once more on a fresh
 // connection inside the same deadline. Reads are idempotent and nothing of the failed one was answered.
 //
-// A page reads the heartbeat first, then the rows: the rows are at least as new as the age they are answered with.
+// A page reads the heartbeat first, then the rows: the rows are at least as new as the age they are answered with, and
+// every row of an event at or below the heartbeat's applied_event_seq is on the page (the projection commits that
+// cursor in the same transaction as the rows it covers). The heartbeat is checked (History.h) before any row is read.
+//
+// Test-only controls (never in a published build): GW_NC_NO_EPOCH_CHECK skips the epoch check (history of another
+// genesis is served); GW_NC_ROWS_BEFORE_HEARTBEAT reads the rows first and the heartbeat after them.
 
 namespace openexchange { namespace gateway {
 
@@ -47,9 +52,10 @@ public:
     ~PgHistoryStore() override;
 
     HistoryAnswer page(int worker, const history::PageRequest &request, HistoryPage &out,
-        std::int64_t deadlineNs) override;
+        std::int64_t deadlineNs, const HistoryExpect &expect) override;
     HistoryAnswer order(int worker, std::int64_t userId, std::int64_t orderId, std::string &json,
-        std::int64_t deadlineNs) override;
+        HistoryAsOf &asOf, std::int64_t deadlineNs, const HistoryExpect &expect) override;
+    HistoryAnswer probe(int worker, HistoryAsOf &out, std::int64_t deadlineNs, const HistoryExpect &expect) override;
     std::string state() const override;
 
     int connected() const noexcept { return m_connected.load(std::memory_order_relaxed); }
@@ -62,11 +68,13 @@ private:
     HistoryAnswer unavailable(HistoryCause cause, const char *what, const std::string &detail);
     // what is left of the deadline in whole milliseconds; false (TIMEOUT in `why`) when nothing is
     bool left(std::int64_t deadlineNs, const char *what, std::int64_t &ms, HistoryAnswer &why);
-    bool ageOf(PgConn &c, std::int64_t deadlineNs, std::int64_t &ageMs, std::int64_t &appliedOrderId,
+    // the heartbeat read and checked (no row, epoch, maximum age), in that order
+    bool heartbeat(PgConn &c, std::int64_t deadlineNs, const HistoryExpect &expect, HistoryAsOf &out,
         HistoryAnswer &why);
-    HistoryAnswer pageOn(PgConn &c, const history::PageRequest &request, HistoryPage &out, std::int64_t deadlineNs);
+    HistoryAnswer pageOn(PgConn &c, const history::PageRequest &request, HistoryPage &out, std::int64_t deadlineNs,
+        const HistoryExpect &expect);
     HistoryAnswer orderOn(PgConn &c, std::int64_t userId, std::int64_t orderId, std::string &json,
-        std::int64_t deadlineNs);
+        HistoryAsOf &asOf, std::int64_t deadlineNs, const HistoryExpect &expect);
 
     PgHistorySettings m_settings;
     std::vector<std::unique_ptr<PgConn>> m_conns;

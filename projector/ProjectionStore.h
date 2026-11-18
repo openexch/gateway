@@ -31,6 +31,19 @@
 //   - the state row is read back by every takeover and renewal (RETURNING), so a writer that lost its connection reads
 //     the cursor again before anything is applied.
 //   - release (a clean stop): lease_until = NULL WHERE writer_token = <mine>, so a standby takes over at its next poll.
+// The beat (the heartbeat means complete as of): for a head probe sent at monotonic time t and answered with the core's
+// head H and genesisId G, a write transaction whose cursor has reached H also runs, after its fence,
+//   UPDATE oe_projection_state SET beat_at = clock_timestamp() - <now - t>, head_seq = H
+//    WHERE writer_token = <mine> AND epoch = G AND applied_seq >= H AND halt_reason IS NULL AND beat_at is older
+// so beat_at is "every event of this genesis is applied as of this instant": the interval comes from the copy's own
+// monotonic clock and is applied by the database's clock, no host wall clock is trusted, and beat_at never moves back.
+// A projection of another genesis (epoch <> G), one below the head, or a halted one never beats, however large its
+// applied_seq. pj-duty hands a probe on only once its head is applied (FollowDuty.h); the statement checks it again
+// against what the transaction committed.
+// Test-only controls (never in a published build): PROJ_NC_BEAT_ALWAYS sets beat_at = clock_timestamp() at every fence
+// (a beat without a fresh head); PROJ_NC_BEAT_NO_EPOCH leaves out the genesis terms of the beat (epoch = G, and an
+// EPOCH_MISMATCH halt).
+//
 // Rebuild (oe-projector --rebuild): with the lease held, one transaction resets the state row under the fence (epoch,
 // cursor, head, beat_at and the halt cleared) and runs a single TRUNCATE naming every base table; from that commit the
 // heartbeat view has no row, so the gateway answers 503 until the new projection beats.
@@ -76,6 +89,14 @@ struct ProjectionState
     std::optional<std::string> haltReason;
 };
 
+// An answered head probe (see the beat above).
+struct BeatCandidate
+{
+    std::int64_t head = 0;      // H: the newest eventSeq the core had emitted
+    std::int64_t genesis = 0;   // G: the core's genesisId
+    std::int64_t sentAtNs = 0;  // t: when the probe was sent (monotonic)
+};
+
 // What a fenced transaction moves the state row to (only the fields set are written).
 struct StateAdvance
 {
@@ -83,6 +104,7 @@ struct StateAdvance
     std::optional<std::int64_t> appliedSeq;
     std::optional<std::int64_t> appliedLogPosition;
     std::optional<std::int64_t> appliedOrderId;
+    std::optional<BeatCandidate> beat; // the beat statement runs after the fence, in the same transaction
 };
 
 enum class Hold : std::uint8_t
@@ -112,10 +134,11 @@ public:
     Hold renew(PgConn &conn, std::int64_t timeoutMs, ProjectionState &state, std::string &error);
     // One write transaction: BEGIN, `writes`, the fence with `advance`, COMMIT. `beforeFence` and `beforeCommit` (test
     // builds only) run between the writes and the fence, and between the fence and the COMMIT.
+    // `beatWritten` (optional) is set true when the advance's beat moved beat_at in the committed transaction.
     Hold commitFenced(PgConn &conn, std::int64_t timeoutMs,
         const std::function<bool(PgConn &, std::string &error)> &writes, const StateAdvance &advance,
         std::string &error, const std::function<void()> &beforeFence = {},
-        const std::function<void()> &beforeCommit = {});
+        const std::function<void()> &beforeCommit = {}, bool *beatWritten = nullptr);
     // The rebuild transaction (see above). The TRUNCATE waits at most `lockTimeoutMs` for open reads of the base tables
     // (SET LOCAL lock_timeout); past it nothing changes and the call is FAILED.
     Hold rebuild(PgConn &conn, std::int64_t timeoutMs, std::int64_t lockTimeoutMs, std::string &error);

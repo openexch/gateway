@@ -126,6 +126,23 @@ public:
         }
         emit(e);
     }
+    // The core's closing FILL of an order whose fills inside a replace window reached its quantity: tradeId 0 and
+    // lastQty 0, the order FILLED. No trade belongs to it.
+    void closeWithoutTrade(std::int64_t orderId)
+    {
+        position += 100;
+        wire::OrderEvent e = open.at(orderId);
+        e.eventKind = money::EventKind::FILL;
+        e.lastQty = 0;
+        e.lastPrice = 0;
+        e.tradeId = 0;
+        e.filledQty = e.quantity;
+        e.remainingQty = 0;
+        e.status = money::OrderStatus::FILLED;
+        e.updatedAtMs = position;
+        open.erase(orderId);
+        emit(e);
+    }
     void cancel(std::int64_t orderId)
     {
         position += 100;

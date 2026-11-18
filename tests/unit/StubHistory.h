@@ -26,6 +26,7 @@ public:
     HistoryAnswer answer{ HistoryStatus::OK, HistoryCause::NONE }; // UNAVAILABLE: every call answers it
     std::vector<history::PageRequest> requests;
     std::vector<std::int64_t> deadlines; // the deadline each call was given
+    std::vector<HistoryExpect> expects;  // what each call was checked against
     bool held = false; // calls wait while true
     std::atomic<int> waiting{ 0 };
     std::atomic<int> calls{ 0 };
@@ -37,13 +38,15 @@ public:
         cv.notify_all();
     }
 
-    HistoryAnswer page(int, const history::PageRequest &request, HistoryPage &out, std::int64_t deadlineNs) override
+    HistoryAnswer page(int, const history::PageRequest &request, HistoryPage &out, std::int64_t deadlineNs,
+        const HistoryExpect &expect) override
     {
         std::unique_lock<std::mutex> l(mutex);
         wait(l);
         calls++;
         requests.push_back(request);
         deadlines.push_back(deadlineNs);
+        expects.push_back(expect);
         if (HistoryStatus::OK != answer.status)
         {
             return answer;
@@ -52,13 +55,14 @@ public:
         return answer;
     }
 
-    HistoryAnswer order(int, std::int64_t userId, std::int64_t orderId, std::string &json,
-        std::int64_t deadlineNs) override
+    HistoryAnswer order(int, std::int64_t userId, std::int64_t orderId, std::string &json, HistoryAsOf &asOf,
+        std::int64_t deadlineNs, const HistoryExpect &expect) override
     {
         std::unique_lock<std::mutex> l(mutex);
         wait(l);
         calls++;
         deadlines.push_back(deadlineNs);
+        expects.push_back(expect);
         if (HistoryStatus::OK != answer.status)
         {
             return answer;
@@ -69,6 +73,16 @@ public:
             return HistoryAnswer{ HistoryStatus::NOT_FOUND, HistoryCause::NONE };
         }
         json = it->second;
+        asOf.ageMs = canned.ageMs;
+        asOf.eventSeq = canned.eventSeq;
+        return answer;
+    }
+
+    HistoryAnswer probe(int, HistoryAsOf &out, std::int64_t, const HistoryExpect &) override
+    {
+        std::unique_lock<std::mutex> l(mutex);
+        out.ageMs = canned.ageMs;
+        out.eventSeq = canned.eventSeq;
         return answer;
     }
 

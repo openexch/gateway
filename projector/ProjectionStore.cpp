@@ -1,6 +1,10 @@
 #include "ProjectionStore.h"
 
+#include <algorithm>
+
 #include <vector>
+
+#include "cluster_tools/runtime/Supervisor.h"
 
 #include "gateway/common/Crypto.h"
 
@@ -221,10 +225,15 @@ Hold WriterLease::fenceInTransaction(PgConn &conn, std::int64_t timeoutMs, const
 #else
     const std::string where = " WHERE writer_token = $1";
 #endif
+#ifdef PROJ_NC_BEAT_ALWAYS
+    const std::string always = ", beat_at = clock_timestamp()"; // test build only: every fence beats
+#else
+    const std::string always;
+#endif
     Result r;
     if (Exec::OK != conn.exec("UPDATE oe_projection_state SET lease_until = clock_timestamp() + $2::bigint * interval "
-            "'1 millisecond', updated_at = clock_timestamp()" + set + where + STATE_RETURNING, params, timeoutMs, r,
-            error, false))
+            "'1 millisecond', updated_at = clock_timestamp()" + always + set + where + STATE_RETURNING, params,
+            timeoutMs, r, error, false))
     {
         return Hold::FAILED;
     }
@@ -256,10 +265,54 @@ Hold WriterLease::renew(PgConn &conn, std::int64_t timeoutMs, ProjectionState &s
     return h;
 }
 
+namespace {
+
+// the monotonic clock pj-duty stamps a probe's send time with (a host clock never reaches the database)
+std::int64_t monotonicNs()
+{
+    return cluster_tools::runtime::Supervisor::monotonicNs();
+}
+
+// The beat statement (see ProjectionStore.h), after the fence of the same transaction. True with `written` when it
+// moved beat_at.
+bool writeBeat(PgConn &conn, std::int64_t timeoutMs, const std::string &token, const BeatCandidate &beat,
+    bool &written, std::string &error)
+{
+    // the interval since the probe was sent, measured on this copy's monotonic clock as late as possible; the database
+    // subtracts it from its own clock
+    const std::int64_t sinceUs = std::max<std::int64_t>(0, (monotonicNs() - beat.sentAtNs) / 1000);
+#if defined(PROJ_NC_BEAT_NO_EPOCH)
+    // test build only: no genesis term (the probe's genesis is not compared, an EPOCH_MISMATCH halt does not stop it)
+    const std::string sql = "UPDATE oe_projection_state SET beat_at = clock_timestamp() - $2::bigint * interval "
+        "'1 microsecond', head_seq = $3::bigint WHERE writer_token = $1 AND $4::bigint IS NOT NULL AND applied_seq >= "
+        "$3::bigint AND (halt_reason IS NULL OR halt_reason = 'EPOCH_MISMATCH') AND (beat_at IS NULL OR beat_at < "
+        "clock_timestamp() - $2::bigint * interval '1 microsecond')";
+#else
+    const std::string sql = "UPDATE oe_projection_state SET beat_at = clock_timestamp() - $2::bigint * interval "
+        "'1 microsecond', head_seq = $3::bigint WHERE writer_token = $1 AND epoch = $4::bigint AND applied_seq >= "
+        "$3::bigint AND halt_reason IS NULL AND (beat_at IS NULL OR beat_at < clock_timestamp() - $2::bigint * "
+        "interval '1 microsecond')";
+#endif
+    Result r;
+    if (Exec::OK != conn.exec(sql, { token, std::to_string(sinceUs), std::to_string(beat.head),
+            std::to_string(beat.genesis) }, timeoutMs, r, error, false))
+    {
+        return false;
+    }
+    written = 1 == rowsOf(r);
+    return true;
+}
+
+}
+
 Hold WriterLease::commitFenced(PgConn &conn, std::int64_t timeoutMs,
     const std::function<bool(PgConn &, std::string &)> &writes, const StateAdvance &advance, std::string &error,
-    const std::function<void()> &beforeFence, const std::function<void()> &beforeCommit)
+    const std::function<void()> &beforeFence, const std::function<void()> &beforeCommit, bool *beatWritten)
 {
+    if (nullptr != beatWritten)
+    {
+        *beatWritten = false;
+    }
     Result r;
     if (Exec::OK != conn.exec("BEGIN", {}, timeoutMs, r, error, false))
     {
@@ -313,6 +366,12 @@ Hold WriterLease::commitFenced(PgConn &conn, std::int64_t timeoutMs,
         }
         return h;
     }
+    bool beat = false;
+    if (advance.beat && !writeBeat(conn, timeoutMs, m_token, *advance.beat, beat, error))
+    {
+        rollback(conn, timeoutMs);
+        return Hold::FAILED;
+    }
     if (beforeCommit)
     {
         beforeCommit();
@@ -323,6 +382,10 @@ Hold WriterLease::commitFenced(PgConn &conn, std::int64_t timeoutMs,
         error = "COMMIT: " + error;
         conn.close();
         return Hold::FAILED;
+    }
+    if (nullptr != beatWritten)
+    {
+        *beatWritten = beat;
     }
     return Hold::HELD;
 }
@@ -335,9 +398,15 @@ Hold WriterLease::rebuild(PgConn &conn, std::int64_t timeoutMs, std::int64_t loc
         return Hold::FAILED;
     }
     // the fence first: a copy that lost the lease truncates nothing
-    const Hold h = fenceInTransaction(conn, timeoutMs, ", epoch = NULL, applied_seq = 0, applied_log_position = 0, "
-        "applied_order_id = 0, head_seq = NULL, beat_at = NULL, halt_reason = NULL, halt_detail = NULL", {}, nullptr,
-        error);
+#ifdef PROJ_NC_REBUILD_KEEPS_BEAT
+    // test build only: the rebuild keeps beat_at (the heartbeat view keeps its row through the rebuild)
+    const char *reset = ", epoch = NULL, applied_seq = 0, applied_log_position = 0, applied_order_id = 0, head_seq = "
+        "NULL, halt_reason = NULL, halt_detail = NULL";
+#else
+    const char *reset = ", epoch = NULL, applied_seq = 0, applied_log_position = 0, applied_order_id = 0, head_seq = "
+        "NULL, beat_at = NULL, halt_reason = NULL, halt_detail = NULL";
+#endif
+    const Hold h = fenceInTransaction(conn, timeoutMs, reset, {}, nullptr, error);
     if (Hold::HELD != h)
     {
         rollback(conn, timeoutMs);

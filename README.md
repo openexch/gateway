@@ -151,12 +151,12 @@ relations only. They are read when `GATEWAY_PG_URL` is set, on `GATEWAY_PG_HISTO
 their own with their own queue (sized by `GATEWAY_PG_QUEUE`), so a history storm never takes a connection from login.
 No order-path request touches PostgreSQL.
 
-- Pages are `{items, nextCursor, asOf:{ageMs}}`, newest first, keyset only: send `nextCursor` back unchanged with the
+- Pages are `{items, nextCursor, asOf:{ageMs, stale, eventSeq}}`, newest first, keyset only: send `nextCursor` back unchanged with the
   same filters (a cursor from another route or filter is 400). `nextCursor: null` is the last page. `limit` defaults
   to `GATEWAY_HISTORY_LIMIT_DEFAULT` (100); above `GATEWAY_HISTORY_LIMIT_MAX` (1000) is 400. A row whose key does not
   change is served exactly once; an order updated during a walk moves to the top, so a walk that has not reached it
   yet does not serve it and a walk started over from the top does.
-- `asOf.ageMs` is the age of the projection's heartbeat, measured by the database clock.
+- `asOf.ageMs` is the age of the projection's last beat, measured by the database clock: history is complete as of that long ago. `asOf.stale` is true above `GATEWAY_HISTORY_STALE_MS` (5000). `asOf.eventSeq` is the projection's cursor: every fill or order event up to it is in the answer. With `GATEWAY_HISTORY_MAX_AGE_MS` set (default 0, off; must be above the stale bound) older history is 503 HISTORY_UNAVAILABLE. History of another core genesis than the gateway's last CoreConfigReport, or before the gateway has read one, is always 503. `/health` shows `history:{ageMs, stale, cause, eventSeq, probedAgoMs}` from a probe every `GATEWAY_HISTORY_PROBE_MS` (5000); the metric is `gateway_history_age_ms`.
 - `GET /orders/{orderId}` of an order that is not open answers from history; an unknown order and another user's
   order both answer the same 404. An id above the projection's `applied_order_id` with no row yet answers 503
   HISTORY_UNAVAILABLE with `Retry-After` from `GATEWAY_HISTORY_LAG_RETRY_AFTER_MS` (1000), never 404.
@@ -253,6 +253,8 @@ The writer treats its lease as held until the lease less one renewal interval (2
 A source that lacks records (a hole, or recordings starting above 1 after a wipe) is marked and another source fills the range; the projection never starts at the first record a source happens to hold. A source re-reading history the projection already holds counts as delivering; BEHIND measures the lag from the highest sequence of the read that the writer verified or applied. Records at or below the cursor are compared byte for byte; a difference marks that source, and PAYLOAD_CONFLICT halts only when no source agrees. The writer applies only the record after its cursor; anything else fails the batch and the projection reloads from the database. Records of another genesis, or of epoch 0, are never applied. A gap no source can fill is GAP; another genesis is EPOCH_MISMATCH; a record it cannot name is SCHEMA. None of these is a latch, and each is shown in `/health` and in the state row.
 
 `_DUTY_WATCHDOG_MS` defaults to 10000, above `_ARCHIVE_TIMEOUT_MS` (5000); a watchdog at or below the archive timeout is accepted with a WARN. Other settings: `_NODE_FRESH_MS` 3000, `_NODE_FIRST_ROUND_MS` 3000, `_SESSION_MAX_INFLIGHT` 64, `_QUERY_RATE_COUNT` 100, `_QUERY_RATE_PERIOD_MS` 1000, `_QUERY_BURST` 200. Building it needs cluster-tools with `WITH_BRIDGE` (`scripts/build-cluster-tools.sh` does this) and the core feed harness jar, downloaded from the core repository's releases or given as `CT_FEED_HARNESS_JAR`.
+
+**Beat.** The projector writes `beat_at` only when it has applied the core's head as its probe answered it, for its own genesis, with no halt: beat_at is the database clock less the time since that probe was sent. Behind, halted, cut off or of another genesis: no beat, `/ready` false. `/health` shows `lagMs` (beat age) and the beat counts.
 
 **Rebuild.** `oe-projector --rebuild` waits for the lease, then in one transaction resets the state row and truncates every base table. History answers 503 until the projection beats again. It waits at most `HISTORY_PROJECTOR_REBUILD_LOCK_TIMEOUT_MS` behind open history reads; past that it changes nothing and exits 75 (run it again). Exit codes: 0 done, 75 stopped or not committed (safe to repeat), 78 config.
 

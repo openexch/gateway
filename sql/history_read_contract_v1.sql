@@ -23,13 +23,19 @@
 -- has not reached it yet, it moves above the cursor and that walk never serves it (a walk that starts over from the top
 -- does). Rows whose key does not change are served exactly once.
 --
--- Heartbeat: the projection writes beat_at = now() whenever it has applied everything it has read (also while idle),
--- and applied_order_id = the highest order id it has applied (order ids are global, so this says nothing about any
--- user). The gateway answers asOf.ageMs = clock_timestamp() - max(beat_at) in whole milliseconds, never below 0,
--- computed by the database (one clock: no skew between the gateway's and the projection's hosts). No row means the
--- projection has never reported: every history read answers 503 HISTORY_UNAVAILABLE. GET /api/v2/orders/{orderId} of
--- an id above applied_order_id that has no row answers 503 HISTORY_UNAVAILABLE with a short Retry-After (the order may
--- exist and not be projected yet), never 404.
+-- Heartbeat: beat_at means "every event of this genesis is applied as of this instant". The projection moves it only
+-- when it has applied the core's head as a cluster probe answered it, with the genesisId of that answer equal to its
+-- epoch and no halt set; beat_at is then the database's clock less the time since the probe was sent. A projection
+-- that is behind the head, halted, cut off from the core, or of another genesis does not beat, whatever it has read.
+-- applied_order_id is the highest order id it has applied (order ids are global, so this says nothing about any user),
+-- applied_event_seq its cursor (every event up to it is applied, committed in the same transaction as the rows), epoch
+-- the core genesisId it projects. The gateway answers asOf.ageMs = clock_timestamp() - max(beat_at) in whole
+-- milliseconds, never below 0, computed by the database (one clock: no skew between the gateway's and the
+-- projection's hosts), asOf.eventSeq = applied_event_seq (read before the rows), and asOf.stale above its
+-- GATEWAY_HISTORY_STALE_MS. No row means the projection has never reported: every history read answers 503
+-- HISTORY_UNAVAILABLE; so does an epoch other than the genesisId of the gateway's last CoreConfigReport.
+-- GET /api/v2/orders/{orderId} of an id above applied_order_id that has no row answers 503 HISTORY_UNAVAILABLE with a
+-- short Retry-After (the order may exist and not be projected yet), never 404.
 --
 -- Roles: the history projection owns these relations (creates, migrates and writes them). The gateway's role is
 -- granted SELECT on these three relations and nothing else, for example:
@@ -95,5 +101,7 @@ CREATE INDEX gateway_fills_v1_user_order_key
 CREATE TABLE gateway_history_heartbeat_v1 (
     singleton           BOOLEAN     NOT NULL PRIMARY KEY DEFAULT TRUE CHECK (singleton),
     beat_at             TIMESTAMPTZ NOT NULL,
-    applied_order_id    BIGINT      NOT NULL CHECK (applied_order_id >= 0) -- 0: no order applied yet
+    applied_order_id    BIGINT      NOT NULL CHECK (applied_order_id >= 0), -- 0: no order applied yet
+    applied_event_seq   BIGINT      NOT NULL CHECK (applied_event_seq >= 0), -- every event up to it is in the rows
+    epoch               BIGINT      NOT NULL CHECK (epoch <> 0)             -- the core genesisId projected
 );

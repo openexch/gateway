@@ -119,6 +119,21 @@ ApiResponse coreFailure(const session::Outcome &o)
 
 }
 
+namespace {
+
+std::int64_t steadyNs()
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+}
+
+GatewayApi::~GatewayApi()
+{
+    stopHistoryProbe();
+}
+
 GatewayApi::GatewayApi(ApiDeps deps) :
     m_deps(std::move(deps)),
     m_s(*m_deps.settings),
@@ -693,6 +708,20 @@ std::string GatewayApi::healthJson() const
     out += ",\"userIdConflicts\":" + std::to_string(userIdConflicts()) + "}";
     out += ",\"history\":{\"state\":" + api::quote(nullptr == m_deps.history ? std::string("off (no GATEWAY_PG_URL)")
         : m_deps.history->state());
+    if (nullptr != m_deps.history)
+    {
+        const HistoryHealth h = historyHealth();
+        const bool known = h.answered && HistoryCause::NONE == h.cause;
+        const bool stale = !known || h.ageMs > m_s.historyStaleMs;
+        const std::int64_t agoMs = h.answered ? (steadyNs() - h.atNs) / 1'000'000 : -1;
+        out += ",\"ageMs\":" + (h.answered && (known || HistoryCause::STALE == h.cause || HistoryCause::EPOCH == h.cause)
+                ? std::to_string(h.ageMs) : std::string("null")) +
+            ",\"stale\":" + (stale ? "true" : "false") + ",\"cause\":" +
+            (!h.answered ? std::string("\"unprobed\"") : HistoryCause::NONE == h.cause ? std::string("null")
+                : api::quote(groupOf(h.cause))) +
+            ",\"eventSeq\":" + (known ? std::to_string(h.eventSeq) : std::string("null")) + ",\"probedAgoMs\":" +
+            (agoMs >= 0 ? std::to_string(agoMs) : std::string("null"));
+    }
     if (nullptr != m_deps.historyPool)
     {
         out += ",\"queue\":" + std::to_string(m_deps.historyPool->queued()) + ",\"queueCapacity\":" +
@@ -739,7 +768,8 @@ std::string GatewayApi::metrics(const std::string &p) const
     }
     out += "# HELP " + p + "history_reads_total History reads by query (orders, fills, order), result (ok, not_found, "
         "busy, unavailable) and the cause (busy: none for a full queue, expired for a read that waited past its "
-        "deadline; unavailable: unconfigured, absent, unreachable, timeout, no_heartbeat, bad_row, error, lagging).\n# TYPE " + p + "history_reads_total counter\n";
+        "deadline; unavailable: unconfigured, absent, unreachable, timeout, no_heartbeat, bad_row, error, lagging, epoch, "
+        "stale).\n# TYPE " + p + "history_reads_total counter\n";
     {
         std::lock_guard<std::mutex> lock(m_countMutex);
         for (const auto &[key, n] : m_historyReads)
@@ -758,6 +788,15 @@ std::string GatewayApi::metrics(const std::string &p) const
         out += "# HELP " + p + "pg_history_refused_total History reads refused because the queue was full (503 "
             "HISTORY_BUSY).\n# TYPE " + p + "pg_history_refused_total counter\n" + p + "pg_history_refused_total " +
             std::to_string(m_deps.historyPool->refused()) + "\n";
+    }
+    if (nullptr != m_deps.history)
+    {
+        const HistoryHealth h = historyHealth();
+        const bool known = h.answered && HistoryCause::NONE == h.cause;
+        out += "# HELP " + p + "history_age_ms The history projection's age at the last history probe (-1: no heartbeat "
+            "this gateway can serve: no probe yet, PostgreSQL down, no heartbeat, another genesis, or above "
+            "GATEWAY_HISTORY_MAX_AGE_MS).\n# TYPE " + p + "history_age_ms gauge\n" + p + "history_age_ms " +
+            (known ? std::to_string(h.ageMs) : std::string("-1")) + "\n";
     }
     out += "# HELP " + p + "token_lookup_refused_total Bearer tokens the cache did not hold, refused before the users "
         "store was asked (per-source lookup budget or the lookup share of the store queue).\n# TYPE " + p +

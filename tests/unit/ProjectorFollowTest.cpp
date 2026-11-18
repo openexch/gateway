@@ -31,6 +31,7 @@
 #include "gateway/common/Rest.h"
 #include "FollowRules.h"
 #include "JournalRecord.h"
+#include "ProjectionStore.h"
 
 using namespace openexchange::gateway;
 using namespace openexchange::gateway::projector;
@@ -363,6 +364,32 @@ TEST(backoff_doubles_to_its_cap)
     }
     b.progress();
     CHECK(1000 * ms == b.leave(0));
+}
+
+// One candidate per answered probe while the cursor is below its head: a stall of an hour at one probe a second must
+// not grow without bound. At the cap the oldest goes (the beat waits for a newer probe; none is ever made up).
+TEST(beat_candidates_capped)
+{
+    std::deque<BeatCandidate> beats;
+    std::size_t dropped = 0;
+    for (std::int64_t i = 1; i <= 3600; ++i)
+    {
+        dropped += addBeatCandidate(beats, BeatCandidate{ 100 + i, 7, i * 1'000'000'000LL }, 4);
+    }
+    if (beats.size() > 4)
+    {
+        CHECK_MSG(false, "beat candidates grow without bound: " + std::to_string(beats.size()));
+    }
+    CHECK(3596 == dropped);
+    CHECK(!beats.empty() && 3700 == beats.back().head && 3697 == beats.front().head);
+    // the same head and genesis again: the last one is replaced by the newer send time, nothing is dropped
+    CHECK(0 == addBeatCandidate(beats, BeatCandidate{ 3700, 7, 9 }, 4));
+    CHECK(4 == beats.size() && 9 == beats.back().sentAtNs);
+    // a cap of one keeps the newest only
+    std::deque<BeatCandidate> one;
+    addBeatCandidate(one, BeatCandidate{ 1, 7, 1 }, 1);
+    CHECK(1 == addBeatCandidate(one, BeatCandidate{ 2, 7, 2 }, 1));
+    CHECK(1 == one.size() && 2 == one.front().head);
 }
 
 TEST(behind_window)

@@ -396,8 +396,7 @@ def case_schema(ctx):
         check(len(want) > 0 and got[:len(want)] == want,
               f"projected history differs from the read contract: {rel}\n contract {want}\n projected {got}")
         compared += len(want)
-        if rel == "gateway_history_heartbeat_v1":
-            check(got[len(want):] == ["applied_event_seq bigint", "epoch bigint"], f"heartbeat extra columns {got}")
+        check(got == want, f"projected relation {rel} has columns the read contract does not: {got}")
     print(f"read relations: {compared} contract columns equal")
     check(ctx.pg.sql("schema1", "SELECT count(*) FROM gateway_history_heartbeat_v1") == "0",
           "the heartbeat view has a row before any beat")

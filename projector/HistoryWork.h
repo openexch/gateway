@@ -21,7 +21,8 @@
 //   3. for a FILL with tradeId > 0 and lastQty > 0, the fills row (maker = liquidity MAKER, executed_at_ms = updatedAtMs);
 //   4. the source memo rows of the sources the batch read from, the replay rows started or ended, the halt, then the
 //      fence: applied_seq, applied_log_position, applied_order_id (the greatest order id seen), the epoch of an empty
-//      database. Zero rows at the fence rolls everything back.
+//      database. Zero rows at the fence rolls everything back;
+//   5. after the fence, the beat of the newest probe the batch carries (the beat rule, ProjectionStore.h).
 // A record at or below the cursor is compared with the stored bytes of its sequence (from the database, or from this
 // batch when that sequence was applied by it): equal is a counted skip, different a payload conflict (the line carries
 // the sequence, the source and both SHA-256 values; nothing of it is written).

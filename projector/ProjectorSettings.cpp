@@ -262,6 +262,7 @@ ParseResult<ProjectorSettings> parseProjectorSettings(const Environment &env, co
     s.sourceBackoffMaxMs = r.positive(X + "SOURCE_BACKOFF_MAX_MS", s.sourceBackoffMaxMs);
     s.gapRetryMs = r.positive(X + "GAP_RETRY_MS", s.gapRetryMs);
     s.readyLagMs = r.positive(X + "READY_LAG_MS", s.readyLagMs);
+    s.beatCandidates = r.positive(X + "BEAT_CANDIDATES", s.beatCandidates);
     above(r, X + "HEAD_FRESH_MS", s.headFreshMs, X + "HEAD_PROBE_MS", s.headProbeMs,
         "a healthy copy would read not ready between two probes");
     above(r, X + "READY_LAG_MS", s.readyLagMs, X + "HEAD_PROBE_MS", s.headProbeMs,

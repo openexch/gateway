@@ -14,12 +14,21 @@
 // Read contract v1 (the DDL file is the reference):
 //   gateway_order_history_v1  the Order columns plus user_id; key (updated_at_ms, order_id), newest first
 //   gateway_fills_v1          the Fill columns plus user_id; key (executed_at_ms, trade_id, order_id), newest first
-//   gateway_history_heartbeat_v1 (beat_at timestamptz, applied_order_id bigint): the projection writes now() whenever
-//                             it has applied everything it has read, and the highest order id it has applied; ageMs =
-//                             the database clock minus the newest beat_at, in whole milliseconds, never below 0 (one
-//                             clock, the database's: no skew between hosts). The projection writes every order from
-//                             its creation on, so an order id above applied_order_id without a row may exist and not be
-//                             projected yet: GET /orders/{orderId} answers 503 (LAGGING), never 404, for it
+//   gateway_history_heartbeat_v1 (beat_at timestamptz, applied_order_id bigint, applied_event_seq bigint, epoch
+//                             bigint): beat_at is the instant as of which the projection holds every event of its
+//                             genesis (it beats only when it has applied the core's head as a cluster probe read it);
+//                             applied_order_id the highest order id it has applied, applied_event_seq its cursor (every
+//                             event up to it is applied, committed with the rows), epoch the core genesisId it
+//                             projects. ageMs = the database clock minus the newest beat_at, in whole milliseconds,
+//                             never below 0 (one clock, the database's: no skew between hosts). The projection writes
+//                             every order from its creation on, so an order id above applied_order_id without a row may
+//                             exist and not be projected yet: GET /orders/{orderId} answers 503 (LAGGING), never 404
+//
+// The checks of a history read, in this order (the first that fails answers 503 HISTORY_UNAVAILABLE): PostgreSQL
+// reachable and answering (cause pg); a heartbeat row (cause heartbeat); its epoch equal to the genesisId of the
+// gateway's last CoreConfigReport (cause epoch; a gateway that never read a report cannot know, the same 503); its age
+// at most GATEWAY_HISTORY_MAX_AGE_MS when that is set (cause stale); the LAGGING rule of GET /orders/{orderId}; then
+// the rows, with asOf {ageMs, stale (ageMs above GATEWAY_HISTORY_STALE_MS), eventSeq (applied_event_seq)}.
 // Amounts are BIGINT integer units at the wire's scale 10^8, rendered as the REST decimal strings; enum columns hold
 // the core's names; times are BIGINT epoch milliseconds (core cluster time).
 //
@@ -39,7 +48,7 @@
 //
 // Test-only control (never in a published build): GW_NC_OFFSET_PAGING pages with OFFSET (the cursor carries the
 // count of rows served) instead of the key; the PG test history_keyset_walk_under_concurrent_inserts must then fail
-// with "row skipped or repeated".
+// with "row skipped or repeated". The store's and the routes' controls are named in PgHistoryStore.h and GatewayApi.h.
 
 namespace openexchange { namespace gateway { namespace history {
 
@@ -83,8 +92,8 @@ struct Statement
 Statement pageStatement(const PageRequest &request);
 // One order of the user by id (GET /orders/{orderId} of an order the core does not hold open).
 Statement orderStatement(std::int64_t userId, std::int64_t orderId);
-// One row: the projection's age in milliseconds and its applied_order_id (both NULL when the heartbeat relation holds
-// no row).
+// One row: the projection's age in milliseconds, its applied_order_id, applied_event_seq and the lowest and highest
+// epoch (all NULL when the heartbeat relation holds no row).
 const std::string &heartbeatStatement();
 
 std::string encodeCursor(Kind kind, const Filter &filter, const Key &key);
@@ -132,10 +141,31 @@ enum class HistoryCause : std::uint8_t
     NO_HEARTBEAT, // the heartbeat relation holds no row: the projection never reported
     BAD_ROW,      // a row that does not have the contract's shape
     ERROR,        // any other server error
-    LAGGING       // GET /orders/{orderId}: no row, and the id is above the projection's applied_order_id
+    LAGGING,      // GET /orders/{orderId}: no row, and the id is above the projection's applied_order_id
+    EPOCH,        // the heartbeat's epoch is not the genesisId of the gateway's last CoreConfigReport (or none was read)
+    STALE         // the heartbeat is older than GATEWAY_HISTORY_MAX_AGE_MS (only when that is set)
 };
 const char *nameOf(HistoryCause c) noexcept;
-inline constexpr int HISTORY_CAUSES = 9;
+inline constexpr int HISTORY_CAUSES = 11;
+// The cause as /health and the catch order name it: pg (unconfigured, absent, unreachable, timeout, bad_row, error),
+// heartbeat, epoch, stale, lagging; "" for NONE.
+const char *groupOf(HistoryCause c) noexcept;
+
+// What a history read is checked against, taken when the read is queued.
+struct HistoryExpect
+{
+    std::int64_t genesisId = 0; // of the gateway's last CoreConfigReport; 0: none read (every read is cause epoch)
+    std::int64_t maxAgeMs = 0;  // GATEWAY_HISTORY_MAX_AGE_MS; 0: off
+};
+
+// The heartbeat as one read found it.
+struct HistoryAsOf
+{
+    std::int64_t ageMs = 0;
+    std::int64_t eventSeq = 0;      // applied_event_seq: every event up to it is in the rows read after it
+    std::int64_t appliedOrderId = 0;
+    std::int64_t epoch = 0;
+};
 
 struct HistoryAnswer
 {
@@ -148,6 +178,7 @@ struct HistoryPage
     std::vector<std::string> items; // JSON objects, newest first
     std::optional<std::string> nextCursor;
     std::int64_t ageMs = 0;
+    std::int64_t eventSeq = 0;      // the heartbeat's applied_event_seq, read before the rows
 };
 
 // Every call is synchronous and runs on a history worker (WorkPool gw-pg-hist, the index is `worker`): never an I/O
@@ -159,11 +190,14 @@ class HistoryStore
 public:
     virtual ~HistoryStore() = default;
     virtual HistoryAnswer page(int worker, const history::PageRequest &request, HistoryPage &out,
-        std::int64_t deadlineNs) = 0;
+        std::int64_t deadlineNs, const HistoryExpect &expect) = 0;
     // NOT_FOUND when the user has no such order (unknown, or another user's: one answer for both) and the id is at or
-    // below the projection's applied_order_id; above it, UNAVAILABLE with cause LAGGING
+    // below the projection's applied_order_id; above it, UNAVAILABLE with cause LAGGING. `asOf` is the heartbeat the
+    // lookup was checked against (the answer's asOf)
     virtual HistoryAnswer order(int worker, std::int64_t userId, std::int64_t orderId, std::string &json,
-        std::int64_t deadlineNs) = 0;
+        HistoryAsOf &asOf, std::int64_t deadlineNs, const HistoryExpect &expect) = 0;
+    // The heartbeat alone, through the same checks as a read (the /health probe)
+    virtual HistoryAnswer probe(int worker, HistoryAsOf &out, std::int64_t deadlineNs, const HistoryExpect &expect) = 0;
     virtual std::string state() const = 0;
 };
 

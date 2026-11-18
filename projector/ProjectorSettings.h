@@ -60,6 +60,8 @@
 //   _BATCH_EVENTS 256, _BATCH_MS 50, _QUEUE_EVENTS 4096
 //   _HEAD_PROBE_MS 1000, _HEAD_FRESH_MS 3000, _ARCHIVE_TIMEOUT_MS 5000, _RELIST_MS 1000, _SOURCE_BEHIND_MS 5000,
 //   _SOURCE_BACKOFF_MS 1000, _SOURCE_BACKOFF_MAX_MS 30000, _GAP_RETRY_MS 5000, _READY_LAG_MS 5000
+//   _BEAT_CANDIDATES 4096  answered head probes kept while the cursor is below their head (one per probe); past it the
+//                          oldest is dropped (counted in /health beatsDropped): the beat then waits for a newer probe
 // Pairs: _HEAD_FRESH_MS and _READY_LAG_MS above _HEAD_PROBE_MS (else a healthy copy flaps not ready between two
 // probes); _SOURCE_BACKOFF_MAX_MS at least _SOURCE_BACKOFF_MS; _LEASE_POLL_MS below _LEASE_MS (a standby that polls less
 // often than a lease lasts adds a whole lease to every takeover); _PG_STATEMENT_TIMEOUT_MS below a third of _LEASE_MS (a renewal that
@@ -118,6 +120,7 @@ struct ProjectorSettings
     std::int64_t sourceBackoffMaxMs = 30'000;
     std::int64_t gapRetryMs = 5000;
     std::int64_t readyLagMs = 5000;
+    std::int64_t beatCandidates = 4096;
     std::vector<std::string> warnings; // accepted but worth an operator's look: written at boot as WARN lines
 };
 
