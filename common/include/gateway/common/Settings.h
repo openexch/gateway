@@ -167,8 +167,12 @@ struct GatewaySettings
     std::int64_t historyRetryAfterMs = 60'000;   // Retry-After of 503 HISTORY_UNAVAILABLE
     std::int64_t historyBusyRetryAfterMs = 1000; // Retry-After of 503 HISTORY_BUSY
     std::int64_t historyLagRetryAfterMs = 1000;  // Retry-After of 503 HISTORY_UNAVAILABLE: an order not projected yet
+    std::int64_t historyStaleMs = 5000;          // asOf.stale above this age
+    std::int64_t historyMaxAgeMs = 0;            // 0 = off; above it every history read is 503 HISTORY_UNAVAILABLE
+    std::int64_t historyProbeMs = 5000;          // the /health history probe's cadence
     std::vector<FaucetCap> faucetMaxAmount;
     Rate faucetRate;
+    std::vector<std::string> warnings;           // boot WARN lines (a setting accepted but not recommended)
 };
 
 // One cluster node's own probe endpoint (cluster-kit NodeEndpoint: /health, /ready, /metrics), as configured.

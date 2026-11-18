@@ -58,7 +58,8 @@ struct Item
         REPLAY_STARTED,// record the replay before any record of it is applied
         REPLAY_ENDED,  // the replay was stopped (or found gone): forget it
         EPOCH,         // the cluster's genesis for an empty database
-        HALT           // the halt state changed (written to the state row)
+        HALT,          // the halt state changed (written to the state row)
+        BEAT           // an answered head probe whose head the cursor has reached: the beat rule (ProjectionStore.h)
     };
     Kind kind = Kind::APPLY;
     std::uint64_t generation = 0;
@@ -68,8 +69,10 @@ struct Item
     std::int64_t endPosition = 0;
     JournalRecord record;       // APPLY, COMPARE
     ReplayRow replay;           // REPLAY_*
-    std::int64_t epoch = 0;     // EPOCH
+    std::int64_t epoch = 0;     // EPOCH; BEAT: the genesisId the probe answered
     HaltState halt;             // HALT
+    std::int64_t head = 0;      // BEAT: the core's head the probe answered
+    std::int64_t sentAtNs = 0;  // BEAT: when the probe was sent (monotonic)
 };
 
 struct Reset

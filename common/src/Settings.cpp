@@ -34,7 +34,11 @@
 //   GATEWAY_HISTORY_LIMIT_DEFAULT 100 (<= _MAX), GATEWAY_HISTORY_LIMIT_MAX 1000 (a larger limit is 400),
 //   GATEWAY_HISTORY_RETRY_AFTER_MS 60000 (Retry-After of 503 HISTORY_UNAVAILABLE), GATEWAY_HISTORY_BUSY_RETRY_AFTER_MS
 //   1000 (Retry-After of 503 HISTORY_BUSY), GATEWAY_HISTORY_LAG_RETRY_AFTER_MS 1000 (Retry-After of the 503
-//   HISTORY_UNAVAILABLE of GET /orders/{orderId} for an id above the projection's applied_order_id: not projected yet).
+//   HISTORY_UNAVAILABLE of GET /orders/{orderId} for an id above the projection's applied_order_id: not projected yet),
+//   GATEWAY_HISTORY_STALE_MS 5000 (a history answer older than this says asOf.stale true; at or below the projector's
+//   default head probe cadence, 1000, it is accepted with a boot WARN), GATEWAY_HISTORY_MAX_AGE_MS 0 (0 = off; when
+//   set, above GATEWAY_HISTORY_STALE_MS, or the boot is refused: every history read older than it is 503
+//   HISTORY_UNAVAILABLE), GATEWAY_HISTORY_PROBE_MS 5000 (the cadence of the history probe /health shows).
 //   History is read when GATEWAY_PG_URL is set, on its own pool (GATEWAY_PG_HISTORY_POOL connections over a queue of
 //   its own, sized GATEWAY_PG_QUEUE like the auth pool's), never the auth pool's connections;
 //   GATEWAY_PG_STATEMENT_TIMEOUT_MS is also one history read's whole deadline, queue wait included,
@@ -855,6 +859,38 @@ ParseResult<GatewaySettings> parseGatewaySettings(const Environment &env, const 
     g.historyRetryAfterMs = r.positive("GATEWAY_HISTORY_RETRY_AFTER_MS", g.historyRetryAfterMs);
     g.historyBusyRetryAfterMs = r.positive("GATEWAY_HISTORY_BUSY_RETRY_AFTER_MS", g.historyBusyRetryAfterMs);
     g.historyLagRetryAfterMs = r.positive("GATEWAY_HISTORY_LAG_RETRY_AFTER_MS", g.historyLagRetryAfterMs);
+    g.historyStaleMs = r.positive("GATEWAY_HISTORY_STALE_MS", g.historyStaleMs);
+    {
+        // 0 is the default and means off: the reader's positive() refuses it, so "0" is read here
+        const std::string key = "GATEWAY_HISTORY_MAX_AGE_MS";
+        const std::optional<std::string> v = r.raw(key);
+        if (v && "0" == *v)
+        {
+            g.historyMaxAgeMs = 0;
+            r.record(key, "0", "set");
+        }
+        else if (!v)
+        {
+            g.historyMaxAgeMs = 0;
+            r.record(key, "0", "default");
+        }
+        else
+        {
+            g.historyMaxAgeMs = r.positive(key, 0);
+        }
+        if (g.historyMaxAgeMs > 0 && g.historyMaxAgeMs <= g.historyStaleMs)
+        {
+            r.problem(key + " (" + std::to_string(g.historyMaxAgeMs) + ") must be above GATEWAY_HISTORY_STALE_MS (" +
+                std::to_string(g.historyStaleMs) + ") when set: history would be refused before it is ever labelled "
+                "stale");
+        }
+    }
+    g.historyProbeMs = r.positive("GATEWAY_HISTORY_PROBE_MS", g.historyProbeMs);
+    if (g.historyStaleMs <= 1000)
+    {
+        g.warnings.push_back("GATEWAY_HISTORY_STALE_MS (" + std::to_string(g.historyStaleMs) + ") is not above the "
+            "history projector's default head probe cadence (1000 ms): fresh history can read stale between two beats");
+    }
     if (g.historyLimitDefault > g.historyLimitMax)
     {
         r.problem("GATEWAY_HISTORY_LIMIT_DEFAULT (" + std::to_string(g.historyLimitDefault) +

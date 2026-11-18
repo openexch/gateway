@@ -2,6 +2,7 @@
 #define GATEWAY_GATEWAY_API_H
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -10,6 +11,7 @@
 #include <string>
 #include <optional>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -129,8 +131,20 @@ class GatewayApi
 {
 public:
     explicit GatewayApi(ApiDeps deps);
+    ~GatewayApi();
 
     void handle(std::shared_ptr<HttpExchange> ex);
+
+    // The history probe behind /health: every GATEWAY_HISTORY_PROBE_MS one heartbeat read on the history pool, through
+    // the checks of a history read (History.h). /health shows history {ageMs, stale, cause, eventSeq, probedAgoMs} from
+    // the last probe, and the metric gateway_history_age_ms. A probe that has not answered for two intervals and the
+    // read deadline reads cause "unprobed", stale true: /health never shows fresh history without a probe. /ready does
+    // not depend on it (the order path does not depend on PostgreSQL). Without GATEWAY_PG_URL nothing is started.
+    // Test-only control (never in a published build): GW_NC_NO_HISTORY_PROBE starts no probe and shows what the last
+    // successful history read found instead.
+    void startHistoryProbe();
+    void stopHistoryProbe();
+    void probeHistoryOnce(); // one probe submitted now (the loop's step)
 
     std::string healthJson() const;
     std::string metrics(const std::string &prefix) const;
@@ -191,6 +205,8 @@ private:
     // starts after its deadline is not run: 503 HISTORY_BUSY (its client has waited out the read's time in the queue).
     bool runHistory(const Ex &ex, const char *route, const char *query, std::function<void(int, std::int64_t)> job);
     ApiResponse historyUnavailable(HistoryCause cause, const char *query);
+    HistoryExpect historyExpect() const;
+    std::string asOfJson(std::int64_t ageMs, std::int64_t eventSeq) const;
     void countHistory(const char *query, const char *result);
 
     // ---- GatewayApi.cpp
@@ -228,6 +244,23 @@ private:
     std::atomic<std::uint64_t> m_userIdConflicts{ 0 };
     std::atomic<std::uint64_t> m_authRateLimited{ 0 };
     std::atomic<std::uint64_t> m_hashBusy{ 0 };
+    struct HistoryHealth
+    {
+        bool answered = false;          // a probe (or, in the control build, a read) has answered
+        std::int64_t atNs = 0;          // steady clock of that answer
+        HistoryCause cause = HistoryCause::NONE;
+        std::int64_t ageMs = 0;
+        std::int64_t eventSeq = 0;
+    };
+    void noteHistory(HistoryCause cause, std::int64_t ageMs, std::int64_t eventSeq);
+    HistoryHealth historyHealth() const;
+    mutable std::mutex m_historyHealthMutex;
+    HistoryHealth m_historyHealth;
+    std::atomic<bool> m_probeInFlight{ false };
+    std::mutex m_probeMutex;
+    std::condition_variable m_probeWake;
+    bool m_probeStop = false;
+    std::thread m_probeThread;
     mutable std::mutex m_countMutex;
     std::map<std::pair<std::string, unsigned>, std::uint64_t> m_requests; // (route, status) -> count
     std::map<std::pair<std::string, std::string>, std::uint64_t> m_historyReads; // (query, result) -> count

@@ -18,6 +18,12 @@
 //                                and types (sql/history_read_contract_v1.sql)
 //   reference_equivalence        the same logical rows in the reference tables and as projected records render the same
 //                                JSON for every case
+//   beat_rule                    the beat statement against what the transaction committed: a probe whose head is
+//                                applied beats (beat_at = the database's clock less the time since the probe was sent);
+//                                a head above the cursor, another genesis, a halt, a renewal, an older probe: no beat
+//   rebuild_reads                the gateway's store reading during an in-place rebuild and the re-projection after it:
+//                                503 cause heartbeat from the truncate until the first beat, never a page, never 404 for
+//                                an order that existed; complete pages after the beat
 // The control builds (tests/CMakeLists.txt) switch one rule off each and must fail with the named text.
 #include <unistd.h>
 
@@ -25,7 +31,9 @@
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <atomic>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -281,7 +289,7 @@ struct Rig
 
     // one batch: due (takes what is queued), the fenced transaction, committed on HELD
     Hold commit(const std::function<void()> &beforeFence = {}, const std::function<void()> &beforeCommit = {},
-        bool ack = true)
+        bool ack = true, bool *beat = nullptr)
     {
         if (!work.due(INT64_MAX / 2))
         {
@@ -291,7 +299,7 @@ struct Rig
         std::string error;
         const Hold h = lease.commitFenced(conn, T,
             [&](PgConn &c, std::string &e) { return work.write(c, lease.token(), advance, e); }, advance, error,
-            beforeFence, beforeCommit);
+            beforeFence, beforeCommit, beat);
         lastError = error;
         if (Hold::HELD == h)
         {
@@ -331,6 +339,18 @@ struct Rig
     }
 
     void release() { lease.release(conn, T); }
+
+    // an answered head probe (H, G) sent `agoMs` ago, as pj-duty hands it on
+    void beat(std::int64_t head, std::int64_t genesis, std::int64_t agoMs = 0)
+    {
+        Item i;
+        i.kind = Item::Kind::BEAT;
+        i.head = head;
+        i.epoch = genesis;
+        i.sentAtNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count() - agoMs * 1'000'000;
+        pushItem(i);
+    }
 
     std::string url;
     PgConn conn;
@@ -888,7 +908,9 @@ TEST(read_contract_compat)
     }
     const std::string hbMine = shapeOf(url, "gateway_history_heartbeat_v1");
     CHECK_MSG(std::string::npos != hbMine.find("beat_at:timestamp with time zone") &&
-        std::string::npos != hbMine.find("applied_order_id:bigint"), hbMine);
+        std::string::npos != hbMine.find("applied_order_id:bigint") &&
+        std::string::npos != hbMine.find("applied_event_seq:bigint") && std::string::npos != hbMine.find("epoch:bigint"),
+        hbMine);
     // the expected JSON of the story, from its records (the stream's mapping)
     std::map<std::int64_t, const JournalRecord *> last;
     for (const auto &r : s)
@@ -908,7 +930,7 @@ TEST(read_contract_compat)
     {
         HistoryPage page;
         const HistoryAnswer a = store.page(0, history::PageRequest{ history::Kind::ORDERS, 501, {}, std::nullopt, 50 }, page,
-            deadline());
+            deadline(), HistoryExpect{ EPOCH, 0 });
         CHECK_MSG(HistoryStatus::UNAVAILABLE == a.status && HistoryCause::NO_HEARTBEAT == a.cause, nameOf(a.cause));
         answers++;
     }
@@ -930,7 +952,7 @@ TEST(read_contract_compat)
         });
         HistoryPage page;
         const HistoryAnswer a = store.page(0, history::PageRequest{ history::Kind::ORDERS, user, {}, std::nullopt, 500 },
-            page, deadline());
+            page, deadline(), HistoryExpect{ EPOCH, 0 });
         if (HistoryStatus::OK != a.status)
         {
             CHECK_MSG(false, std::string("projected history differs from the read contract: orders page ") +
@@ -946,13 +968,15 @@ TEST(read_contract_compat)
         for (const JournalRecord *r : mine)
         {
             std::string json;
-            const HistoryAnswer o = store.order(0, user, r->event.orderId, json, deadline());
+            HistoryAsOf asOf;
+            const HistoryAnswer o = store.order(0, user, r->event.orderId, json, asOf, deadline(),
+                HistoryExpect{ EPOCH, 0 });
             answers++;
             differs = differs || HistoryStatus::OK != o.status || json != rest::orderJson(r->event);
         }
         HistoryPage fills;
         const HistoryAnswer f = store.page(0, history::PageRequest{ history::Kind::FILLS, user, {}, std::nullopt, 500 },
-            fills, deadline());
+            fills, deadline(), HistoryExpect{ EPOCH, 0 });
         if (HistoryStatus::OK != f.status)
         {
             CHECK_MSG(false, std::string("projected history differs from the read contract: fills page ") +
@@ -987,9 +1011,10 @@ TEST(read_contract_compat)
     }
     // LAGGING: an order id above applied_order_id with no row
     std::string json;
-    const HistoryAnswer lag = store.order(0, 501, 9999, json, deadline());
+    HistoryAsOf asOf;
+    const HistoryAnswer lag = store.order(0, 501, 9999, json, asOf, deadline(), HistoryExpect{ EPOCH, 0 });
     CHECK_MSG(HistoryStatus::UNAVAILABLE == lag.status && HistoryCause::LAGGING == lag.cause, nameOf(lag.cause));
-    const HistoryAnswer nf = store.order(0, 502, 1, json, deadline()); // another user's order: not found
+    const HistoryAnswer nf = store.order(0, 502, 1, json, asOf, deadline(), HistoryExpect{ EPOCH, 0 }); // another user's order: not found
     CHECK(HistoryStatus::NOT_FOUND == nf.status);
     answers += 2;
     std::printf("  compatibility: %d answers compared\n", answers);
@@ -1056,4 +1081,268 @@ TEST(reference_equivalence)
     }
     std::printf("  equivalence: %d orders compared (the reference suite's own seeds are not records: not compared)\n",
         cases);
+}
+
+namespace {
+
+std::string beatAt(const std::string &url)
+{
+    return one(url, "SELECT coalesce(beat_at::text, 'null') FROM oe_projection_state");
+}
+
+}
+
+TEST(beat_rule)
+{
+    const std::string url = gwtest::freshDatabase("pj_beat");
+    Rig rig(url);
+    CHECK(rig.start());
+    rig.epoch(EPOCH);
+    const std::vector<JournalRecord> s = story();
+    for (const auto &r : s)
+    {
+        rig.push(Item::Kind::APPLY, r);
+    }
+    CHECK(Hold::HELD == rig.commit());
+    const std::int64_t n = static_cast<std::int64_t>(s.size());
+    CHECK_MSG("null" == beatAt(url), "a beat before any probe: " + beatAt(url));
+    // the head applied, the genesis the projection's: a beat, as of the probe's send time on the database's clock
+    bool wrote = false;
+    rig.beat(n, EPOCH, 400);
+    CHECK(Hold::HELD == rig.commit({}, {}, true, &wrote));
+    const std::int64_t ageMs = num(url, "SELECT (extract(epoch FROM clock_timestamp() - beat_at) * 1000)::bigint FROM "
+        "oe_projection_state");
+    CHECK_MSG(wrote && ageMs >= 400 && ageMs < 3000, "beat at the head: written " + std::to_string(wrote) + ", age " +
+        std::to_string(ageMs) + " ms");
+    CHECK_MSG(n == num(url, "SELECT head_seq FROM oe_projection_state"), "head_seq " + beatAt(url));
+    CHECK_MSG(1 == num(url, "SELECT count(*) FROM gateway_history_heartbeat_v1 WHERE applied_event_seq = " +
+        std::to_string(n) + " AND epoch = " + std::to_string(EPOCH)), "the heartbeat view row");
+    std::string last = beatAt(url);
+    bool fresh = true;     // false once a beat is written without a fresh head
+    bool sameGenesis = true;
+    auto noBeat = [&](const char *what, bool &flag) {
+        const std::string now = beatAt(url);
+        if (now != last)
+        {
+            flag = false;
+            CHECK_MSG(false, std::string(what) + ": beat_at moved from " + last + " to " + now);
+        }
+        last = now;
+    };
+    // a head above the cursor: no beat, whatever else holds
+    rig.beat(n + 5, EPOCH);
+    CHECK(Hold::HELD == rig.commit({}, {}, true, &wrote));
+    noBeat("applied below head", fresh);
+    // a renewal alone (an idle writer): no beat
+    {
+        ProjectionState st;
+        std::string error;
+        CHECK(Hold::HELD == rig.lease.renew(rig.conn, T, st, error));
+    }
+    noBeat("renewal without a probe", fresh);
+    // an older probe than the last beat: beat_at never moves back
+    rig.beat(n, EPOCH, 5000);
+    CHECK(Hold::HELD == rig.commit());
+    noBeat("older probe", fresh);
+    // another genesis, its head reached (a projection of an old genesis is far above a new one's head)
+    rig.beat(1, EPOCH + 1);
+    CHECK(Hold::HELD == rig.commit());
+    noBeat("probe of another genesis", sameGenesis);
+    // the projection halted
+    Item halt;
+    halt.kind = Item::Kind::HALT;
+    halt.halt = HaltState{ Halt::GAP, "test" };
+    rig.pushItem(halt);
+    CHECK(Hold::HELD == rig.commit());
+    last = beatAt(url);
+    rig.beat(n, EPOCH);
+    CHECK(Hold::HELD == rig.commit());
+    noBeat("halted", fresh);
+    // halted EPOCH_MISMATCH, a probe of the new genesis whose head the old cursor is far above
+    halt.halt = HaltState{ Halt::EPOCH_MISMATCH, "test" };
+    rig.pushItem(halt);
+    CHECK(Hold::HELD == rig.commit());
+    last = beatAt(url);
+    rig.beat(2, EPOCH + 1);
+    CHECK(Hold::HELD == rig.commit());
+    noBeat("EPOCH_MISMATCH", sameGenesis);
+    // the halt cleared: the projection's own genesis beats again
+    halt.halt = HaltState{};
+    rig.pushItem(halt);
+    CHECK(Hold::HELD == rig.commit());
+    rig.beat(n, EPOCH);
+    CHECK(Hold::HELD == rig.commit({}, {}, true, &wrote));
+    CHECK_MSG(wrote && beatAt(url) != last, "no beat after the halt cleared");
+    rig.release();
+    if (!fresh)
+    {
+        CHECK_MSG(false, "beat without a fresh head");
+    }
+    if (!sameGenesis)
+    {
+        CHECK_MSG(false, "beat across genesis ids");
+    }
+}
+
+TEST(rebuild_reads)
+{
+    const std::string url = gwtest::freshDatabase("pj_rebuild_reads");
+    Rig rig(url);
+    CHECK(rig.start());
+    rig.epoch(EPOCH);
+    const std::vector<JournalRecord> s = story();
+    for (const auto &r : s)
+    {
+        rig.push(Item::Kind::APPLY, r);
+    }
+    rig.beat(static_cast<std::int64_t>(s.size()), EPOCH);
+    CHECK(Hold::HELD == rig.commit());
+    const std::int64_t user = 501;
+    std::set<std::int64_t> mine;
+    for (const auto &r : s)
+    {
+        if (r.event.userId == user)
+        {
+            mine.insert(r.event.orderId);
+        }
+    }
+    auto mono = [] {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    };
+    struct Read
+    {
+        std::int64_t startNs = 0;
+        std::int64_t endNs = 0;
+        bool page = true;
+        HistoryAnswer answer;
+        std::size_t items = 0;
+        std::int64_t ageMs = 0;
+    };
+    std::vector<Read> reads;
+    std::atomic<bool> reading{ true };
+    std::thread reader([&] {
+        PgHistorySettings hs;
+        hs.url = url;
+        hs.workers = 1;
+        PgHistoryStore store(hs);
+        std::size_t k = 0;
+        while (reading.load())
+        {
+            Read r;
+            r.startNs = mono();
+            r.page = 0 == k % 2;
+            if (r.page)
+            {
+                HistoryPage page;
+                r.answer = store.page(0, history::PageRequest{ history::Kind::ORDERS, user, {}, std::nullopt, 500 }, page,
+                    mono() + 5'000'000'000LL, HistoryExpect{ EPOCH, 0 });
+                r.items = page.items.size();
+                r.ageMs = page.ageMs;
+            }
+            else
+            {
+                std::string json;
+                HistoryAsOf asOf;
+                const auto it = std::next(mine.begin(), static_cast<long>(k / 2 % mine.size()));
+                r.answer = store.order(0, user, *it, json, asOf, mono() + 5'000'000'000LL, HistoryExpect{ EPOCH, 0 });
+            }
+            r.endNs = mono();
+            reads.push_back(r);
+            k++;
+            sleepMs(2);
+        }
+    });
+    sleepMs(200);
+    // the rebuild (its TRUNCATE waits behind the reads, bounded; run again until it commits)
+    const std::int64_t rebuildStart = mono();
+    Hold h = Hold::FAILED;
+    for (int attempt = 0; attempt < 20 && Hold::HELD != h; ++attempt)
+    {
+        std::string error;
+        h = rig.lease.rebuild(rig.conn, T, 1000, error);
+        if (Hold::HELD != h)
+        {
+            std::printf("  rebuild attempt %d: %s\n", attempt, error.c_str());
+            if (!rig.conn.ok())
+            {
+                rig.connect();
+            }
+        }
+    }
+    CHECK(Hold::HELD == h);
+    const std::int64_t rebuildDone = mono();
+    // the re-projection: the writer reads the reset row and starts over, in several batches, then beats at the head
+    CHECK(rig.reassert());
+    CHECK(Hold::HELD == rig.commit());
+    CHECK(rig.loadGeneration());
+    rig.epoch(EPOCH);
+    CHECK(Hold::HELD == rig.commit());
+    for (std::size_t i = 0; i < s.size(); ++i)
+    {
+        rig.push(Item::Kind::APPLY, s[i]);
+        if (0 == i % 10)
+        {
+            CHECK(Hold::HELD == rig.commit());
+            sleepMs(20);
+        }
+    }
+    CHECK(Hold::HELD == rig.commit());
+    sleepMs(100);
+    const std::int64_t beatStart = mono();
+    rig.beat(static_cast<std::int64_t>(s.size()), EPOCH);
+    bool wrote = false;
+    CHECK(Hold::HELD == rig.commit({}, {}, true, &wrote));
+    CHECK(wrote);
+    const std::int64_t beatDone = mono();
+    sleepMs(200);
+    reading = false;
+    reader.join();
+    rig.release();
+    int during = 0;
+    int after = 0;
+    int servedEarly = 0;
+    int otherCause = 0;
+    int notFound = 0;
+    int incompleteAfter = 0;
+    for (const Read &r : reads)
+    {
+        if (r.startNs >= rebuildDone && r.endNs <= beatStart)
+        {
+            during++;
+            if (HistoryStatus::NOT_FOUND == r.answer.status)
+            {
+                notFound++;
+            }
+            else if (HistoryStatus::OK == r.answer.status)
+            {
+                servedEarly++; // a page or an order of a projection that has not reached the head
+            }
+            else if (HistoryCause::NO_HEARTBEAT != r.answer.cause)
+            {
+                otherCause++;
+            }
+        }
+        else if (r.startNs >= beatDone)
+        {
+            after++;
+            const bool complete = HistoryStatus::OK == r.answer.status && (!r.page || r.items == mine.size());
+            incompleteAfter += complete ? 0 : 1;
+        }
+        else if (r.endNs <= rebuildStart && r.page)
+        {
+            CHECK_MSG(HistoryStatus::OK == r.answer.status && r.items == mine.size(), "before the rebuild");
+        }
+    }
+    std::printf("  rebuild: %d reads inside the rebuild, %d after the beat\n", during, after);
+    CHECK_MSG(during >= 20 && after >= 10, "reads inside " + std::to_string(during) + ", after " + std::to_string(after));
+    CHECK_MSG(0 == notFound, std::to_string(notFound) + " reads answered 404 for an order that existed");
+    CHECK_MSG(0 == otherCause, std::to_string(otherCause) + " reads inside the rebuild answered 503 with a cause other "
+        "than heartbeat");
+    if (servedEarly > 0 || notFound > 0)
+    {
+        CHECK_MSG(false, "rebuilding history served as complete: " + std::to_string(servedEarly) + " reads answered "
+            "with rows and " + std::to_string(notFound) + " with 404 between the truncate and the first beat");
+    }
+    CHECK_MSG(0 == incompleteAfter, std::to_string(incompleteAfter) + " reads after the beat were not complete");
 }

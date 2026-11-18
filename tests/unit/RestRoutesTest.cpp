@@ -1245,7 +1245,8 @@ TEST(routes_history_pages)
     stub.canned.nextCursor.reset();
     stub.canned.items.clear();
     r = rig.call("GET", "/api/v2/fills?limit=1000&orderId=900", "", as(9));
-    CHECK_MSG(200 == r.status && r.body == R"({"items":[],"nextCursor":null,"asOf":{"ageMs":1234}})", what(r));
+    CHECK_MSG(200 == r.status && r.body == R"({"items":[],"nextCursor":null,"asOf":{"ageMs":1234,"stale":false,"eventSeq":0}})",
+        what(r));
     std::lock_guard<std::mutex> l(stub.mutex);
     CHECK(stub.requests.size() == 3);
     if (stub.requests.size() == 3)
@@ -1381,9 +1382,12 @@ TEST(routes_order_from_history)
     // open: the core answers, history is not asked
     r = rig.call("GET", "/api/v2/orders/" + open, "", as(7));
     CHECK_MSG(200 == r.status && str(body(r), "orderId") == open && 0 == stub.calls.load(), what(r));
-    // not open: the caller's row in history
+    // not open: the caller's row in history, with the read's asOf (stale above GATEWAY_HISTORY_STALE_MS, 5000)
+    stub.canned.ageMs = 7000;
+    stub.canned.eventSeq = 41;
     r = rig.call("GET", "/api/v2/orders/900", "", as(7));
-    CHECK_MSG(200 == r.status && r.body == HISTORY_ORDER, what(r));
+    CHECK_MSG(200 == r.status && r.body == HISTORY_ORDER.substr(0, HISTORY_ORDER.size() - 1) +
+        R"(,"asOf":{"ageMs":7000,"stale":true,"eventSeq":41}})", what(r));
     // another user's closed order, another user's open order, an unknown id: one 404 body for all three
     const HttpResult foreign = rig.call("GET", "/api/v2/orders/901", "", as(7));
     const HttpResult foreignOpen = rig.call("GET", "/api/v2/orders/" + open, "", as(8));

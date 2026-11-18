@@ -232,11 +232,12 @@ Statement orderStatement(std::int64_t userId, std::int64_t orderId)
 const std::string &heartbeatStatement()
 {
     // NULL when there is no row: GREATEST ignores NULL, so the empty case is tested before it (else it reads as age 0).
-    // applied_order_id: the lowest of the rows (one row in the reference DDL; with more, the conservative one, so an
-    // order is never answered 404 before every reporter has applied it)
+    // applied_order_id and applied_event_seq: the lowest of the rows (one row in the reference DDL; with more, the
+    // conservative one, so an order is never answered 404 before every reporter has applied it); two epochs among the
+    // rows match no genesis
     static const std::string sql = "SELECT CASE WHEN max(beat_at) IS NULL THEN NULL ELSE GREATEST(0, floor(extract("
-        "epoch FROM (clock_timestamp() - max(beat_at))) * 1000))::bigint END, min(applied_order_id) "
-        "FROM gateway_history_heartbeat_v1";
+        "epoch FROM (clock_timestamp() - max(beat_at))) * 1000))::bigint END, min(applied_order_id), "
+        "min(applied_event_seq), min(epoch), max(epoch) FROM gateway_history_heartbeat_v1";
     return sql;
 }
 
@@ -405,6 +406,27 @@ const char *nameOf(HistoryCause c) noexcept
         case HistoryCause::NO_HEARTBEAT: return "no_heartbeat";
         case HistoryCause::BAD_ROW: return "bad_row";
         case HistoryCause::ERROR: return "error";
+        case HistoryCause::LAGGING: return "lagging";
+        case HistoryCause::EPOCH: return "epoch";
+        case HistoryCause::STALE: return "stale";
+    }
+    return "?";
+}
+
+const char *groupOf(HistoryCause c) noexcept
+{
+    switch (c)
+    {
+        case HistoryCause::NONE: return "";
+        case HistoryCause::UNCONFIGURED:
+        case HistoryCause::ABSENT:
+        case HistoryCause::UNREACHABLE:
+        case HistoryCause::TIMEOUT:
+        case HistoryCause::BAD_ROW:
+        case HistoryCause::ERROR: return "pg";
+        case HistoryCause::NO_HEARTBEAT: return "heartbeat";
+        case HistoryCause::EPOCH: return "epoch";
+        case HistoryCause::STALE: return "stale";
         case HistoryCause::LAGGING: return "lagging";
     }
     return "?";

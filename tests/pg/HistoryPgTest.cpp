@@ -10,6 +10,7 @@
 //   - a closed-order lookup above the projection's applied_order_id is 503 (not projected yet), never 404;
 //   - one deadline per read, queue wait included; a connection the server dropped is retried once.
 #include <atomic>
+#include <functional>
 #include <chrono>
 #include <fstream>
 #include <map>
@@ -42,6 +43,8 @@ namespace {
 
 constexpr std::int64_t T0 = 1'800'000'000'000; // the seeded rows' times start here
 constexpr std::int64_t SEEDED = 400;            // orders (and fills) of the walking user
+constexpr std::int64_t GENESIS = 7;             // the core genesis of the seeded heartbeat and of the rig's model core
+const HistoryExpect EXPECT{ GENESIS, 0 };       // what a read of the store is checked against
 
 std::string contractDdl()
 {
@@ -62,8 +65,8 @@ std::string historyDatabase(const std::string &name, bool heartbeat = true)
     sql(url, contractDdl());
     if (heartbeat)
     {
-        sql(url, "INSERT INTO gateway_history_heartbeat_v1 (beat_at, applied_order_id) VALUES (now() - interval "
-            "'1500 milliseconds', 1000000000000)");
+        sql(url, "INSERT INTO gateway_history_heartbeat_v1 (beat_at, applied_order_id, applied_event_seq, epoch) VALUES "
+            "(now() - interval '1500 milliseconds', 1000000000000, 1000000000000, " + std::to_string(GENESIS) + ")");
     }
     return url;
 }
@@ -195,7 +198,7 @@ void walk(const std::string &url, history::Kind kind)
     for (; pages < 1000; ++pages)
     {
         HistoryPage page;
-        const HistoryAnswer a = store.page(0, request, page, soon());
+        const HistoryAnswer a = store.page(0, request, page, soon(), EXPECT);
         if (HistoryStatus::OK != a.status)
         {
             gwtest::fail(__FILE__, __LINE__, std::string("page failed: ") + nameOf(a.cause) + " " + store.state());
@@ -291,6 +294,17 @@ struct HttpRig
     std::unique_ptr<HttpServer> server;
     std::uint16_t port = 0;
     std::atomic<std::int64_t> nextOrderId{ 5'000'000 };
+    std::shared_ptr<const session::CoreConfig> config;
+    std::atomic<bool> coreUp{ true };
+
+    // the model core's last CoreConfigReport names `genesis`; nullopt: no report read yet
+    void setGenesis(std::optional<std::int64_t> genesis)
+    {
+        auto c = std::make_shared<session::CoreConfig>();
+        c->reported = genesis.has_value();
+        c->head.genesisId = genesis.value_or(0);
+        std::atomic_store(&config, std::shared_ptr<const session::CoreConfig>(std::move(c)));
+    }
 
     HttpRig(const std::string &url, int historyWorkers, std::size_t historyQueue, std::int64_t timeoutMs)
     {
@@ -352,8 +366,10 @@ struct HttpRig
                 done(o);
             });
         };
-        d.config = [] { return std::make_shared<const session::CoreConfig>(); };
-        d.registered = [] { return true; };
+        // the model core's config: a CoreConfigReport of genesis GENESIS was read (a test swaps it with setGenesis)
+        setGenesis(GENESIS);
+        d.config = [this] { return std::atomic_load(&config); };
+        d.registered = [this] { return coreUp.load(); };
         api = std::make_unique<GatewayApi>(std::move(d));
         HttpServerSettings hs;
         hs.host = "127.0.0.1";
@@ -498,13 +514,16 @@ TEST(history_routes_over_postgres)
     r = rig.get("/api/v2/orders/history?limit=2&marketId=1&cursor=" + cursor, a);
     CHECK_MSG(400 == r.status && "VALIDATION" == codeOf(r), what(r));
 
-    // the closed-order lookup: the caller's row, every field; another user's order and an unknown id are one 404
+    // the closed-order lookup: the caller's row, every field, then the read's asOf; another user's order and an unknown
+    // id are one 404
     r = rig.get("/api/v2/orders/9001", a);
-    CHECK_MSG(200 == r.status && r.body == R"({"orderId":"9001","clientOrderId":"11111111-2222-4333-8444-555555555555",)"
+    const std::string row = R"({"orderId":"9001","clientOrderId":"11111111-2222-4333-8444-555555555555",)"
         R"("marketId":"3","side":"SELL","type":"STOP_LIMIT","timeInForce":"GTD","price":"25","stopPrice":"26",)"
         R"("quantity":"2","filledQuantity":"0.5","remainingQuantity":"1.5","status":"EXPIRED",)"
         R"("reason":"INSUFFICIENT_FUNDS","meReason":12,"meOrderId":"777","hold":{"assetId":"1","amount":"2",)"
-        R"("remaining":"0"},"createdAt":1800000000001,"updatedAt":1800000000002})", what(r));
+        R"("remaining":"0"},"createdAt":1800000000001,"updatedAt":1800000000002,"asOf":{"ageMs":)";
+    CHECK_MSG(200 == r.status && 0 == r.body.rfind(row, 0) &&
+        r.body.find(R"(,"stale":false,"eventSeq":)", row.size()) != std::string::npos, what(r));
     const HttpResult foreign = rig.get("/api/v2/orders/1001", a);
     const HttpResult unknown = rig.get("/api/v2/orders/424242", a);
     CHECK_MSG(404 == unknown.status && "NOT_FOUND" == codeOf(unknown), what(unknown));
@@ -588,7 +607,8 @@ TEST(history_unavailable_causes)
             std::string::npos, m);
         // the projection creates its relations later: the next read answers, no restart
         sql(url, contractDdl());
-        sql(url, "INSERT INTO gateway_history_heartbeat_v1 (beat_at, applied_order_id) VALUES (now(), 0)");
+        sql(url, "INSERT INTO gateway_history_heartbeat_v1 (beat_at, applied_order_id, applied_event_seq, epoch) VALUES "
+            "(now(), 0, 0, " + std::to_string(GENESIS) + ")");
         CHECK(200 == rig.get("/api/v2/orders/history", a).status);
     }
     // relations present, the heartbeat empty: the projection never reported
@@ -598,10 +618,11 @@ TEST(history_unavailable_causes)
         history::PageRequest req;
         req.userId = 7;
         req.limit = 10;
-        HistoryAnswer x = store.page(0, req, page, soon());
+        HistoryAnswer x = store.page(0, req, page, soon(), EXPECT);
         CHECK_MSG(HistoryStatus::UNAVAILABLE == x.status && HistoryCause::NO_HEARTBEAT == x.cause, nameOf(x.cause));
         std::string json;
-        x = store.order(0, 7, 5, json, soon()); // never 404 from a projection that never reported
+        HistoryAsOf asOf;
+        x = store.order(0, 7, 5, json, asOf, soon(), EXPECT); // never 404 from a projection that never reported
         CHECK_MSG(HistoryStatus::UNAVAILABLE == x.status && HistoryCause::NO_HEARTBEAT == x.cause, nameOf(x.cause));
     }
     // nothing listens: unreachable, bounded, then fail-fast inside the retry window
@@ -611,9 +632,9 @@ TEST(history_unavailable_causes)
         history::PageRequest req;
         req.userId = 7;
         req.limit = 10;
-        HistoryAnswer x = store.page(0, req, page, soon());
+        HistoryAnswer x = store.page(0, req, page, soon(), EXPECT);
         CHECK_MSG(HistoryStatus::UNAVAILABLE == x.status && HistoryCause::UNREACHABLE == x.cause, nameOf(x.cause));
-        x = store.page(0, req, page, soon());
+        x = store.page(0, req, page, soon(), EXPECT);
         CHECK(HistoryCause::UNREACHABLE == x.cause);
     }
     // the connection is read-only: the gateway cannot write the projection even by mistake
@@ -735,7 +756,7 @@ TEST(history_dropped_connection_is_retried_once)
     req.userId = 7;
     req.limit = 10;
     HistoryPage page;
-    HistoryAnswer x = store.page(0, req, page, soon());
+    HistoryAnswer x = store.page(0, req, page, soon(), EXPECT);
     CHECK_MSG(HistoryStatus::OK == x.status && 5 == page.items.size(), nameOf(x.cause));
     // the server drops the connection (a restart, an idle kill): only the next statement sees it
     sql(url, "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE datname = current_database() AND "
@@ -747,7 +768,335 @@ TEST(history_dropped_connection_is_retried_once)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     // a read is idempotent: one retry on a fresh connection answers, no 503 for a server that is up
-    x = store.page(0, req, page, soon());
+    x = store.page(0, req, page, soon(), EXPECT);
     CHECK_MSG(HistoryStatus::OK == x.status && 5 == page.items.size(), nameOf(x.cause));
     CHECK(1 == store.connected());
+}
+
+// A heartbeat ten minutes old: the page answers with asOf.stale true (asOf.ageMs alone does not say it to a client
+// that does not know the gateway's bound). The single order read from history carries the same asOf.
+TEST(history_stale_label)
+{
+    const std::string url = historyDatabase("gw_hist_stale");
+    sql(url, "UPDATE gateway_history_heartbeat_v1 SET beat_at = clock_timestamp() - interval '10 minutes'");
+    HttpRig rig(url, 1, 8, 2000);
+    const std::int64_t alice = rig.user("alice", "secret-alice");
+    sql(url, insertOrders(alice, 1, 3, std::to_string(T0) + " + g"));
+    const auto a = rig.bearer("alice", "secret-alice");
+    for (const char *target : { "/api/v2/orders/history", "/api/v2/fills", "/api/v2/orders/2" })
+    {
+        const HttpResult r = rig.get(target, a);
+        CHECK_MSG(200 == r.status, what(r));
+        if (200 != r.status)
+        {
+            continue;
+        }
+        const json::object body = json::parse(r.body).as_object();
+        if (!body.contains("asOf") || !body.at("asOf").is_object())
+        {
+            CHECK_MSG(false, std::string("stale label missing: ") + target + " " + r.body);
+            continue;
+        }
+        const json::object asOf = body.at("asOf").as_object();
+        CHECK(asOf.at("ageMs").as_int64() >= 600'000);
+        CHECK_MSG(asOf.contains("eventSeq"), std::string(target) + " " + r.body);
+        if (!asOf.contains("stale") || !asOf.at("stale").is_bool() || !asOf.at("stale").as_bool())
+        {
+            CHECK_MSG(false, std::string("stale label missing: ") + target + " " + r.body);
+        }
+    }
+    // refusal is a setting: with GATEWAY_HISTORY_MAX_AGE_MS set, the same reads are 503 with the usual Retry-After
+    rig.g.historyMaxAgeMs = 60'000;
+    for (const char *target : { "/api/v2/orders/history", "/api/v2/fills", "/api/v2/orders/2" })
+    {
+        HttpResult r = rig.get(target, a);
+        CHECK_MSG(503 == r.status && "HISTORY_UNAVAILABLE" == codeOf(r) && r.headers["retry-after"] == "60" &&
+            std::string::npos == r.body.find("\"items\""), std::string(target) + ": " + what(r));
+    }
+    const std::string m = rig.api->metrics("gw_");
+    CHECK_MSG(m.find("history_reads_total{query=\"orders\",result=\"unavailable\",cause=\"stale\"} 1") !=
+        std::string::npos, m);
+    // a fresh heartbeat: served again, stale false
+    sql(url, "UPDATE gateway_history_heartbeat_v1 SET beat_at = clock_timestamp()");
+    rig.g.historyMaxAgeMs = 0;
+    for (const char *target : { "/api/v2/orders/history", "/api/v2/orders/2" })
+    {
+        const HttpResult r = rig.get(target, a);
+        CHECK_MSG(200 == r.status && json::parse(r.body).as_object().at("asOf").as_object().at("stale") == false,
+            std::string(target) + ": " + what(r));
+    }
+}
+
+// The epoch against the cluster: a heartbeat of another genesis than the gateway's last CoreConfigReport, and a gateway
+// that has read no report yet, answer 503 (cause epoch), never rows; a gateway that had a report and lost the core
+// keeps serving history.
+TEST(history_epoch_check)
+{
+    const std::string url = historyDatabase("gw_hist_epoch");
+    HttpRig rig(url, 1, 8, 2000);
+    const std::int64_t alice = rig.user("alice", "secret-alice");
+    sql(url, insertOrders(alice, 1, 3, std::to_string(T0) + " + g"));
+    sql(url, insertFills(alice, 1, 2, std::to_string(T0) + " + g"));
+    const auto a = rig.bearer("alice", "secret-alice");
+    bool served = false;
+    auto refused = [&](const char *when) {
+        for (const char *target : { "/api/v2/orders/history", "/api/v2/fills", "/api/v2/orders/2" })
+        {
+            const HttpResult r = rig.get(target, a);
+            const bool ok = 503 == r.status && "HISTORY_UNAVAILABLE" == codeOf(r);
+            if (!ok && 200 == r.status)
+            {
+                served = true;
+            }
+            CHECK_MSG(ok, std::string(when) + " " + target + ": " + what(r));
+        }
+    };
+    CHECK(200 == rig.get("/api/v2/orders/history", a).status);
+    rig.setGenesis(GENESIS + 1); // the core was re-created: its genesis is not the projection's
+    refused("another genesis");
+    rig.setGenesis(std::nullopt); // no CoreConfigReport read yet
+    refused("no report");
+    if (served)
+    {
+        CHECK_MSG(false, "history of another genesis served");
+    }
+    const std::string m = rig.api->metrics("gw_");
+    CHECK_MSG(m.find("history_reads_total{query=\"orders\",result=\"unavailable\",cause=\"epoch\"} 2") !=
+        std::string::npos && m.find("history_reads_total{query=\"order\",result=\"unavailable\",cause=\"epoch\"} 2") !=
+        std::string::npos, m);
+    // the report read, then the core lost (the session down, its last report kept): history is still served
+    rig.setGenesis(GENESIS);
+    rig.coreUp = false;
+    for (const char *target : { "/api/v2/orders/history", "/api/v2/fills" })
+    {
+        const HttpResult r = rig.get(target, a);
+        CHECK_MSG(200 == r.status && !json::parse(r.body).as_object().at("items").as_array().empty(),
+            std::string("core lost: ") + target + ": " + what(r));
+    }
+}
+
+namespace {
+
+json::object healthOf(HttpRig &rig)
+{
+    const std::string h = rig.api->healthJson();
+    return json::parse("{" + h.substr(1) + "}").as_object().at("history").as_object();
+}
+
+std::int64_t ageMetric(HttpRig &rig)
+{
+    const std::string m = rig.api->metrics("gw_");
+    const std::size_t at = m.find("\ngw_history_age_ms ");
+    return std::string::npos == at ? -2 : std::stoll(m.substr(at + 19));
+}
+
+// waits up to `ms` for /health's history block to satisfy `ok`; the block it last saw
+bool healthWithin(HttpRig &rig, std::int64_t ms, const std::function<bool(const json::object &)> &ok, json::object &last)
+{
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    do
+    {
+        last = healthOf(rig);
+        if (ok(last))
+        {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    } while (std::chrono::steady_clock::now() < until);
+    return false;
+}
+
+std::string causeOf(const json::object &h)
+{
+    return h.at("cause").is_null() ? std::string("null") : std::string(h.at("cause").as_string());
+}
+
+}
+
+// /health's history block and the age metric follow the probe: fresh, stale, no heartbeat, PostgreSQL down, each
+// entered twice, each shown inside one probe interval (plus the read deadline); PostgreSQL down is 503 on history and
+// never reaches the order path. Catch order: a heartbeat of another epoch and older than MAX_AGE is cause epoch; PG down
+// while the cached probe says stale is cause pg.
+TEST(history_health_probe)
+{
+    const std::string url = historyDatabase("gw_hist_health");
+    HttpRig rig(url, 2, 8, 800);
+    rig.g.historyProbeMs = 300;
+    rig.g.historyStaleMs = 5000;
+    const std::int64_t alice = rig.user("alice", "secret-alice");
+    sql(url, insertOrders(alice, 1, 3, std::to_string(T0) + " + g"));
+    const auto a = rig.bearer("alice", "secret-alice");
+    const std::int64_t bound = rig.g.historyProbeMs + rig.g.pgStatementTimeoutMs + 300;
+    {
+        // before the first probe: never fresh
+        const json::object h = healthOf(rig);
+        CHECK_MSG(h.at("stale") == true && "unprobed" == causeOf(h), json::serialize(h));
+    }
+    rig.api->startHistoryProbe();
+    bool shownWithoutProbe = false;
+    int entered[4] = { 0, 0, 0, 0 };
+    for (int round = 0; round < 2; ++round)
+    {
+        json::object h;
+        // fresh: a beat now (a read finds it too, so a read-fed /health would look the same here)
+        sql(url, "UPDATE gateway_history_heartbeat_v1 SET beat_at = clock_timestamp()");
+        CHECK(200 == rig.get("/api/v2/orders/history", a).status);
+        const bool fresh = healthWithin(rig, bound, [](const json::object &x) {
+            return x.at("stale") == false && x.at("cause").is_null() && x.at("ageMs").is_int64() &&
+                x.at("eventSeq").is_int64();
+        }, h);
+        CHECK_MSG(fresh, "fresh not shown: " + json::serialize(h));
+        CHECK_MSG(ageMetric(rig) >= 0, "the age metric while fresh: " + std::to_string(ageMetric(rig)));
+        entered[0] += fresh ? 1 : 0;
+        // stale: the beat 10 s old, nobody reads
+        sql(url, "UPDATE gateway_history_heartbeat_v1 SET beat_at = clock_timestamp() - interval '10 seconds'");
+        const bool stale = healthWithin(rig, bound, [](const json::object &x) {
+            return x.at("stale") == true && x.at("cause").is_null() && x.at("ageMs").is_int64() &&
+                x.at("ageMs").as_int64() >= 10'000;
+        }, h);
+        if (!stale && h.at("stale") == false)
+        {
+            shownWithoutProbe = true;
+        }
+        CHECK_MSG(stale, "stale not shown: " + json::serialize(h));
+        CHECK_MSG(ageMetric(rig) >= 10'000, "the age metric while stale: " + std::to_string(ageMetric(rig)));
+        entered[1] += stale ? 1 : 0;
+        // no heartbeat
+        sql(url, "DELETE FROM gateway_history_heartbeat_v1");
+        const bool none = healthWithin(rig, bound, [](const json::object &x) {
+            return x.at("stale") == true && "heartbeat" == causeOf(x) && x.at("ageMs").is_null();
+        }, h);
+        if (!none && h.at("stale") == false)
+        {
+            shownWithoutProbe = true;
+        }
+        CHECK_MSG(none, "no heartbeat not shown: " + json::serialize(h));
+        CHECK_MSG(-1 == ageMetric(rig), "the age metric without a heartbeat: " + std::to_string(ageMetric(rig)));
+        entered[2] += none ? 1 : 0;
+        // PostgreSQL down (the server frozen) while the cached probe says no heartbeat: a read is 503 cause pg, the
+        // order path answers, /health shows pg
+        sql(url, "INSERT INTO gateway_history_heartbeat_v1 (beat_at, applied_order_id, applied_event_seq, epoch) VALUES "
+            "(clock_timestamp() - interval '10 seconds', 100, 100, " + std::to_string(GENESIS) + ")");
+        healthWithin(rig, bound, [](const json::object &x) { return x.at("ageMs").is_int64(); }, h); // stale cached
+        gwtest::run("GW_TEST_PG_PAUSE");
+        const HttpResult down = rig.get("/api/v2/fills", a);
+        const HttpResult order = httpCall(rig.port, "POST", "/api/v2/orders",
+            R"({"marketId":"1","side":"BUY","type":"LIMIT","timeInForce":"GTC","price":"100","quantity":"0.5"})",
+            { a[0], { "Idempotency-Key", "11111111-2222-4333-8444-55555555555" + std::to_string(round) } });
+        const bool pgShown = healthWithin(rig, bound + rig.g.pgStatementTimeoutMs, [](const json::object &x) {
+            return x.at("stale") == true && "pg" == causeOf(x);
+        }, h);
+        const std::int64_t metricDown = ageMetric(rig);
+        gwtest::run("GW_TEST_PG_UNPAUSE");
+        CHECK_MSG(503 == down.status && "HISTORY_UNAVAILABLE" == codeOf(down), "a read while PostgreSQL is down: " +
+            what(down));
+        CHECK_MSG(201 == order.status && order.ms < 2000, "the order path while PostgreSQL is down: " + what(order));
+        if (!pgShown && h.at("stale") == false)
+        {
+            shownWithoutProbe = true;
+        }
+        CHECK_MSG(pgShown, "PostgreSQL down not shown: " + json::serialize(h));
+        CHECK_MSG(-1 == metricDown, "the age metric while PostgreSQL is down: " + std::to_string(metricDown));
+        entered[3] += pgShown ? 1 : 0;
+    }
+    if (shownWithoutProbe)
+    {
+        CHECK_MSG(false, "health shows fresh history without a probe");
+    }
+    CHECK_MSG(2 == entered[0] && 2 == entered[1] && 2 == entered[2] && 2 == entered[3], "states entered: fresh " +
+        std::to_string(entered[0]) + ", stale " + std::to_string(entered[1]) + ", no heartbeat " +
+        std::to_string(entered[2]) + ", pg down " + std::to_string(entered[3]));
+    const std::string m = rig.api->metrics("gw_");
+    CHECK_MSG(m.find("history_reads_total{query=\"fills\",result=\"unavailable\",cause=\"timeout\"} 2") !=
+        std::string::npos || m.find("cause=\"unreachable\"") != std::string::npos, m);
+    // catch order: another epoch and older than MAX_AGE at once answers epoch (the epoch is checked first)
+    rig.g.historyMaxAgeMs = 6000;
+    sql(url, "UPDATE gateway_history_heartbeat_v1 SET epoch = " + std::to_string(GENESIS + 1) + ", beat_at = "
+        "clock_timestamp() - interval '1 minute'");
+    const HttpResult both = rig.get("/api/v2/orders/history", a);
+    CHECK_MSG(503 == both.status, what(both));
+    const std::string m2 = rig.api->metrics("gw_");
+    CHECK_MSG(m2.find("history_reads_total{query=\"orders\",result=\"unavailable\",cause=\"epoch\"} 1") !=
+        std::string::npos && m2.find("cause=\"stale\"") == std::string::npos, m2);
+    json::object h;
+    CHECK_MSG(healthWithin(rig, bound, [](const json::object &x) { return "epoch" == causeOf(x); }, h),
+        "epoch before stale on /health: " + json::serialize(h));
+    rig.api->stopHistoryProbe();
+}
+
+// Read order under a concurrent apply: a page's asOf.eventSeq is read before its rows, and the writer commits that
+// cursor with the rows it covers, so every row of an event at or below asOf.eventSeq is on the page (it may hold newer
+// rows, never fewer).
+TEST(history_read_order_under_concurrent_apply)
+{
+    const std::string url = historyDatabase("gw_hist_order");
+    const std::int64_t user = 41;
+    // the writer: one transaction per batch, the rows of events (n + 1 .. n + 5) and the heartbeat's cursor moved with
+    // them; fill f of event e is trade e
+    sql(url, "UPDATE gateway_history_heartbeat_v1 SET applied_event_seq = 0");
+    std::atomic<bool> writing{ true };
+    std::atomic<std::int64_t> committed{ 0 };
+    std::thread writer([&] {
+        PGconn *c = PQconnectdb(url.c_str());
+        std::int64_t n = 0;
+        while (writing.load() && n < 20'000)
+        {
+            const std::string from = std::to_string(n + 1);
+            const std::string to = std::to_string(n + 5);
+            PGresult *r = PQexec(c, ("BEGIN; INSERT INTO gateway_fills_v1 (trade_id, order_id, user_id, market_id, side, "
+                "price, quantity, maker, executed_at_ms) SELECT g, g, " + std::to_string(user) + ", 1, 'BUY', 1, 1, false, "
+                "g FROM generate_series(" + from + ", " + to + ") g; SELECT pg_sleep(0.002); UPDATE "
+                "gateway_history_heartbeat_v1 SET applied_event_seq = " + to + ", beat_at = clock_timestamp(); COMMIT")
+                .c_str());
+            PQclear(r);
+            n += 5;
+            committed = n;
+        }
+        PQfinish(c);
+    });
+    PgHistoryStore store(historySettings(url));
+    int pages = 0;
+    int lacking = 0;
+    std::string example;
+    while (pages < 300)
+    {
+        history::PageRequest req;
+        req.kind = history::Kind::FILLS;
+        req.userId = user;
+        req.limit = 1000;
+        HistoryPage page;
+        const HistoryAnswer x = store.page(0, req, page, soon(), EXPECT);
+        CHECK_MSG(HistoryStatus::OK == x.status, nameOf(x.cause));
+        if (HistoryStatus::OK != x.status)
+        {
+            break;
+        }
+        pages++;
+        // the newest 1000 rows: every trade in (eventSeq - 999 .. eventSeq] must be there
+        std::set<std::int64_t> trades;
+        for (const std::string &item : page.items)
+        {
+            trades.insert(std::stoll(std::string(json::parse(item).as_object().at("tradeId").as_string())));
+        }
+        for (std::int64_t t = std::max<std::int64_t>(1, page.eventSeq - 900); t <= page.eventSeq; ++t)
+        {
+            if (0 == trades.count(t))
+            {
+                if (lacking++ == 0)
+                {
+                    example = "eventSeq " + std::to_string(page.eventSeq) + " without trade " + std::to_string(t);
+                }
+                break;
+            }
+        }
+    }
+    writing = false;
+    writer.join();
+    std::printf("  read order: %d pages over %lld committed events\n", pages, static_cast<long long>(committed.load()));
+    CHECK_MSG(committed.load() > 100, "the writer committed " + std::to_string(committed.load()) + " events");
+    if (lacking > 0)
+    {
+        CHECK_MSG(false, "asOf.eventSeq claims rows the page lacks: " + std::to_string(lacking) + " pages, first " +
+            example);
+    }
 }

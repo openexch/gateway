@@ -105,6 +105,7 @@ TEST(projector_settings_accepted_with_defaults)
     CHECK(s.warnings.empty());
     CHECK(10'000 == s.leaseMs && 1000 == s.leasePollMs && 256 == s.batchEvents && 50 == s.batchMs);
     CHECK(4096 == s.queueEvents && 1000 == s.headProbeMs && 3000 == s.headFreshMs && 5000 == s.readyLagMs);
+    CHECK(4096 == s.beatCandidates);
     CHECK(3000 == s.pgStatementTimeoutMs && 1000 == s.pgRetryMs && 10'000 == s.pgIdleInTxTimeoutMs);
     CHECK(5 == s.pgKeepaliveIdleS && 2 == s.pgKeepaliveIntervalS && 3 == s.pgKeepaliveCount);
     CHECK(5000 == s.archiveTimeoutMs && 1000 == s.relistMs && 5000 == s.sourceBehindMs);
@@ -117,7 +118,7 @@ TEST(projector_settings_accepted_with_defaults)
              "HISTORY_PROJECTOR_DUTY_WATCHDOG_MS", "HISTORY_PROJECTOR_DRIVER_TIMEOUT_MS",
              "HISTORY_PROJECTOR_REBUILD_LOCK_TIMEOUT_MS", "HISTORY_PROJECTOR_NODE_FRESH_MS",
              "HISTORY_PROJECTOR_NODE_FIRST_ROUND_MS", "HISTORY_PROJECTOR_SESSION_MAX_INFLIGHT",
-             "HISTORY_PROJECTOR_QUERY_RATE_COUNT" })
+             "HISTORY_PROJECTOR_QUERY_RATE_COUNT", "HISTORY_PROJECTOR_BEAT_CANDIDATES" })
     {
         const SettingRecord *r = recordOf(parsed.records, name);
         CHECK_MSG(nullptr != r && "default" == r->source, name);

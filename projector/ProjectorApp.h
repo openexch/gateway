@@ -42,6 +42,9 @@ struct ProjectorShared
     std::atomic<std::int64_t> replaysOpen{ 0 }; // replays this copy holds (pj-duty)
     std::atomic<bool> sessionOpen{ false };  // the head-probe session is open (pj-duty)
     std::atomic<std::int64_t> writerUntilNs{ 0 }; // monotonic ns: the step-down point of pj-pg's last confirmation
+    std::atomic<std::int64_t> lastBeatNs{ -1 };    // monotonic ns the last beat this copy committed stands for (its
+                                                   // probe's send time); -1: none
+    std::atomic<std::uint64_t> beats{ 0 };         // beats this copy committed
 };
 
 // True while pj-pg holds the lease and `nowNs` (monotonic) is before the step-down point of its last confirmation.

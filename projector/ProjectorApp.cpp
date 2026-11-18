@@ -118,7 +118,8 @@ public:
         std::lock_guard<std::mutex> lock(m_viewLock);
         status.leaseHeld = leaseHeldNow(nowNs());
         status.halted = projector::Halt::NONE != m_parts.view->get().halt.halt;
-        status.lastBeatNs = -1; // no beat is written yet: the beat rule is not part of this binary
+        // the beat counts only while this copy holds the lease: a standby is not ready whatever it beat before
+        status.lastBeatNs = leaseHeldNow(nowNs()) ? m_shared.lastBeatNs.load(std::memory_order_acquire) : -1;
     }
 
     std::string healthJson() const override
@@ -160,6 +161,14 @@ public:
             ",\"epoch\":" + (f.dbEpoch ? std::to_string(*f.dbEpoch) : std::string("null")) + ",\"genesisId\":" +
             std::to_string(f.genesisId) + ",\"headSeq\":" + std::to_string(f.headSeq) + ",\"lagEvents\":" +
             (f.headSeq >= 0 ? std::to_string(std::max<std::int64_t>(0, f.headSeq - f.appliedSeq)) : std::string("null"));
+        {
+            // lagMs: how far behind the instant the projection is complete as of (the age of its last beat)
+            const std::int64_t beatNs = m_shared.lastBeatNs.load(std::memory_order_acquire);
+            out += ",\"lagMs\":" + (beatNs >= 0 ? std::to_string((now - beatNs) / 1'000'000LL) : std::string("null")) +
+                ",\"beats\":" + std::to_string(m_shared.beats.load()) + ",\"beatsOffered\":" + n(f.beatsOffered) +
+                ",\"beatsRefused\":" + n(f.beatsRefused) + ",\"beatsPending\":" + std::to_string(f.beatsPending) +
+                ",\"beatsDropped\":" + n(f.beatsDropped);
+        }
         out += ",\"sources\":[";
         for (std::size_t i = 0; i < f.sourceStates.size(); ++i)
         {
@@ -210,6 +219,14 @@ public:
         const projector::FollowView f = m_parts.view->get();
         line("gauge", "head_seq", "The core's head at the last answered probe (-1: none).", std::to_string(f.headSeq));
         line("gauge", "halted", "1 while a halt is set.", projector::Halt::NONE != f.halt.halt ? "1" : "0");
+        {
+            const std::int64_t beatNs = m_shared.lastBeatNs.load(std::memory_order_acquire);
+            line("gauge", "lag_ms", "Age of the last beat this copy committed: history is complete as of that long ago "
+                "(-1: none).", beatNs >= 0 ? std::to_string((now - beatNs) / 1'000'000LL) : std::string("-1"));
+            line("counter", "beats_total", "Beats this copy committed.", std::to_string(m_shared.beats.load()));
+            line("gauge", "lag_events", "The core's head at the last answered probe less the cursor (-1: no probe).",
+                f.headSeq >= 0 ? std::to_string(std::max<std::int64_t>(0, f.headSeq - f.appliedSeq)) : std::string("-1"));
+        }
         line("counter", "records_applied_total", "Journal records applied.",
             std::to_string(m_stats.recordsApplied.load(std::memory_order_relaxed)));
         line("counter", "skips_total", "Records at or below the cursor compared equal with the stored bytes.",
@@ -311,6 +328,7 @@ private:
             v.state = state;
         });
         confirmed(now);
+        m_shared.lastBeatNs.store(-1, std::memory_order_release); // a takeover beats anew before it reads ready
         m_shared.writer.store(true, std::memory_order_release);
         std::fprintf(stderr, "oe-projector: writer: lease taken (token %.8s..., %lld ms) at applied_seq %lld, epoch %s\n",
             m_lease.token().c_str(), static_cast<long long>(m_settings.leaseMs),
@@ -457,10 +475,16 @@ private:
             else if (m_work && m_work->due(now))
             {
                 step = "batch";
+                bool beat = false;
                 h = m_lease.commitFenced(m_conn, t,
                     [&](PgConn &c, std::string &e) { return m_work->write(c, m_lease.token(), advance, e); }, advance,
-                    error, m_hooks.beforeFence, m_hooks.beforeCommit);
+                    error, m_hooks.beforeFence, m_hooks.beforeCommit, &beat);
                 committed = Hold::HELD == h;
+                if (committed && beat && advance.beat)
+                {
+                    m_shared.lastBeatNs.store(advance.beat->sentAtNs, std::memory_order_release);
+                    m_shared.beats.fetch_add(1, std::memory_order_relaxed);
+                }
             }
             else if (now - lastConfirmNs >= renewNs)
             {

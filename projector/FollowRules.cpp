@@ -1,5 +1,7 @@
 #include "FollowRules.h"
 
+#include "ProjectionStore.h"
+
 #include <algorithm>
 #include <limits>
 
@@ -286,6 +288,23 @@ HaltState haltOf(const std::vector<SourceView> &sources, std::int64_t applied)
         h.detail = "no source holds journalSeq " + std::to_string(applied + 1) + ".." + std::to_string(gapTo);
     }
     return h;
+}
+
+std::size_t addBeatCandidate(std::deque<BeatCandidate> &beats, const BeatCandidate &c, std::size_t cap)
+{
+    if (!beats.empty() && beats.back().head == c.head && beats.back().genesis == c.genesis)
+    {
+        beats.back() = c;
+        return 0;
+    }
+    std::size_t dropped = 0;
+    while (!beats.empty() && beats.size() >= std::max<std::size_t>(cap, 1))
+    {
+        beats.pop_front();
+        ++dropped;
+    }
+    beats.push_back(c);
+    return dropped;
 }
 
 }}}

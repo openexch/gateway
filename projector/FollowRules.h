@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <optional>
 #include <string>
 #include <vector>
@@ -180,6 +181,13 @@ struct HaltState
 // The halt when no source can be read: every source is marked (back-off alone is never a halt). NONE otherwise. A
 // GAP names the range no source holds: from the cursor + 1 to the smallest missing end.
 HaltState haltOf(const std::vector<SourceView> &sources, std::int64_t applied);
+
+// ---- the beat candidates (ProjectionStore.h): answered probes whose head the cursor has not reached yet, oldest first.
+// A newer answer with the same head and genesis replaces the last one (it says more); otherwise each answered probe
+// adds one. At `cap` (HISTORY_PROJECTOR_BEAT_CANDIDATES) the oldest is dropped: that only delays the beat to a newer
+// probe, it never makes one. Returns how many were dropped (0 or 1).
+struct BeatCandidate;
+std::size_t addBeatCandidate(std::deque<BeatCandidate> &beats, const BeatCandidate &c, std::size_t cap);
 
 }}}
 

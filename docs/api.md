@@ -466,7 +466,7 @@ Errors: 4.1, 4.2, 400 `invalid field` for `marketId`.
 `orderId` is a positive decimal integer (else 400 `invalid orderId`). An open order of the caller answers from the core
 (200 `Order`, with `displayQuantity`, `expiresAt`, `budget`). Any other id is looked up in history:
 
-- the caller's row in history: 200 `Order` (history shape);
+- the caller's row in history: 200 `Order` (history shape) with `asOf` (`{ageMs, stale, eventSeq}`, as on the pages of 4.6); an open order from the core has no `asOf`;
 - no row, and the id is above the highest order id the projection has applied: 503 `HISTORY_UNAVAILABLE` with
   `Retry-After` `GATEWAY_HISTORY_LAG_RETRY_AFTER_MS` (1000): the order may exist and not be projected yet;
 - otherwise 404 `NOT_FOUND` `not found`. An unknown order and another user's order give the same answer.
@@ -574,7 +574,7 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMDA3IiwiZXhwIjoxNzYzMzgwM
            "maker":true,"executedAt":1763373601200},
           {"tradeId":"500230","orderId":"1042","marketId":"1","side":"BUY","price":"65000.5","quantity":"0.006",
            "maker":true,"executedAt":1763373601195}],
- "nextCursor":"ZjF8...","asOf":{"ageMs":120}}
+ "nextCursor":"ZjF8...","asOf":{"ageMs":120,"stale":false,"eventSeq":88230}}
 ```
 
 - `limit`: default `GATEWAY_HISTORY_LIMIT_DEFAULT` (100); above `GATEWAY_HISTORY_LIMIT_MAX` (1000) is 400, never
@@ -584,7 +584,7 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMDA3IiwiZXhwIjoxNzYzMzgwM
   A cursor of the other route, of other filters, or one that does not decode is 400 `invalid cursor`. There is no
   offset and no total. A row whose key does not change is served exactly once in a walk; an order updated during a walk
   moves to the top, so that walk does not serve it again, and a walk started over from the top does.
-- `asOf.ageMs` is the age of the projection's last heartbeat, measured by the database clock.
+- `asOf.ageMs`: history is complete as of this long ago (database clock). `asOf.stale`: `ageMs` above `GATEWAY_HISTORY_STALE_MS` (5000). `asOf.eventSeq`: every event up to it is in the answer.
 - Each history read takes one principal token.
 - Each read has one deadline, `GATEWAY_PG_STATEMENT_TIMEOUT_MS` (2000), counted from when it is queued.
 
@@ -592,7 +592,7 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMDA3IiwiZXhwIjoxNzYzMzgwM
 |---|---|---|---|
 | 400 | `VALIDATION` | `invalid cursor` (detail `send the nextCursor of the previous page unchanged`, `the cursor belongs to another route`, `the cursor was issued for another filter: keep marketId, status and orderId as on the first page`), `malformed query string`, `invalid field` | |
 | 503 | `HISTORY_BUSY` | `too many history reads at once` (queue `GATEWAY_PG_QUEUE` 64 full, or the read waited past its deadline) | `GATEWAY_HISTORY_BUSY_RETRY_AFTER_MS` (1000) |
-| 503 | `HISTORY_UNAVAILABLE` | `history is not available` (no URL, no relations, no heartbeat, unreachable, timeout) | `GATEWAY_HISTORY_RETRY_AFTER_MS` (60000) |
+| 503 | `HISTORY_UNAVAILABLE` | `history is not available` (no URL, no relations, no heartbeat, unreachable, timeout, another core genesis, older than `GATEWAY_HISTORY_MAX_AGE_MS` when set) | `GATEWAY_HISTORY_RETRY_AFTER_MS` (60000) |
 | 503 | `HISTORY_UNAVAILABLE` | same text, for an order not projected yet | `GATEWAY_HISTORY_LAG_RETRY_AFTER_MS` (1000) |
 
 ### 4.7 Balances
@@ -664,7 +664,7 @@ Every server frame has `type`. Ids and money follow section 1; `eventSeq` is a J
 | `snapshot` (orders) | `{"type":"snapshot","channel":"orders","asOf":{"eventSeq":88200},"orders":[Order,...]}` | on subscribe to `orders` and after a `resync` |
 | `snapshot` (balances) | `{"type":"snapshot","channel":"balances","assets":[{"assetId":"2","asset":"USD","available":"9349.995","locked":"650.005"}]}` | on subscribe to `balances`, and after the stream re-registers with the core |
 | `order` | `{"type":"order","eventSeq":88212,"event":"FILL","order":Order}` | every order event of the user; `event` is the core event kind |
-| `fill` | `{"type":"fill","eventSeq":88212,"fill":{"tradeId":"500231","orderId":"1042","marketId":"1","side":"BUY","price":"65000.5","quantity":"0.004","maker":null,"executedAt":1763373601200}}` | one per `FILL` event; never coalesced; `maker` is `null` on the stream (it is set in history) |
+| `fill` | `{"type":"fill","eventSeq":88212,"fill":{"tradeId":"500231","orderId":"1042","marketId":"1","side":"BUY","price":"65000.5","quantity":"0.004","maker":null,"executedAt":1763373601200}}` | one per `FILL` event with a trade (`tradeId` above 0; a `FILL` without one goes out as an `order` frame only); never coalesced; `maker` is `null` on the stream (it is set in history) |
 | `balance` | `{"type":"balance","assetId":"2","asset":"USD","available":"9349.995","locked":"650.005"}` | each change of one of the user's balances |
 | `admission` | `{"type":"admission","marketId":"0","gate":"SUSPENDED","reasons":["ADMIN"],"circuitBreaker":false}` | to every connection, subscribed or not |
 | `heartbeat` | `{"type":"heartbeat","eventSeq":88230}` | every `STREAM_HEARTBEAT_MS` (5000) to connections with `orders` or `fills` active |
@@ -718,11 +718,7 @@ sends a new orders snapshot to connections subscribed to `orders`; a `fills`-onl
 fill. Balances are not sequenced: they are re-sent as a snapshot when the stream registers with the core again, and a
 `resync` from an event gap does not resend them.
 
-**Stated limitation: a resync can lose fills.** The snapshot holds open orders, not fills. Fills that happened between
-your last frame and the snapshot are not sent on the stream. Read them from `GET /api/v2/fills` (filter by `orderId`
-or `marketId`, newest first). That endpoint answers only where the deployment runs the history projection; where it
-does not, it answers 503 `HISTORY_UNAVAILABLE` and those fills cannot be recovered by the client until a fills
-endpoint is available.
+**Closing the fills gap of a resync.** After a `resync` take E, the `eventSeq` of the first frame that follows it: the orders `snapshot` (`asOf.eventSeq`), or for a fills-only connection the first `heartbeat`. Read `GET /api/v2/fills` from the newest down to your last known fill, again until an answer's `asOf.eventSeq` is at least E, and drop duplicates by (tradeId, orderId). Where no history projection runs, `/fills` answers 503 `HISTORY_UNAVAILABLE` and the gap cannot be closed.
 
 ### 5.6 Slow consumers
 
@@ -851,7 +847,7 @@ JSON:
  "storage":{"starved":false,"starvedSeconds":0},
  "treasuryLane":"off",
  "auth":{"modes":["api-key","jwt"],"hashQueue":0,"hashQueueCapacity":32,"userIdConflicts":0},
- "history":{"state":"...","queue":0,"queueCapacity":64},
+ "history":{"state":"...","ageMs":420,"stale":false,"cause":null,"eventSeq":88230,"probedAgoMs":800,"queue":0,"queueCapacity":64},
  "ready":true,"conditions":[...],"aeronErrors":0,"logDropped":0,
  "settings":{"GATEWAY_PRINCIPAL_RATE":{"value":"50/s","source":"default"}}}
 ```
@@ -875,7 +871,7 @@ of `config`, `storage` and `treasuryLane`. Secrets in `settings` are redacted.
 
 Prometheus text, prefix `gateway_` or `stream_`. Among them: `requests_total{route,code}`, `principal_rate_limited_total`,
 `read_cache_hits_total`, `cancel_reoffered_not_open_total`, `outcome_unknown_total`, `reoffers_total`,
-`late_replies_total`, `history_reads_total{query,result,cause}`, `user_id_conflict_total`, `inflight`, `ready`,
+`late_replies_total`, `history_reads_total{query,result,cause}` (causes add `epoch`, `stale`), `history_age_ms`, `user_id_conflict_total`, `inflight`, `ready`,
 `ready_condition{name}`; for the stream `resync_total{reason}`, `ws_closed_total{code}`, `ws_closed_at_bound_total`,
 `ws_queue_high_water`, `watermark`, `window_first_seq`, `users_cached`.
 

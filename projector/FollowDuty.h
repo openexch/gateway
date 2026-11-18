@@ -41,7 +41,12 @@
 // HISTORY_PROJECTOR_NODE_POLL_TIMEOUT_MS) while this copy is the writer: the role the member reports, its
 // readerReplayBudget and core_archive_replays_active. Nothing is read from a member's files.
 //
-// Test-only controls (never in a published build): PROJ_NC_NO_STOP_REPLAY (the recorded replays are not stopped at a
+// The beat: every answered head probe (H, G, the time t it was sent) waits until the committed cursor reaches H; then
+// the newest such probe goes to pj-pg as a BEAT item when G is the projection's epoch and no halt is set (the beat
+// rule, ProjectionStore.h). A probe that is never answered, or a cursor that never reaches its head, never beats.
+//
+// Test-only controls (never in a published build): PROJ_NC_BEAT_NO_EPOCH (no genesis term in the beat),
+// PROJ_NC_NO_STOP_REPLAY (the recorded replays are not stopped at a
 // start or a takeover), PROJ_NC_NO_EPOCH_CHECK (no epoch filter, no mismatch halt), PROJ_NC_EPOCH_FROM_FIRST_RECORD
 // (an empty projection's followers keep no epoch filter), PROJ_NC_NO_MTU_CHECK (the configured MTU is not handed to
 // the library), PROJ_NC_COMPARES_NOT_DELIVERY (verified compares do not count for BEHIND), PROJ_NC_HOLE_MARKS_ALL (a
@@ -124,6 +129,10 @@ struct FollowView
     std::int64_t genesisId = 0;             // the cluster's, last read (0: none)
     std::int64_t headSeq = -1;              // the core's head at the last answered probe
     std::int64_t lastHeadProbeNs = -1;
+    std::uint64_t beatsOffered = 0;         // probes handed to pj-pg as beats (their head applied)
+    std::uint64_t beatsRefused = 0;         // probes whose head was applied but of another genesis, or while halted
+    std::size_t beatsPending = 0;           // answered probes whose head is not applied yet
+    std::uint64_t beatsDropped = 0;         // of those, the oldest dropped at HISTORY_PROJECTOR_BEAT_CANDIDATES
     HaltState halt;
     std::vector<std::string> sourceStates;  // per source: "<mark>/<role>/<blocked ms>"
     std::uint64_t switches = 0;

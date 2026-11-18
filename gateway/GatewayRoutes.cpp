@@ -62,6 +62,8 @@
 // its reject), GW_NC_NO_ASSET_CHECK (deposit sends any assetId), GW_NC_RANDOM_FUNDING_ID (a fresh random funding id
 // per attempt).
 
+#include <pthread.h>
+
 #include <algorithm>
 #include <cinttypes>
 #include <charconv>
@@ -1152,6 +1154,123 @@ ApiResponse GatewayApi::historyUnavailable(HistoryCause cause, const char *query
         HistoryCause::LAGGING == cause ? m_s.historyLagRetryAfterMs : m_s.historyRetryAfterMs);
 }
 
+void GatewayApi::noteHistory(HistoryCause cause, std::int64_t ageMs, std::int64_t eventSeq)
+{
+    std::lock_guard<std::mutex> lock(m_historyHealthMutex);
+    m_historyHealth.answered = true;
+    m_historyHealth.atNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    m_historyHealth.cause = cause;
+    m_historyHealth.ageMs = ageMs;
+    m_historyHealth.eventSeq = eventSeq;
+}
+
+GatewayApi::HistoryHealth GatewayApi::historyHealth() const
+{
+    std::lock_guard<std::mutex> lock(m_historyHealthMutex);
+    HistoryHealth h = m_historyHealth;
+#ifndef GW_NC_NO_HISTORY_PROBE
+    // a probe that stopped answering (a full pool, a hung read) never leaves an old "fresh" on /health
+    const std::int64_t boundNs = (2 * m_s.historyProbeMs + m_s.pgStatementTimeoutMs) * 1'000'000;
+    const std::int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (h.answered && now - h.atNs > boundNs)
+    {
+        h.answered = false;
+    }
+#endif
+    return h;
+}
+
+void GatewayApi::probeHistoryOnce()
+{
+#ifdef GW_NC_NO_HISTORY_PROBE
+    return; // test build only: no probe (/health shows what the last read found)
+#else
+    if (nullptr == m_deps.history || nullptr == m_deps.historyPool)
+    {
+        return;
+    }
+    if (m_probeInFlight.exchange(true))
+    {
+        return; // the previous probe has not answered yet: one at a time
+    }
+    const HistoryExpect expect = historyExpect();
+    const std::int64_t deadlineNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count() + m_s.pgStatementTimeoutMs * 1'000'000;
+    const bool queued = m_deps.historyPool->trySubmit([this, expect, deadlineNs](int worker) {
+        HistoryAsOf asOf;
+        const HistoryAnswer a = m_deps.history->probe(worker, asOf, deadlineNs, expect);
+        noteHistory(HistoryStatus::OK == a.status ? HistoryCause::NONE : a.cause, asOf.ageMs, asOf.eventSeq);
+        m_probeInFlight.store(false);
+    });
+    if (!queued)
+    {
+        m_probeInFlight.store(false); // the history queue is full: this probe is skipped (the next one tries again)
+    }
+#endif
+}
+
+void GatewayApi::startHistoryProbe()
+{
+    if (nullptr == m_deps.history || m_probeThread.joinable())
+    {
+        return;
+    }
+    m_probeThread = std::thread([this] {
+        pthread_setname_np(pthread_self(), "gw-hist-probe");
+        std::unique_lock<std::mutex> lock(m_probeMutex);
+        while (!m_probeStop)
+        {
+            lock.unlock();
+            probeHistoryOnce();
+            lock.lock();
+            m_probeWake.wait_for(lock, std::chrono::milliseconds(m_s.historyProbeMs), [this] { return m_probeStop; });
+        }
+    });
+}
+
+void GatewayApi::stopHistoryProbe()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_probeMutex);
+        m_probeStop = true;
+    }
+    m_probeWake.notify_all();
+    if (m_probeThread.joinable())
+    {
+        m_probeThread.join();
+    }
+}
+
+HistoryExpect GatewayApi::historyExpect() const
+{
+    HistoryExpect e;
+    // the genesis of the gateway's last CoreConfigReport: kept across a core outage (the session keeps its last report),
+    // none before the first one (every history read is then 503, cause epoch: the gateway cannot know)
+    const auto config = m_deps.config ? m_deps.config() : nullptr;
+    e.genesisId = config && config->reported ? config->head.genesisId : 0;
+    e.maxAgeMs = m_s.historyMaxAgeMs;
+    return e;
+}
+
+// asOf of a history answer: ageMs (the database's clock minus the projection's last beat), stale (ageMs above
+// GATEWAY_HISTORY_STALE_MS), eventSeq (the projection's applied_event_seq, read before the rows: every row of an event
+// at or below it is in the answer)
+std::string GatewayApi::asOfJson(std::int64_t ageMs, std::int64_t eventSeq) const
+{
+    std::string out = "{\"ageMs\":" + std::to_string(ageMs);
+#ifndef GW_NC_NO_STALE_LABEL
+    out += std::string(",\"stale\":") + (ageMs > m_s.historyStaleMs ? "true" : "false");
+#endif
+#ifndef GW_NC_NO_ASOF_EVENT_SEQ
+    out += ",\"eventSeq\":" + std::to_string(eventSeq);
+#else
+    (void)eventSeq;
+#endif
+    return out + "}";
+}
+
 bool GatewayApi::runHistory(const Ex &ex, const char *route, const char *query,
     std::function<void(int, std::int64_t)> job)
 {
@@ -1272,22 +1391,26 @@ void GatewayApi::historyPage(const Ex &ex, history::Kind kind)
             return;
         }
         request.userId = p.userId; // always the principal's: nothing in the request can name a user
-        runHistory(ex, route, query, [this, ex, route, query, request](int worker, std::int64_t deadlineNs) {
+        const HistoryExpect expect = historyExpect();
+        runHistory(ex, route, query, [this, ex, route, query, request, expect](int worker, std::int64_t deadlineNs) {
             HistoryPage page;
-            const HistoryAnswer a = m_deps.history->page(worker, request, page, deadlineNs);
+            const HistoryAnswer a = m_deps.history->page(worker, request, page, deadlineNs, expect);
             if (HistoryStatus::OK != a.status)
             {
                 finish(ex, route, historyUnavailable(a.cause, query));
                 return;
             }
             countHistory(query, "ok");
+#ifdef GW_NC_NO_HISTORY_PROBE
+            noteHistory(HistoryCause::NONE, page.ageMs, page.eventSeq); // test build only: a read stands in for the probe
+#endif
             std::string out = "{\"items\":[";
             for (std::size_t i = 0; i < page.items.size(); ++i)
             {
                 out += (0 == i ? "" : ",") + page.items[i];
             }
             out += "],\"nextCursor\":" + (page.nextCursor ? api::quote(*page.nextCursor) : std::string("null")) +
-                ",\"asOf\":{\"ageMs\":" + std::to_string(page.ageMs) + "}}";
+                ",\"asOf\":" + asOfJson(page.ageMs, page.eventSeq) + "}";
             finish(ex, route, api::jsonBody(200, std::move(out)));
         });
     });
@@ -1303,13 +1426,26 @@ void GatewayApi::orderFromHistory(const Ex &ex, std::int64_t userId, std::int64_
         finish(ex, route, historyUnavailable(HistoryCause::UNCONFIGURED, "order"));
         return;
     }
-    runHistory(ex, route, "order", [this, ex, userId, orderId](int worker, std::int64_t deadlineNs) {
+    const HistoryExpect expect = historyExpect();
+    runHistory(ex, route, "order", [this, ex, userId, orderId, expect](int worker, std::int64_t deadlineNs) {
         std::string json;
-        const HistoryAnswer a = m_deps.history->order(worker, userId, orderId, json, deadlineNs);
+        HistoryAsOf asOf;
+        const HistoryAnswer a = m_deps.history->order(worker, userId, orderId, json, asOf, deadlineNs, expect);
         switch (a.status)
         {
             case HistoryStatus::OK:
+                // the history shape of Order plus the read's asOf (an order the core holds open answers without one)
+                if (json.size() < 2 || '}' != json.back())
+                {
+                    break; // not an object: a bad row, never a body without asOf
+                }
                 countHistory("order", "ok");
+#ifdef GW_NC_NO_HISTORY_PROBE
+                noteHistory(HistoryCause::NONE, asOf.ageMs, asOf.eventSeq); // test build only: a read stands in
+#endif
+                json.pop_back();
+                json += std::string('{' == json.back() ? "" : ",") + "\"asOf\":" +
+                    asOfJson(asOf.ageMs, asOf.eventSeq) + "}";
                 finish(ex, route, api::jsonBody(200, std::move(json)));
                 return;
             case HistoryStatus::NOT_FOUND:
@@ -1319,7 +1455,7 @@ void GatewayApi::orderFromHistory(const Ex &ex, std::int64_t userId, std::int64_
             case HistoryStatus::UNAVAILABLE:
                 break;
         }
-        finish(ex, route, historyUnavailable(a.cause, "order"));
+        finish(ex, route, historyUnavailable(HistoryStatus::OK == a.status ? HistoryCause::BAD_ROW : a.cause, "order"));
     });
 }
 

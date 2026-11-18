@@ -212,6 +212,7 @@ set_tests_properties(stream PROPERTIES ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:gw_
 #   GW_NC_UNBOUNDED_QUEUE       the outbound queue has no bound (no 4001)
 #   GW_NC_COALESCE_FILLS        fill frames of one order coalesce like order frames
 #   GW_NC_ROUTE_BY_FRAME_USER   a userId in a client frame rebinds the connection instead of closing it 4003
+#   GW_NC_FILL_ZERO_TRADE       a FILL with tradeId 0 goes out as a fill frame
 set(GW_STREAM_CONTROLS
     "GW_NC_STITCH_INCLUSIVE|stream_stitch_across_pages|duplicate event [0-9]+"
     "GW_NC_SINGLE_PAGE_ASOF|stream_stitch_across_pages|client state differs from oracle"
@@ -221,7 +222,8 @@ set(GW_STREAM_CONTROLS
     "GW_NC_NO_RESNAPSHOT_PACING|stream_resnapshot_is_paced|snapshot query rate above the bound"
     "GW_NC_UNBOUNDED_QUEUE|stream_slow_client_bound|queue exceeded bound"
     "GW_NC_COALESCE_FILLS|stream_fills_never_coalesce|fill [0-9]+ missing"
-    "GW_NC_ROUTE_BY_FRAME_USER|ws_no_foreign_event|foreign event delivered")
+    "GW_NC_ROUTE_BY_FRAME_USER|ws_no_foreign_event|foreign event delivered"
+    "GW_NC_FILL_ZERO_TRADE|stream_no_fill_frame_without_a_trade|fill frame with tradeId 0")
 foreach(control IN LISTS GW_STREAM_CONTROLS)
     string(REPLACE "|" ";" parts "${control}")
     list(GET parts 0 define)
@@ -314,7 +316,43 @@ target_include_directories(gw_pg_nc_offset_paging PRIVATE unit pg)
 target_compile_definitions(gw_pg_nc_offset_paging PRIVATE ${GW_HISTORY_CONTRACT_DEFINITION} GW_NC_OFFSET_PAGING)
 target_link_libraries(gw_pg_nc_offset_paging PRIVATE oe_gateway_app gw_common)
 target_compile_options(gw_pg_nc_offset_paging PRIVATE ${GW_WARNINGS})
+# Controls for the freshness rows of the history read (stale label, epoch check, health probe, read order): the test
+# built with one rule off in the source named (test-only defines, never in a binary); the case must fail with the text.
+#   GW_NC_NO_STALE_LABEL          asOf carries no stale field
+#   GW_NC_NO_EPOCH_CHECK          the heartbeat's epoch is not compared with the gateway's last CoreConfigReport
+#   GW_NC_NO_HISTORY_PROBE        no probe: /health shows what the last successful read found
+#   GW_NC_ROWS_BEFORE_HEARTBEAT   a page reads its rows first and the heartbeat after them
+set(GW_HISTORY_PG_CONTROLS
+    "GW_NC_NO_STALE_LABEL|gateway/GatewayRoutes.cpp|history_stale_label|stale label missing"
+    "GW_NC_NO_EPOCH_CHECK|common/src/PgHistoryStore.cpp|history_epoch_check|history of another genesis served"
+    "GW_NC_NO_HISTORY_PROBE|gateway/GatewayRoutes.cpp|history_health_probe|health shows fresh history without a probe"
+    "GW_NC_ROWS_BEFORE_HEARTBEAT|common/src/PgHistoryStore.cpp|history_read_order_under_concurrent_apply|asOf.eventSeq claims rows the page lacks")
+set(GW_HISTORY_PG_CONTROL_TESTS "")
+foreach(entry IN LISTS GW_HISTORY_PG_CONTROLS)
+    string(REPLACE "|" ";" parts "${entry}")
+    list(GET parts 0 define)
+    list(GET parts 1 source)
+    list(GET parts 2 case)
+    list(GET parts 3 text)
+    string(TOLOWER "${define}" target)
+    string(REPLACE "gw_nc_" "gw_pg_history_nc_" target "${target}")
+    add_executable(${target} unit/TestMain.cpp pg/HistoryPgTest.cpp "${PROJECT_SOURCE_DIR}/${source}")
+    target_include_directories(${target} PRIVATE unit pg)
+    target_compile_definitions(${target} PRIVATE ${GW_HISTORY_CONTRACT_DEFINITION} ${define})
+    target_link_libraries(${target} PRIVATE oe_gateway_app gw_common)
+    list(APPEND GW_HISTORY_PG_CONTROL_TESTS "${target}|${case}|${text}")
+endforeach()
 if(GW_PG_TESTS)
+    foreach(entry IN LISTS GW_HISTORY_PG_CONTROL_TESTS)
+        string(REPLACE "|" ";" parts "${entry}")
+        list(GET parts 0 target)
+        list(GET parts 1 case)
+        list(GET parts 2 text)
+        add_test(NAME pg.${target} COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/pg/pg_it.py"
+            --binary "$<TARGET_FILE:${target}>" --image "${GW_PG_TEST_IMAGE}" ${case})
+        set_tests_properties(pg.${target} PROPERTIES TIMEOUT 300 LABELS pg RUN_SERIAL TRUE
+            PASS_REGULAR_EXPRESSION "${text}")
+    endforeach()
     add_test(NAME pg.users COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/pg/pg_it.py"
         --binary "$<TARGET_FILE:gw_pg_tests>" --image "${GW_PG_TEST_IMAGE}")
     set_tests_properties(pg.users PROPERTIES TIMEOUT 300 LABELS pg RUN_SERIAL TRUE)
@@ -385,6 +423,9 @@ set(GW_PROJECTOR_PG_CONTROLS
     "PROJ_NC_NO_COMPARE|HistoryWork.cpp|overlap_compare|conflicting duplicate skipped"
     "PROJ_NC_NO_DENSITY_CHECK|HistoryWork.cpp|dense_apply|applied a record past a gap"
     "PROJ_NC_SECOND_NAME_TABLE|JournalRecord.cpp|one_mapping_from_postgres|history row renders differently from the stream"
+    "PROJ_NC_BEAT_ALWAYS|ProjectionStore.cpp|beat_rule|beat without a fresh head"
+    "PROJ_NC_BEAT_NO_EPOCH|ProjectionStore.cpp|beat_rule|beat across genesis ids"
+    "PROJ_NC_REBUILD_KEEPS_BEAT|ProjectionStore.cpp|rebuild_reads|rebuilding history served as complete"
     "GW_NC_VIEW_REMAINING_FROM_QUANTITY||read_contract_compat|projected history differs from the read contract"
     "GW_NC_VIEW_COLUMN_RENAMED||read_contract_compat|the gateway's absent"
     "GW_NC_SHIFTED_COLUMN||reference_equivalence|projected history differs from the reference DDL")
@@ -409,7 +450,7 @@ foreach(entry IN LISTS GW_PROJECTOR_PG_CONTROLS)
 endforeach()
 if(GW_PG_TESTS)
     foreach(case apply_story fk_order_first_records crash_points overlap_compare dense_apply one_mapping_from_postgres
-            read_contract_compat reference_equivalence)
+            read_contract_compat reference_equivalence beat_rule rebuild_reads)
         add_test(NAME pg.projector.${case} COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/pg/pg_it.py"
             --binary "$<TARGET_FILE:gw_projector_pg_tests>" --image "${GW_PG_TEST_IMAGE}" ${case})
         set_tests_properties(pg.projector.${case} PROPERTIES TIMEOUT 300 LABELS "pg;projector" RUN_SERIAL TRUE)
@@ -578,7 +619,8 @@ if(GW_TEST_BUILDS)
             "PROJ_NC_READ_THE_LEADER|FollowRules.cpp"
             "PROJ_NC_NO_EPOCH_CHECK|FollowDuty.cpp,HistoryWork.cpp"
             "PROJ_NC_EPOCH_FROM_FIRST_RECORD|FollowDuty.cpp,HistoryWork.cpp" "PROJ_NC_NO_MTU_CHECK|FollowDuty.cpp"
-            "PROJ_NC_COMPARES_NOT_DELIVERY|FollowDuty.cpp")
+            "PROJ_NC_COMPARES_NOT_DELIVERY|FollowDuty.cpp"
+            "PROJ_NC_BEAT_NO_EPOCH|FollowDuty.cpp,ProjectionStore.cpp")
         string(REPLACE "|" ";" parts "${entry}")
         list(GET parts 0 define)
         list(GET parts 1 sources)
@@ -598,7 +640,8 @@ if(GW_TEST_BUILDS)
     foreach(entry "oe-projector-tc-faults|PROJ_TC_SOURCE_FAULTS|FollowDuty.cpp,HistoryWork.cpp"
             "oe-projector-tc-faults-nc-hole-marks-all|PROJ_TC_SOURCE_FAULTS+PROJ_NC_HOLE_MARKS_ALL|FollowDuty.cpp,HistoryWork.cpp"
             "oe-projector-tc-faults-nc-start-at-first|PROJ_TC_SOURCE_FAULTS+PROJ_NC_START_AT_FIRST|FollowDuty.cpp,HistoryWork.cpp"
-            "oe-projector-tc-faults-nc-behind-silent-only|PROJ_TC_SOURCE_FAULTS+PROJ_NC_BEHIND_SILENT_ONLY|FollowDuty.cpp,HistoryWork.cpp,FollowRules.cpp")
+            "oe-projector-tc-faults-nc-behind-silent-only|PROJ_TC_SOURCE_FAULTS+PROJ_NC_BEHIND_SILENT_ONLY|FollowDuty.cpp,HistoryWork.cpp,FollowRules.cpp"
+            "oe-projector-tc-faults-nc-beat-always|PROJ_TC_SOURCE_FAULTS+PROJ_NC_BEAT_ALWAYS|FollowDuty.cpp,HistoryWork.cpp,ProjectionStore.cpp")
         string(REPLACE "|" ";" parts "${entry}")
         list(GET parts 0 target)
         list(GET parts 1 defines)
@@ -611,7 +654,37 @@ if(GW_TEST_BUILDS)
         target_compile_definitions(${target} PRIVATE ${defines} GW_NO_ORDER_ENTRY)
         target_link_libraries(${target} PRIVATE cluster_tools::runtime_embedded_driver oe_projector_app)
     endforeach()
+    # the gateway with asOf.eventSeq left out (test-only, never published): the control of the resync fills rule
+    add_executable(oe-gateway-nc-no-asof-event-seq "${PROJECT_SOURCE_DIR}/gateway/main.cpp"
+        "${PROJECT_SOURCE_DIR}/gateway/GatewayRoutes.cpp")
+    target_compile_definitions(oe-gateway-nc-no-asof-event-seq PRIVATE GW_NC_NO_ASOF_EVENT_SEQ)
+    target_link_libraries(oe-gateway-nc-no-asof-event-seq PRIVATE cluster_tools::runtime_embedded_driver oe_gateway_app)
     if(GW_IT_CORE_JAR AND GW_IT_PROBE_JAR AND GW_PG_TESTS)
+        # the fills gap of a stream resync closed with GET /fills (tests/projector/fills_it.py): both driver modes, and
+        # the control (asOf without eventSeq)
+        set(_port 34000)
+        foreach(entry "oe-gateway|" "oe-gateway-nc-no-asof-event-seq|resync fill gap not closable")
+            foreach(mode embedded external)
+                string(REPLACE "|" ";" parts "${entry}")
+                list(GET parts 0 binary)
+                list(GET parts 1 text)
+                if(text STREQUAL "")
+                    set(name it.fills_gap.${mode})
+                else()
+                    set(name it.fills_gap.nc_no_asof_event_seq.${mode})
+                endif()
+                add_test(NAME ${name}
+                    COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/projector/fills_it.py"
+                        --bin-dir "${PROJECT_BINARY_DIR}/bin" --core-jar "${GW_IT_CORE_JAR}" --probe-jar "${GW_IT_PROBE_JAR}"
+                        --image "${GW_PG_TEST_IMAGE}" --mode ${mode} --work "${CMAKE_CURRENT_BINARY_DIR}/it-work/${name}"
+                        --port-base ${_port} --gateway-binary ${binary})
+                set_tests_properties(${name} PROPERTIES TIMEOUT 600 LABELS t1 RUN_SERIAL TRUE)
+                if(NOT text STREQUAL "")
+                    set_tests_properties(${name} PROPERTIES PASS_REGULAR_EXPRESSION "${text}")
+                endif()
+                math(EXPR _port "${_port} + 400")
+            endforeach()
+        endforeach()
         set(_port 25000)
         # case|binary|failure text of a control|core driver mode
         foreach(entry "follow|oe-projector||embedded" "follow|oe-projector||external" "successor|oe-projector||embedded"
@@ -629,7 +702,10 @@ if(GW_TEST_BUILDS)
                 "epoch|oe-projector-nc-no-epoch-check|rows of two genesis ids in one projection|embedded"
                 "regenesis|oe-projector-nc-epoch-from-first-record|projection built from a previous genesis|embedded"
                 "mtu|oe-projector-nc-no-mtu-check|replay opened with a different MTU|embedded"
-                "long_overlap|oe-projector-nc-compares-not-delivery|BEHIND left a source that was comparing the overlap|embedded")
+                "long_overlap|oe-projector-nc-compares-not-delivery|BEHIND left a source that was comparing the overlap|embedded"
+                "beat|oe-projector-tc-faults||embedded" "beat_epoch|oe-projector||embedded"
+                "beat|oe-projector-tc-faults-nc-beat-always|beat without a fresh head|embedded"
+                "beat_epoch|oe-projector-nc-beat-no-epoch|beat across genesis ids|embedded")
             foreach(mode embedded external)
                 string(REPLACE "|" ";" parts "${entry}")
                 list(GET parts 0 case)

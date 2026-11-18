@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <map>
 
 #include "cluster_tools/archive/aeron/ChainFollower.h"
@@ -300,6 +301,7 @@ public:
             return work; // pj-pg has not handed over a generation yet
         }
         evaluateEpoch(now);
+        work += offerBeat();
         work += stepOrphans(now);
         work += follow(now, tp);
         publishView(now);
@@ -444,6 +446,7 @@ private:
         m_genesis = 0;
         m_head = -1;
         m_lastProbeAnsweredNs = -1;
+        m_beats.clear();
         log(rt::LogLevel::INFO, "standby: the replay is stopped and the cluster session closed");
     }
 
@@ -490,7 +493,54 @@ private:
             m_genesis = events->end.genesisId;
             m_lastProbeAnsweredNs = monoNs();
             m_behind.onProbe(m_head, m_applied, readPosition());
+            if (m_genesis >= 1)
+            {
+                // a candidate of the beat rule: complete as of the send time once the cursor reaches this head
+                // (FollowRules.h: one per answered probe, the oldest dropped at HISTORY_PROJECTOR_BEAT_CANDIDATES)
+                m_beatsDropped += addBeatCandidate(m_beats, BeatCandidate{ m_head, m_genesis, m_lastProbeSentNs },
+                    static_cast<std::size_t>(m_settings.beatCandidates));
+            }
         }
+    }
+
+    // ---- the beat rule (ProjectionStore.h): an answered probe whose head the committed cursor has reached, of the
+    // projection's own genesis, with no halt, goes to pj-pg as a BEAT; the newest such probe wins. No answered probe
+    // (unanswered, no leader, the session down), a probe of another genesis, a cursor below its head, or a halt: none.
+    // pj-pg's statement checks the same against what its transaction committed.
+    int offerBeat()
+    {
+        std::optional<BeatCandidate> best;
+        while (!m_beats.empty() && m_beats.front().head <= m_applied)
+        {
+            best = m_beats.front();
+            m_beats.pop_front();
+        }
+        if (!best)
+        {
+            return 0;
+        }
+#ifdef PROJ_NC_BEAT_NO_EPOCH
+        // test build only: no genesis term
+        const bool sameGenesis = true;
+        const bool halted = Halt::NONE != m_halt.halt && Halt::EPOCH_MISMATCH != m_halt.halt;
+#else
+        const bool sameGenesis = m_dbEpoch && *m_dbEpoch == best->genesis;
+        const bool halted = Halt::NONE != m_halt.halt;
+#endif
+        if (!sameGenesis || halted)
+        {
+            m_beatsRefused++;
+            return 0;
+        }
+        Item i;
+        i.kind = Item::Kind::BEAT;
+        i.generation = m_generation;
+        i.head = best->head;
+        i.epoch = best->genesis;
+        i.sentAtNs = best->sentAtNs;
+        m_exchange.push(std::move(i));
+        m_beatsOffered++;
+        return 1;
     }
 
     std::int64_t clusterGenesis() const
@@ -1373,6 +1423,10 @@ private:
         v.genesisId = clusterGenesis();
         v.headSeq = m_head;
         v.lastHeadProbeNs = m_lastProbeAnsweredNs;
+        v.beatsOffered = m_beatsOffered;
+        v.beatsRefused = m_beatsRefused;
+        v.beatsDropped = m_beatsDropped;
+        v.beatsPending = m_beats.size();
         v.halt = m_halt;
         v.foreignEpochRecordings = ar::ArchiveMetrics::get(m_metrics.foreignEpochRecordings);
         v.sourceStates.clear();
@@ -1421,6 +1475,10 @@ private:
     std::int64_t m_lastProbeAnsweredNs = -1;
     std::int64_t m_head = -1;
     std::int64_t m_genesis = 0;
+    std::deque<BeatCandidate> m_beats; // answered probes whose head the cursor has not reached yet, oldest first
+    std::uint64_t m_beatsOffered = 0;
+    std::uint64_t m_beatsDropped = 0;  // candidates dropped at HISTORY_PROJECTOR_BEAT_CANDIDATES (oldest first)
+    std::uint64_t m_beatsRefused = 0;  // probes reached but of another genesis, or while halted
 
     std::uint64_t m_generation = 0;
     std::int64_t m_applied = 0;

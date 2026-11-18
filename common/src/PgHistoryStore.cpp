@@ -172,7 +172,7 @@ bool PgHistoryStore::left(std::int64_t deadlineNs, const char *what, std::int64_
     return false;
 }
 
-bool PgHistoryStore::ageOf(PgConn &c, std::int64_t deadlineNs, std::int64_t &ageMs, std::int64_t &appliedOrderId,
+bool PgHistoryStore::heartbeat(PgConn &c, std::int64_t deadlineNs, const HistoryExpect &expect, HistoryAsOf &out,
     HistoryAnswer &why)
 {
     std::int64_t ms = 0;
@@ -193,31 +193,72 @@ bool PgHistoryStore::ageOf(PgConn &c, std::int64_t deadlineNs, std::int64_t &age
             "gateway_history_heartbeat_v1 holds no row: the projection has not reported");
         return false;
     }
-    if (PQgetisnull(r.get(), 0, 1))
+    for (int col = 1; col <= 4; ++col)
     {
-        why = unavailable(HistoryCause::BAD_ROW, "heartbeat", "column applied_order_id is NULL");
+        if (PQgetisnull(r.get(), 0, col))
+        {
+            static const char *const names[] = { "", "applied_order_id", "applied_event_seq", "epoch", "epoch" };
+            why = unavailable(HistoryCause::BAD_ROW, "heartbeat", std::string("column ") + names[col] + " is NULL");
+            return false;
+        }
+    }
+    out.ageMs = std::atoll(PQgetvalue(r.get(), 0, 0));
+    out.appliedOrderId = std::atoll(PQgetvalue(r.get(), 0, 1));
+    out.eventSeq = std::atoll(PQgetvalue(r.get(), 0, 2));
+    out.epoch = std::atoll(PQgetvalue(r.get(), 0, 3));
+    const std::int64_t highest = std::atoll(PQgetvalue(r.get(), 0, 4));
+#ifndef GW_NC_NO_EPOCH_CHECK
+    // history of another genesis is never served: the expected genesis comes from the cluster (the gateway's last
+    // CoreConfigReport), never from the data; a gateway that has read no report cannot know, the same answer
+    if (0 == expect.genesisId || out.epoch != expect.genesisId || highest != out.epoch)
+    {
+        why = unavailable(HistoryCause::EPOCH, "heartbeat", "the projection's epoch is " + std::to_string(out.epoch) +
+            (highest != out.epoch ? " and " + std::to_string(highest) : std::string()) + ", the core's genesisId " +
+            (0 == expect.genesisId ? std::string("not known yet (no CoreConfigReport read)")
+                                   : std::to_string(expect.genesisId)));
         return false;
     }
-    ageMs = std::atoll(PQgetvalue(r.get(), 0, 0));
-    appliedOrderId = std::atoll(PQgetvalue(r.get(), 0, 1));
+#else
+    (void)highest; // test build only: no epoch check
+#endif
+    if (expect.maxAgeMs > 0 && out.ageMs > expect.maxAgeMs)
+    {
+        // normal under a projector outage with refusal set: the cause is in the metrics, no WARN line per read
+        why = HistoryAnswer{ HistoryStatus::UNAVAILABLE, HistoryCause::STALE };
+        return false;
+    }
     return true;
 }
 
 HistoryAnswer PgHistoryStore::page(int worker, const history::PageRequest &request, HistoryPage &out,
-    std::int64_t deadlineNs)
+    std::int64_t deadlineNs, const HistoryExpect &expect)
 {
-    return attempt(worker, deadlineNs, [&](PgConn &c) { return pageOn(c, request, out, deadlineNs); });
+    return attempt(worker, deadlineNs, [&](PgConn &c) { return pageOn(c, request, out, deadlineNs, expect); });
+}
+
+HistoryAnswer PgHistoryStore::probe(int worker, HistoryAsOf &out, std::int64_t deadlineNs, const HistoryExpect &expect)
+{
+    return attempt(worker, deadlineNs, [&](PgConn &c) {
+        HistoryAnswer why;
+        if (!heartbeat(c, deadlineNs, expect, out, why))
+        {
+            return why;
+        }
+        return HistoryAnswer{ HistoryStatus::OK, HistoryCause::NONE };
+    });
 }
 
 HistoryAnswer PgHistoryStore::pageOn(PgConn &c, const history::PageRequest &request, HistoryPage &out,
-    std::int64_t deadlineNs)
+    std::int64_t deadlineNs, const HistoryExpect &expect)
 {
     HistoryAnswer why;
-    std::int64_t applied = 0;
-    if (!ageOf(c, deadlineNs, out.ageMs, applied, why))
+    HistoryAsOf asOf;
+#ifndef GW_NC_ROWS_BEFORE_HEARTBEAT
+    if (!heartbeat(c, deadlineNs, expect, asOf, why))
     {
         return why;
     }
+#endif
     const char *what = history::Kind::ORDERS == request.kind ? "orders page" : "fills page";
     std::int64_t ms = 0;
     if (!left(deadlineNs, what, ms, why))
@@ -231,6 +272,14 @@ HistoryAnswer PgHistoryStore::pageOn(PgConn &c, const history::PageRequest &requ
     {
         return failed(c, what, error);
     }
+#ifdef GW_NC_ROWS_BEFORE_HEARTBEAT
+    if (!heartbeat(c, deadlineNs, expect, asOf, why)) // test build only: the heartbeat after the rows
+    {
+        return why;
+    }
+#endif
+    out.ageMs = asOf.ageMs;
+    out.eventSeq = asOf.eventSeq;
     const int rows = PQntuples(r.get());
     const std::size_t limit = static_cast<std::size_t>(request.limit);
     history::Key last;
@@ -261,22 +310,23 @@ HistoryAnswer PgHistoryStore::pageOn(PgConn &c, const history::PageRequest &requ
 }
 
 HistoryAnswer PgHistoryStore::order(int worker, std::int64_t userId, std::int64_t orderId, std::string &json,
-    std::int64_t deadlineNs)
+    HistoryAsOf &asOf, std::int64_t deadlineNs, const HistoryExpect &expect)
 {
-    return attempt(worker, deadlineNs, [&](PgConn &c) { return orderOn(c, userId, orderId, json, deadlineNs); });
+    return attempt(worker, deadlineNs,
+        [&](PgConn &c) { return orderOn(c, userId, orderId, json, asOf, deadlineNs, expect); });
 }
 
 HistoryAnswer PgHistoryStore::orderOn(PgConn &c, std::int64_t userId, std::int64_t orderId, std::string &json,
-    std::int64_t deadlineNs)
+    HistoryAsOf &asOf, std::int64_t deadlineNs, const HistoryExpect &expect)
 {
     HistoryAnswer why;
-    std::int64_t ageMs = 0;
-    std::int64_t applied = 0;
-    // a projection that never reported cannot say "no such order": that is 503, never 404
-    if (!ageOf(c, deadlineNs, ageMs, applied, why))
+    asOf = HistoryAsOf{};
+    // a projection that never reported, or one of another genesis, cannot say "no such order": that is 503, never 404
+    if (!heartbeat(c, deadlineNs, expect, asOf, why))
     {
         return why;
     }
+    const std::int64_t applied = asOf.appliedOrderId;
     std::int64_t ms = 0;
     if (!left(deadlineNs, "order lookup", ms, why))
     {

@@ -8,6 +8,10 @@ GatewayFront::GatewayFront(const GatewaySettings &g, AuthMaterial material, Duty
     m_settings(g), m_bridge(bridge)
 {
     const CommonSettings &c = g.common;
+    for (const std::string &w : g.warnings)
+    {
+        frontLog(FrontLevel::WARN, "%s", w.c_str());
+    }
     const bool demo = 0 != (c.authModes & auth_mode::DEMO);
     if (demo)
     {
@@ -104,12 +108,14 @@ void GatewayFront::start()
         m_historyPool->start();
     }
     m_bridge.startCompletions();
+    m_api->startHistoryProbe();
     m_server->start();
 }
 
 bool GatewayFront::stop(std::int64_t boundMs)
 {
     bool ok = m_server->stop(boundMs);
+    m_api->stopHistoryProbe();
     if (m_hashPool)
     {
         ok = m_hashPool->stop(boundMs) && ok;
