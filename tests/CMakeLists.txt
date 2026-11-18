@@ -337,6 +337,95 @@ target_compile_definitions(gw_projector_tests PRIVATE
     GW_PROJECTION_STORE_SOURCE="${PROJECT_SOURCE_DIR}/projector/ProjectionStore.cpp")
 add_test(NAME projector COMMAND gw_projector_tests)
 
+# oe-projector T0: the follow rules and the record mapping (tests/unit/ProjectorFollowTest.cpp), and their controls: each
+# compiles one rule off (PROJ_NC_*, in the projector source named) and must fail its case with the named text.
+add_executable(gw_projector_follow_tests unit/TestMain.cpp unit/ProjectorFollowTest.cpp)
+target_include_directories(gw_projector_follow_tests PRIVATE unit)
+target_link_libraries(gw_projector_follow_tests PRIVATE cluster_tools::runtime_embedded_driver oe_projector_app gw_common)
+target_compile_options(gw_projector_follow_tests PRIVATE ${GW_WARNINGS})
+add_test(NAME projector.follow COMMAND gw_projector_follow_tests)
+set(GW_PROJECTOR_FOLLOW_CONTROLS
+    "PROJ_NC_HOLE_FROM_MEMO|FollowRules.cpp|forward_rule_table|hole believed from a memo read"
+    "PROJ_NC_READ_THE_LEADER|FollowRules.cpp|source_choice_avoids_the_leader|the leader's archive read while a follower could be"
+    "PROJ_NC_NO_BACKOFF|FollowRules.cpp|backoff_doubles_to_its_cap|replay requests flood the source archive"
+    "PROJ_NC_BEHIND_SILENT_ONLY|FollowRules.cpp|behind_window|attached to a lagging source while another was current"
+    "PROJ_NC_NO_ENUM_CHECK|JournalRecord.cpp|record_refuses_unnamed_enums|row written with an unnamed enum value"
+    "PROJ_NC_SECOND_NAME_TABLE|JournalRecord.cpp|one_mapping_order_and_fill_json|history row renders differently from the stream")
+foreach(entry IN LISTS GW_PROJECTOR_FOLLOW_CONTROLS)
+    string(REPLACE "|" ";" parts "${entry}")
+    list(GET parts 0 define)
+    list(GET parts 1 source)
+    list(GET parts 2 case)
+    list(GET parts 3 text)
+    string(TOLOWER "${define}" target)
+    string(REPLACE "proj_nc_" "gw_projector_nc_" target "${target}")
+    add_executable(${target} unit/TestMain.cpp unit/ProjectorFollowTest.cpp "${PROJECT_SOURCE_DIR}/projector/${source}")
+    target_include_directories(${target} PRIVATE unit)
+    target_compile_definitions(${target} PRIVATE ${define})
+    target_link_libraries(${target} PRIVATE cluster_tools::runtime_embedded_driver oe_projector_app gw_common)
+    add_test(NAME projector.${target} COMMAND ${target} ${case})
+    set_tests_properties(projector.${target} PROPERTIES PASS_REGULAR_EXPRESSION "${text}")
+endforeach()
+# the property's non-vacuity control: faults that never clear must leave no recovery in the seed set
+add_test(NAME projector.fuzz_faults_never_clear COMMAND gw_projector_follow_tests follow_fuzz_recovers)
+set_tests_properties(projector.fuzz_faults_never_clear PROPERTIES ENVIRONMENT GW_FUZZ_FAULTS_NEVER_CLEAR=1
+    PASS_REGULAR_EXPRESSION "no recovery in the seed set")
+
+# oe-projector T1 against PostgreSQL (tests/pg/ProjectorPgTest.cpp through pg_it.py): the writer's batches over the
+# shipped lease and fence, and the controls (PROJ_NC_* in the projector source named, GW_NC_* in the test itself).
+add_executable(gw_projector_pg_tests unit/TestMain.cpp pg/ProjectorPgTest.cpp)
+target_include_directories(gw_projector_pg_tests PRIVATE unit pg)
+target_compile_definitions(gw_projector_pg_tests PRIVATE ${GW_HISTORY_CONTRACT_DEFINITION})
+target_link_libraries(gw_projector_pg_tests PRIVATE cluster_tools::runtime_embedded_driver oe_projector_app gw_common)
+target_compile_options(gw_projector_pg_tests PRIVATE ${GW_WARNINGS})
+set(GW_PROJECTOR_PG_CONTROLS
+    "PROJ_NC_FILL_ZERO_TRADE|JournalRecord.cpp|apply_story|fill row with tradeId 0"
+    "PROJ_NC_FILLS_FIRST|HistoryWork.cpp|fk_order_first_records|fill before its order"
+    "PROJ_NC_CURSOR_OWN_TX|HistoryWork.cpp|crash_points|cursor ahead of the rows"
+    "PROJ_NC_NO_COMPARE|HistoryWork.cpp|overlap_compare|conflicting duplicate skipped"
+    "PROJ_NC_NO_DENSITY_CHECK|HistoryWork.cpp|dense_apply|applied a record past a gap"
+    "PROJ_NC_SECOND_NAME_TABLE|JournalRecord.cpp|one_mapping_from_postgres|history row renders differently from the stream"
+    "GW_NC_VIEW_REMAINING_FROM_QUANTITY||read_contract_compat|projected history differs from the read contract"
+    "GW_NC_VIEW_COLUMN_RENAMED||read_contract_compat|the gateway's absent"
+    "GW_NC_SHIFTED_COLUMN||reference_equivalence|projected history differs from the reference DDL")
+set(GW_PROJECTOR_PG_CONTROL_TESTS "")
+foreach(entry IN LISTS GW_PROJECTOR_PG_CONTROLS)
+    string(REPLACE "|" ";" parts "${entry}")
+    list(GET parts 0 define)
+    list(GET parts 1 source)
+    list(GET parts 2 case)
+    list(GET parts 3 text)
+    string(TOLOWER "${define}" target)
+    string(REGEX REPLACE "^(proj|gw)_nc_" "gw_projector_pg_nc_" target "${target}")
+    set(extra "")
+    if(NOT source STREQUAL "")
+        set(extra "${PROJECT_SOURCE_DIR}/projector/${source}")
+    endif()
+    add_executable(${target} unit/TestMain.cpp pg/ProjectorPgTest.cpp ${extra})
+    target_include_directories(${target} PRIVATE unit pg)
+    target_compile_definitions(${target} PRIVATE ${GW_HISTORY_CONTRACT_DEFINITION} ${define})
+    target_link_libraries(${target} PRIVATE cluster_tools::runtime_embedded_driver oe_projector_app gw_common)
+    list(APPEND GW_PROJECTOR_PG_CONTROL_TESTS "${target}|${case}|${text}")
+endforeach()
+if(GW_PG_TESTS)
+    foreach(case apply_story fk_order_first_records crash_points overlap_compare dense_apply one_mapping_from_postgres
+            read_contract_compat reference_equivalence)
+        add_test(NAME pg.projector.${case} COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/pg/pg_it.py"
+            --binary "$<TARGET_FILE:gw_projector_pg_tests>" --image "${GW_PG_TEST_IMAGE}" ${case})
+        set_tests_properties(pg.projector.${case} PROPERTIES TIMEOUT 300 LABELS "pg;projector" RUN_SERIAL TRUE)
+    endforeach()
+    foreach(entry IN LISTS GW_PROJECTOR_PG_CONTROL_TESTS)
+        string(REPLACE "|" ";" parts "${entry}")
+        list(GET parts 0 target)
+        list(GET parts 1 case)
+        list(GET parts 2 text)
+        add_test(NAME pg.${target} COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/pg/pg_it.py"
+            --binary "$<TARGET_FILE:${target}>" --image "${GW_PG_TEST_IMAGE}" ${case})
+        set_tests_properties(pg.${target} PROPERTIES TIMEOUT 300 LABELS "pg;projector" RUN_SERIAL TRUE
+            PASS_REGULAR_EXPRESSION "${text}")
+    endforeach()
+endif()
+
 add_test(NAME lock COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/lock/lock_test.sh" "${PROJECT_SOURCE_DIR}" "${CMAKE_COMMAND}"
     "${CMAKE_CURRENT_BINARY_DIR}/lock-work")
 
@@ -479,6 +568,97 @@ if(GW_TEST_BUILDS)
             if(NOT text STREQUAL "")
                 set_tests_properties(${name} PROPERTIES PASS_REGULAR_EXPRESSION "${text}")
             endif()
+        endforeach()
+    endif()
+
+    # oe-projector follow side against a real three-member core cluster (tests/projector/follow_it.py, T1, a heavy job),
+    # both driver modes of the projector (the core members run their own embedded drivers), and the follow controls:
+    # each test build compiles one rule off (PROJ_NC_*, in the projector source named) and runs the case it guards.
+    foreach(entry "PROJ_NC_NO_STOP_REPLAY|FollowDuty.cpp" "PROJ_NC_NO_BACKOFF|FollowRules.cpp"
+            "PROJ_NC_READ_THE_LEADER|FollowRules.cpp"
+            "PROJ_NC_NO_EPOCH_CHECK|FollowDuty.cpp,HistoryWork.cpp"
+            "PROJ_NC_EPOCH_FROM_FIRST_RECORD|FollowDuty.cpp,HistoryWork.cpp" "PROJ_NC_NO_MTU_CHECK|FollowDuty.cpp"
+            "PROJ_NC_COMPARES_NOT_DELIVERY|FollowDuty.cpp")
+        string(REPLACE "|" ";" parts "${entry}")
+        list(GET parts 0 define)
+        list(GET parts 1 sources)
+        string(REPLACE "," ";" sources "${sources}")
+        list(TRANSFORM sources PREPEND "${PROJECT_SOURCE_DIR}/projector/")
+        string(TOLOWER "${define}" target)
+        string(REPLACE "proj_nc_" "oe-projector-nc-" target "${target}")
+        string(REPLACE "_" "-" target "${target}")
+        add_executable(${target} "${PROJECT_SOURCE_DIR}/projector/main.cpp" ${sources})
+        target_include_directories(${target} PRIVATE "${PROJECT_SOURCE_DIR}/stream" "${PROJECT_SOURCE_DIR}/projector")
+        target_compile_definitions(${target} PRIVATE ${define} GW_NO_ORDER_ENTRY)
+        target_link_libraries(${target} PRIVATE cluster_tools::runtime_embedded_driver oe_projector_app)
+    endforeach()
+    # the fault build (PROJ_TC_SOURCE_FAULTS, test-only, never published): the frame sink drops or delays records of a
+    # configured source before the forward rule, and the writer fails one batch on request (PROJ_TC_RELOAD_AT); and the
+    # same build with one rule off for each control (defines joined by +)
+    foreach(entry "oe-projector-tc-faults|PROJ_TC_SOURCE_FAULTS|FollowDuty.cpp,HistoryWork.cpp"
+            "oe-projector-tc-faults-nc-hole-marks-all|PROJ_TC_SOURCE_FAULTS+PROJ_NC_HOLE_MARKS_ALL|FollowDuty.cpp,HistoryWork.cpp"
+            "oe-projector-tc-faults-nc-start-at-first|PROJ_TC_SOURCE_FAULTS+PROJ_NC_START_AT_FIRST|FollowDuty.cpp,HistoryWork.cpp"
+            "oe-projector-tc-faults-nc-behind-silent-only|PROJ_TC_SOURCE_FAULTS+PROJ_NC_BEHIND_SILENT_ONLY|FollowDuty.cpp,HistoryWork.cpp,FollowRules.cpp")
+        string(REPLACE "|" ";" parts "${entry}")
+        list(GET parts 0 target)
+        list(GET parts 1 defines)
+        list(GET parts 2 sources)
+        string(REPLACE "+" ";" defines "${defines}")
+        string(REPLACE "," ";" sources "${sources}")
+        list(TRANSFORM sources PREPEND "${PROJECT_SOURCE_DIR}/projector/")
+        add_executable(${target} "${PROJECT_SOURCE_DIR}/projector/main.cpp" ${sources})
+        target_include_directories(${target} PRIVATE "${PROJECT_SOURCE_DIR}/stream" "${PROJECT_SOURCE_DIR}/projector")
+        target_compile_definitions(${target} PRIVATE ${defines} GW_NO_ORDER_ENTRY)
+        target_link_libraries(${target} PRIVATE cluster_tools::runtime_embedded_driver oe_projector_app)
+    endforeach()
+    if(GW_IT_CORE_JAR AND GW_IT_PROBE_JAR AND GW_PG_TESTS)
+        set(_port 25000)
+        # case|binary|failure text of a control|core driver mode
+        foreach(entry "follow|oe-projector||embedded" "follow|oe-projector||external" "successor|oe-projector||embedded"
+                "replays|oe-projector||embedded" "epoch|oe-projector||embedded" "mtu|oe-projector||embedded"
+                "replay_cap|oe-projector||embedded"
+                "long_overlap|oe-projector||embedded" "regenesis|oe-projector||embedded"
+                "holes|oe-projector-tc-faults||embedded" "above_one|oe-projector-tc-faults||embedded"
+                "slow|oe-projector-tc-faults||embedded" "writer_reset|oe-projector-tc-faults||embedded"
+                "holes|oe-projector-tc-faults-nc-hole-marks-all|halted on a hole another source could fill|embedded"
+                "above_one|oe-projector-tc-faults-nc-start-at-first|projection started above 1|embedded"
+                "slow|oe-projector-tc-faults-nc-behind-silent-only|attached to a lagging source while another was current|embedded"
+                "replays|oe-projector-nc-no-stop-replay|replay left open on the source|embedded"
+                "replay_cap|oe-projector-nc-no-backoff|replay requests flood the source archive|embedded"
+                "follow|oe-projector-nc-read-the-leader|the leader's archive read while a follower could be|embedded"
+                "epoch|oe-projector-nc-no-epoch-check|rows of two genesis ids in one projection|embedded"
+                "regenesis|oe-projector-nc-epoch-from-first-record|projection built from a previous genesis|embedded"
+                "mtu|oe-projector-nc-no-mtu-check|replay opened with a different MTU|embedded"
+                "long_overlap|oe-projector-nc-compares-not-delivery|BEHIND left a source that was comparing the overlap|embedded")
+            foreach(mode embedded external)
+                string(REPLACE "|" ";" parts "${entry}")
+                list(GET parts 0 case)
+                list(GET parts 1 binary)
+                list(GET parts 2 text)
+                list(GET parts 3 core)
+                if(text STREQUAL "")
+                    set(name it.projector.${case}.${mode})
+                else()
+                    string(REPLACE "oe-projector-" "" nc "${binary}")
+                    string(REPLACE "-" "_" nc "${nc}")
+                    set(name it.projector.${nc}.${mode})
+                endif()
+                if(core STREQUAL "external")
+                    # the mixed combination's other half: members on external drivers (each its own), the projector
+                    # in ${mode}
+                    set(name ${name}.core_external)
+                endif()
+                add_test(NAME ${name}
+                    COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/projector/follow_it.py"
+                        --bin-dir "${PROJECT_BINARY_DIR}/bin" --core-jar "${GW_IT_CORE_JAR}" --probe-jar "${GW_IT_PROBE_JAR}"
+                        --image "${GW_PG_TEST_IMAGE}" --mode ${mode} --work "${CMAKE_CURRENT_BINARY_DIR}/it-work/${name}"
+                        --port-base ${_port} --binary ${binary} --core-driver ${core} ${case})
+                set_tests_properties(${name} PROPERTIES TIMEOUT 600 LABELS t1 RUN_SERIAL TRUE)
+                if(NOT text STREQUAL "")
+                    set_tests_properties(${name} PROPERTIES PASS_REGULAR_EXPRESSION "${text}")
+                endif()
+                math(EXPR _port "${_port} + 400")
+            endforeach()
         endforeach()
     endif()
 

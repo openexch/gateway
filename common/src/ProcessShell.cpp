@@ -356,6 +356,7 @@ void runProcess(const ProcessIdentity &id, const ProcessInputs &in)
             {
                 DutyContext context;
                 context.aeron = aeron;
+                context.monitor = monitor;
                 context.log = &log;
                 duty = in.makeDuty(context);
             }

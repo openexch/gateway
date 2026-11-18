@@ -80,7 +80,9 @@ ParseResult<ProjectorSettings> parseProjectorSettings(const Environment &env, co
         }
     }
     c.idle = 1 == r.choice(X + "IDLE", { "backoff", "busy" }, 0) ? IdleMode::BUSY : IdleMode::BACKOFF;
-    c.dutyWatchdogMs = r.positive(X + "DUTY_WATCHDOG_MS", c.dutyWatchdogMs);
+    // above the default archive timeout (5000): an archive control call that waits out its timeout on pj-duty leaves
+    // the source instead of tripping the watchdog
+    c.dutyWatchdogMs = r.positive(X + "DUTY_WATCHDOG_MS", 10'000);
     c.stopTimeoutMs = r.positive(X + "STOP_TIMEOUT_MS", c.stopTimeoutMs);
     c.statusIntervalMs = r.positive(X + "STATUS_INTERVAL_MS", c.statusIntervalMs);
     {
@@ -123,7 +125,57 @@ ParseResult<ProjectorSettings> parseProjectorSettings(const Environment &env, co
         }
     }
 
-    // the head-probe session
+    // the member node of each source, in the archive list's order
+    {
+        const std::string key = X + "JOURNAL_NODE_ENDPOINTS";
+        const std::string text = r.requiredString(key, "one entry per archive, in its order: host:port of that core "
+            "member's node endpoint, or '-' for a source that is not a core member");
+        if (!text.empty())
+        {
+            const auto items = splitList(text);
+            if (!items)
+            {
+                r.problem(key + " has an empty entry: name host:port or '-' for every archive");
+            }
+            else
+            {
+                for (const std::string &item : *items)
+                {
+                    if ("-" == item)
+                    {
+                        s.nodeEndpoints.push_back(std::nullopt);
+                        continue;
+                    }
+                    std::string why;
+                    if (const auto b = parseBindText(item, false, why))
+                    {
+                        s.nodeEndpoints.push_back(*b);
+                    }
+                    else
+                    {
+                        r.problem(key + ": '" + item + "' must be " + why + " or '-'");
+                    }
+                }
+                if (!s.archive.archives.empty() && s.nodeEndpoints.size() != s.archive.archives.size())
+                {
+                    r.problem(key + " names " + std::to_string(items->size()) + " entries; " + X +
+                        "JOURNAL_ARCHIVES names " + std::to_string(s.archive.archives.size()) + " (one each, same order)");
+                }
+            }
+        }
+    }
+    s.nodePollMs = r.positive(X + "NODE_POLL_MS", s.nodePollMs);
+    s.nodePollTimeoutMs = r.positive(X + "NODE_POLL_TIMEOUT_MS", s.nodePollTimeoutMs);
+    s.nodeMaxBodyBytes = r.positive(X + "NODE_MAX_BODY_BYTES", s.nodeMaxBodyBytes);
+    s.archiveProbeMs = r.positive(X + "ARCHIVE_PROBE_MS", s.archiveProbeMs);
+    s.nodeFreshMs = r.positive(X + "NODE_FRESH_MS", s.nodeFreshMs);
+    s.nodeFirstRoundMs = r.positive(X + "NODE_FIRST_ROUND_MS", s.nodeFirstRoundMs);
+    above(r, X + "NODE_POLL_MS", s.nodePollMs, X + "NODE_POLL_TIMEOUT_MS", s.nodePollTimeoutMs,
+        "a round would still run when the next one is due");
+    above(r, X + "NODE_FRESH_MS", s.nodeFreshMs, X + "NODE_POLL_MS", s.nodePollMs,
+        "every answer would be stale before the next round");
+
+    // the cluster session
     s.clusterMembers = r.requiredString(X + "CLUSTER_MEMBERS", "the core members, id=host:port,...");
     if (!s.clusterMembers.empty())
     {
@@ -160,6 +212,26 @@ ParseResult<ProjectorSettings> parseProjectorSettings(const Environment &env, co
             }
         }
     }
+
+    s.ingressChannel = r.requiredString(X + "CORE_INGRESS_CHANNEL",
+        "a full aeron:udp URI naming term-length and mtu, e.g. aeron:udp?term-length=4m|mtu=8192");
+    if (!s.ingressChannel.empty())
+    {
+        checkSessionChannel(r, X + "CORE_INGRESS_CHANNEL", s.ingressChannel, false);
+    }
+    s.responseChannel = r.requiredString(X + "CORE_RESPONSE_CHANNEL",
+        "a full aeron:udp URI naming endpoint, term-length and mtu, e.g. aeron:udp?endpoint=10.0.0.5:0|term-length=4m|mtu=8192");
+    if (!s.responseChannel.empty())
+    {
+        checkSessionChannel(r, X + "CORE_RESPONSE_CHANNEL", s.responseChannel, true);
+    }
+    s.requestTimeoutMs = r.positive(X + "REQUEST_TIMEOUT_MS", s.requestTimeoutMs);
+    s.reconnectDelayMs = r.positive(X + "RECONNECT_DELAY_MS", s.reconnectDelayMs);
+    s.registerResendMs = r.positive(X + "REGISTER_RESEND_MS", s.registerResendMs);
+    s.sessionMaxInflight = r.positive(X + "SESSION_MAX_INFLIGHT", s.sessionMaxInflight);
+    s.queryRateCount = r.positive(X + "QUERY_RATE_COUNT", s.queryRateCount);
+    s.queryRatePeriodMs = r.positive(X + "QUERY_RATE_PERIOD_MS", s.queryRatePeriodMs);
+    s.queryBurst = r.positive(X + "QUERY_BURST", s.queryBurst);
 
     // PostgreSQL
     s.pgUrl = r.requiredString(X + "PG_URL", "postgresql://... of the projection database", true);
@@ -203,6 +275,14 @@ ParseResult<ProjectorSettings> parseProjectorSettings(const Environment &env, co
             ") is above " + X + "LEASE_MS (" + std::to_string(s.leaseMs) + "): a writer stopped inside a transaction "
             "holds the state row until the server ends that transaction, so a takeover can wait that long instead of "
             "at most one lease");
+    }
+    if (c.dutyWatchdogMs <= s.archiveTimeoutMs)
+    {
+        // not a refusal: an archive that stops answering a control call holds pj-duty up to
+        // the archive timeout, and a watchdog at or below it ends the process (70) instead of leaving the source
+        s.warnings.push_back(X + "DUTY_WATCHDOG_MS (" + std::to_string(c.dutyWatchdogMs) + ") is not above " + X +
+            "ARCHIVE_TIMEOUT_MS (" + std::to_string(s.archiveTimeoutMs) + "): an archive control call that waits out "
+            "its timeout on pj-duty can trip the duty watchdog (exit 70) before the source is left");
     }
     if (s.pgStatementTimeoutMs * 3 >= s.leaseMs)
     {

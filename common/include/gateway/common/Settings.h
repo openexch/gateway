@@ -237,6 +237,9 @@ ParseResult<StreamSettings> parseStreamSettings(const Environment &env,
 // HISTORY_PROJECTOR_).
 void parseDriverSettings(SettingsReader &r, const std::string &prefix, const cluster_tools::runtime::DirProbe &probe,
     CommonSettings &c);
+// A core session channel (<P>_CORE_INGRESS_CHANNEL, `response` false; <P>_CORE_RESPONSE_CHANNEL, true) with the rules
+// the gateway binaries apply: a full aeron:udp URI naming term-length and mtu (and the endpoint of a response channel).
+void checkSessionChannel(SettingsReader &r, const std::string &name, const std::string &uri, bool response);
 // host:port (IPv6 as [addr]:port); `ipv4Only` for an admin bind. nullopt with `why` (the expected form).
 std::optional<Bind> parseBindText(const std::string &text, bool ipv4Only, std::string &why);
 

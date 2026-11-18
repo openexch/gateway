@@ -55,6 +55,9 @@ std::map<std::string, std::string> projectorEnv()
         { "HISTORY_PROJECTOR_CLUSTER_MEMBERS", "0=10.0.0.1:9010,1=10.0.0.2:9010,2=10.0.0.3:9010" },
         { "HISTORY_PROJECTOR_CLUSTER_KEY_FILE", keyFile("gateway-key", "9:GATEWAY:" + SECRET_HEX + "\n") },
         { "HISTORY_PROJECTOR_PG_URL", "postgresql://projector:pw@10.0.0.20/history" },
+        { "HISTORY_PROJECTOR_JOURNAL_NODE_ENDPOINTS", "10.0.0.2:9702,10.0.0.3:9703,-" },
+        { "HISTORY_PROJECTOR_CORE_INGRESS_CHANNEL", "aeron:udp?term-length=4m|mtu=8192" },
+        { "HISTORY_PROJECTOR_CORE_RESPONSE_CHANNEL", "aeron:udp?endpoint=10.0.0.9:0|term-length=4m|mtu=8192" },
     };
 }
 
@@ -106,11 +109,15 @@ TEST(projector_settings_accepted_with_defaults)
     CHECK(5 == s.pgKeepaliveIdleS && 2 == s.pgKeepaliveIntervalS && 3 == s.pgKeepaliveCount);
     CHECK(5000 == s.archiveTimeoutMs && 1000 == s.relistMs && 5000 == s.sourceBehindMs);
     CHECK(1000 == s.sourceBackoffMs && 30'000 == s.sourceBackoffMaxMs && 5000 == s.gapRetryMs);
+    CHECK(3000 == s.nodeFreshMs && 3000 == s.nodeFirstRoundMs && 64 == s.sessionMaxInflight);
+    CHECK(100 == s.queryRateCount && 1000 == s.queryRatePeriodMs && 200 == s.queryBurst);
     // every setting in force is recorded, defaults included, the URL redacted
     for (const char *name : { "HISTORY_PROJECTOR_LEASE_MS", "HISTORY_PROJECTOR_BATCH_EVENTS", "HISTORY_PROJECTOR_QUEUE_EVENTS",
              "HISTORY_PROJECTOR_PG_IDLE_IN_TX_TIMEOUT_MS", "HISTORY_PROJECTOR_SOURCE_BACKOFF_MAX_MS",
              "HISTORY_PROJECTOR_DUTY_WATCHDOG_MS", "HISTORY_PROJECTOR_DRIVER_TIMEOUT_MS",
-             "HISTORY_PROJECTOR_REBUILD_LOCK_TIMEOUT_MS" })
+             "HISTORY_PROJECTOR_REBUILD_LOCK_TIMEOUT_MS", "HISTORY_PROJECTOR_NODE_FRESH_MS",
+             "HISTORY_PROJECTOR_NODE_FIRST_ROUND_MS", "HISTORY_PROJECTOR_SESSION_MAX_INFLIGHT",
+             "HISTORY_PROJECTOR_QUERY_RATE_COUNT" })
     {
         const SettingRecord *r = recordOf(parsed.records, name);
         CHECK_MSG(nullptr != r && "default" == r->source, name);
@@ -128,7 +135,8 @@ TEST(projector_settings_required_in_one_pass)
              "HISTORY_PROJECTOR_ADMIN_BIND", "HISTORY_PROJECTOR_JOURNAL_ARCHIVES", "HISTORY_PROJECTOR_JOURNAL_CONTROL_STREAM",
              "HISTORY_PROJECTOR_JOURNAL_STREAM", "HISTORY_PROJECTOR_JOURNAL_CHANNEL", "HISTORY_PROJECTOR_REPLAY_STREAM",
              "HISTORY_PROJECTOR_LOCAL_HOST", "HISTORY_PROJECTOR_JOURNAL_MTU", "HISTORY_PROJECTOR_CLUSTER_MEMBERS",
-             "HISTORY_PROJECTOR_CLUSTER_KEY_FILE", "HISTORY_PROJECTOR_PG_URL" })
+             "HISTORY_PROJECTOR_CLUSTER_KEY_FILE", "HISTORY_PROJECTOR_PG_URL", "HISTORY_PROJECTOR_JOURNAL_NODE_ENDPOINTS",
+             "HISTORY_PROJECTOR_CORE_INGRESS_CHANNEL", "HISTORY_PROJECTOR_CORE_RESPONSE_CHANNEL" })
     {
         CHECK_MSG(has(parsed.errors, std::string(key) + " is required"), key);
     }
@@ -202,6 +210,30 @@ TEST(projector_settings_timeouts_against_the_lease)
     rebuild["HISTORY_PROJECTOR_REBUILD_LOCK_TIMEOUT_MS"] = "3000";
     CHECK(has(parseProjectorSettings(MapEnvironment(rebuild), probe()).errors,
         "HISTORY_PROJECTOR_PG_STATEMENT_TIMEOUT_MS (3000) must be above HISTORY_PROJECTOR_REBUILD_LOCK_TIMEOUT_MS (3000)"));
+}
+
+TEST(projector_settings_watchdog_above_the_archive_timeout)
+{
+    // an archive control call may wait out its timeout on pj-duty: the default watchdog is above it, so the defaults
+    // carry no WARN
+    auto env = projectorEnv();
+    auto parsed = parseProjectorSettings(MapEnvironment(env), probe());
+    CHECK_MSG(parsed.ok(), parsed.errors.empty() ? "" : parsed.errors.front());
+    CHECK_MSG(parsed.settings.common.dutyWatchdogMs > parsed.settings.archiveTimeoutMs,
+        "default watchdog " + std::to_string(parsed.settings.common.dutyWatchdogMs) + " ms, archive timeout " +
+            std::to_string(parsed.settings.archiveTimeoutMs) + " ms");
+    CHECK(parsed.settings.warnings.empty());
+    // equal: accepted, with a WARN (the call that waits out its timeout reaches the watchdog)
+    env["HISTORY_PROJECTOR_DUTY_WATCHDOG_MS"] = "5000";
+    env["HISTORY_PROJECTOR_ARCHIVE_TIMEOUT_MS"] = "5000";
+    parsed = parseProjectorSettings(MapEnvironment(env), probe());
+    CHECK_MSG(parsed.ok(), parsed.errors.empty() ? "" : parsed.errors.front());
+    CHECK(has(parsed.settings.warnings,
+        "HISTORY_PROJECTOR_DUTY_WATCHDOG_MS (5000) is not above HISTORY_PROJECTOR_ARCHIVE_TIMEOUT_MS (5000)"));
+    CHECK(1 == parsed.settings.warnings.size());
+    env["HISTORY_PROJECTOR_DUTY_WATCHDOG_MS"] = "5001";
+    parsed = parseProjectorSettings(MapEnvironment(env), probe());
+    CHECK(parsed.settings.warnings.empty());
 }
 
 TEST(projector_writer_horizon)

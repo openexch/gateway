@@ -7,18 +7,22 @@
 #      directory, cluster-tools-<ref>. A mismatch refuses, names both values and leaves nothing extracted;
 #   2. the money schema pin of the extracted tree's own lock must equal this lock's (one schema for the client
 #      library and for this repository);
-#   3. (unless --verify-only) the tree's own scripts/fetch-deps.sh fetches and verifies Aeron, sbe-tool and agrona
-#      against the tree's lock, and the three wire schemas are downloaded at their pinned commits and verified: the
-#      money schema against this lock, the match and ME journal schemas against the tree's lock.
+#   3. (unless --verify-only) the tree's own scripts/fetch-deps.sh fetches and verifies Aeron, sbe-tool, agrona and
+#      the core feed harness jar against the tree's lock (the archive follow library's build, WITH_BRIDGE, refuses to
+#      configure without the harness the tree pins), and the three wire schemas are downloaded at their pinned commits
+#      and verified: the money schema against this lock, the match and ME journal schemas against the tree's lock.
 #
 # Usage: scripts/fetch-cluster-tools.sh <cache-dir> [--verify-only]
 # Prints the cmake arguments for the cluster-tools build on stdout, one per line:
 #   -DCLUSTER_TOOLS_SOURCE_DIR=<cache>/cluster-tools-<ref>   (not a cluster-tools option: build-cluster-tools.sh reads it)
 #   -DCT_BUILD_SOURCE_SHA=<ref> -DAERON_TARBALL=... -DSBE_CLASSPATH=... -DMONEY_SCHEMA=... -DMATCH_SCHEMA=...
-#   -DME_JOURNAL_SCHEMA=...
+#   -DME_JOURNAL_SCHEMA=... -DCT_FEED_HARNESS_JAR=...
 #
 # Env: GW_LOCK         the lock to read (default: dependencies.lock next to this script's parent)
 #      FETCH_OFFLINE=1 never download: verify what is in the cache only
+#      CT_ARTIFACT_BASE_URL  where the feed harness jar is downloaded from (default: the releases of the core repository
+#                      this lock names as money_schema_repo, https://github.com/<money_schema_repo>)
+#      CT_FEED_HARNESS_JAR   a local harness jar, accepted only when its sha256 is the one the tree's lock pins
 set -euo pipefail
 
 usage() { echo "usage: $0 <cache-dir> [--verify-only]" >&2; exit 64; }
@@ -114,7 +118,8 @@ if [ "$VERIFY_ONLY" = "1" ]; then
 fi
 
 # 3. the tree's own third-party inputs (its script verifies them against its lock), then the wire schemas
-bash "$SRC/scripts/fetch-deps.sh" "$CACHE/ct-deps"
+CT_ARTIFACT_BASE_URL=${CT_ARTIFACT_BASE_URL:-https://github.com/$(lock money_schema_repo)} \
+    bash "$SRC/scripts/fetch-deps.sh" "$CACHE/ct-deps" --harness
 
 raw() { # repo ref path
     echo "https://raw.githubusercontent.com/$1/$2/$3"

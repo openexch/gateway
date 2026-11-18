@@ -5,7 +5,7 @@
 // usage: gw_session_it --mode embedded|external --dir <driver parent dir | AERON_DIR> --ingress <id=host:port,...>
 //            --host <response host> [--timeout-ms N] [--query-rate N] [--query-burst N] [--instance N]
 //        credential: CORE_AUTH_CREDENTIAL (a GATEWAY key)
-// stdin:  status | create <count> <user> <market> <price> <qty> <keyBase> | balances <count> <user> | mute on|off
+// stdin:  status | create <count> <user> <market> <price> <qty> <keyBase> [BUY|SELL] | balances <count> <user> | mute on|off
 //         | drop-session <cycles> | quit
 //         drop-session: <cycles> duty cycles later the session is closed (the client's close, as a lost session), and the
 //         egress is polled again (unmuted) from the next session on; the session reconnects and registers by itself
@@ -259,7 +259,8 @@ int main(int argc, char **argv)
                 else if ("create" == verb)
                 {
                     std::int64_t count = 0, user = 0, market = 0, price = 0, qty = 0, keyBase = 0;
-                    line >> count >> user >> market >> price >> qty >> keyBase;
+                    std::string side;
+                    line >> count >> user >> market >> price >> qty >> keyBase >> side; // side: BUY (default) or SELL
                     for (std::int64_t i = 0; i < count; ++i)
                     {
                         wire::CreateOrder c;
@@ -269,7 +270,7 @@ int main(int argc, char **argv)
                         c.requestIdHigh = 0x5E55'17E5'7000'0000LL;
                         c.requestIdLow = keyBase + i;
                         c.marketId = static_cast<std::int32_t>(market);
-                        c.side = wire::money::Side::BUY;
+                        c.side = "SELL" == side ? wire::money::Side::SELL : wire::money::Side::BUY;
                         c.orderType = wire::money::OrderType::LIMIT;
                         c.timeInForce = wire::money::TimeInForce::GTC;
                         c.price = price;
