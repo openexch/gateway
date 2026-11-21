@@ -8,6 +8,7 @@
 #include <cinttypes>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 #include <cstdio>
 #include <exception>
 #include <memory>
@@ -284,9 +285,15 @@ void runProcess(const ProcessIdentity &id, const ProcessInputs &in)
         std::fprintf(stderr, "%s: embedded media driver at %s%s\n", id.processName, dir.c_str(),
             driver->reclaimed() ? " (a stale dir of this instance was reused and cleaned)" : "");
     }
-    // a fatal conductor error is _Exit(70); test build only: counted and ignored
-    auto monitor = in.hooks.ignoreDriverLoss ? std::make_shared<at::AeronFatalMonitor>([](const std::string &) {})
-                                             : std::make_shared<at::AeronFatalMonitor>();
+    // a fatal conductor error is _Exit(70), its line classified as the supervisor's conductor exits are (the process
+    // name, the driver timeout, F3b); test build only: counted and ignored
+    const std::int64_t driverTimeoutMs = c.driverTimeoutMs;
+    auto monitor = in.hooks.ignoreDriverLoss
+        ? std::make_shared<at::AeronFatalMonitor>([](const std::string &) {})
+        : std::make_shared<at::AeronFatalMonitor>([driverTimeoutMs](const std::string &message) {
+              rt::Supervisor::exitProcess(exit_code::SOFTWARE, "Aeron client fatal error: " + message +
+                  "; the driver timeout is " + std::to_string(driverTimeoutMs) + " ms (F3b)");
+          });
     std::shared_ptr<aeron::Aeron> aeron;
     try
     {

@@ -170,6 +170,8 @@ enum class Halt : std::uint8_t
     MTU               // every source's recording has another MTU than HISTORY_PROJECTOR_JOURNAL_MTU
 };
 const char *nameOf(Halt h) noexcept;
+// The halt a name stands for (the state row's halt_reason); false for a name no halt has.
+bool haltNamed(const std::string &name, Halt &out) noexcept;
 
 struct HaltState
 {

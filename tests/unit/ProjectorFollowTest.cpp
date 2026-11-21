@@ -10,7 +10,8 @@
 //   backoff_doubles_to_its_cap       the wait of a left source doubles up to the cap and resets on progress
 //   behind_window                    BEHIND for a silent source and for one that does not close the lag; not for one
 //                                    that only re-reads (compares) history the projection holds; not otherwise
-//   halt_names_the_gap               GAP from the cursor + 1 to the smallest missing end; conflict and schema first
+//   halt_names_the_gap               GAP from the cursor + 1 to the smallest missing end; conflict and schema first;
+//                                    each halt's name reads back as that halt
 //   follow_fuzz_recovers             property: random sources with holes, late fixes, conflicts and writer failures;
 //                                    the applied prefix is dense and equals the canonical bytes; recoveries > 0
 // Each control build (tests/CMakeLists.txt) compiles one rule off and must fail its case with the named text.
@@ -457,6 +458,14 @@ TEST(halt_names_the_gap)
     CHECK(Halt::SCHEMA == haltOf(v, 10).halt);
     v[0].mark = Mark::MTU;
     CHECK(Halt::MTU == haltOf(v, 10).halt);
+    // the state row's halt_reason names the halt a new writer generation starts with
+    for (Halt each : { Halt::NONE, Halt::GAP, Halt::PAYLOAD_CONFLICT, Halt::EPOCH_MISMATCH, Halt::SCHEMA, Halt::MTU })
+    {
+        Halt read = Halt::NONE;
+        CHECK(haltNamed(nameOf(each), read) && each == read);
+    }
+    Halt unknown = Halt::GAP;
+    CHECK(!haltNamed("LATCH", unknown) && Halt::GAP == unknown);
 }
 
 // The property: sources are lists of (seq, bytes); faults are holes, a start above 1, a bad copy, an unreachable

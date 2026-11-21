@@ -1,7 +1,7 @@
 #!/bin/sh
-# The finished oe-stream holds no symbol of an order-entry or money-command encoder; oe-gateway does (the control: the
-# same pattern finds them there, so an empty answer for oe-stream means something).
-# usage: no_order_entry_symbols.sh <oe-stream> <oe-gateway>
+# The finished oe-stream (or oe-projector, built the same way) holds no symbol of an order-entry or money-command
+# encoder; oe-gateway does (the control: the same pattern finds them there, so an empty answer means something).
+# usage: no_order_entry_symbols.sh <oe-stream | oe-projector> <oe-gateway>
 set -eu
 stream="$1"
 gateway="$2"

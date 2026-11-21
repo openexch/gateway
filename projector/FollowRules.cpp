@@ -88,6 +88,19 @@ const char *nameOf(Halt h) noexcept
     return "?";
 }
 
+bool haltNamed(const std::string &name, Halt &out) noexcept
+{
+    for (Halt h : { Halt::NONE, Halt::GAP, Halt::PAYLOAD_CONFLICT, Halt::EPOCH_MISMATCH, Halt::SCHEMA, Halt::MTU })
+    {
+        if (name == nameOf(h))
+        {
+            out = h;
+            return true;
+        }
+    }
+    return false;
+}
+
 bool budgetFull(const SourceView &v) noexcept
 {
     return v.replaysActive && *v.replaysActive >= 0 && v.readerBudget && *v.replaysActive >= *v.readerBudget;

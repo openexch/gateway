@@ -294,6 +294,33 @@ add_test(NAME build.stream_no_order_entry_symbols
     COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/link/no_order_entry_symbols.sh" "$<TARGET_FILE:oe-stream>"
         "$<TARGET_FILE:oe-gateway>")
 
+# The same for oe-projector, which is built like the stream. Its probes take the definitions oe_projector_app is
+# compiled with, so the compile probe fails only while the projector's own sources are built with GW_NO_ORDER_ENTRY.
+add_library(gw_projector_compile_probe OBJECT EXCLUDE_FROM_ALL link/StreamOrderEntryProbe.cpp)
+target_compile_definitions(gw_projector_compile_probe PRIVATE
+    $<TARGET_PROPERTY:oe_projector_app,COMPILE_DEFINITIONS>)
+target_link_libraries(gw_projector_compile_probe PRIVATE gw_common)
+add_executable(gw_projector_link_probe EXCLUDE_FROM_ALL link/StreamLinkProbe.cpp)
+target_compile_definitions(gw_projector_link_probe PRIVATE $<TARGET_PROPERTY:oe_projector_app,COMPILE_DEFINITIONS>)
+target_link_libraries(gw_projector_link_probe PRIVATE cluster_tools::runtime_embedded_driver oe_projector_app)
+add_executable(gw_projector_link_probe_control EXCLUDE_FROM_ALL link/StreamLinkProbe.cpp)
+target_link_libraries(gw_projector_link_probe_control PRIVATE cluster_tools::runtime_embedded_driver oe_projector_app
+    gw_order_entry)
+add_test(NAME build.projector_no_order_entry_compile
+    COMMAND "${CMAKE_COMMAND}" --build "${PROJECT_BINARY_DIR}" --target gw_projector_compile_probe)
+set_tests_properties(build.projector_no_order_entry_compile PROPERTIES RUN_SERIAL TRUE
+    PASS_REGULAR_EXPRESSION "must not encode CreateOrder, CancelOrder, AmendOrder")
+add_test(NAME build.projector_no_order_entry_link
+    COMMAND "${CMAKE_COMMAND}" --build "${PROJECT_BINARY_DIR}" --target gw_projector_link_probe)
+set_tests_properties(build.projector_no_order_entry_link PROPERTIES RUN_SERIAL TRUE
+    PASS_REGULAR_EXPRESSION "undefined reference to .openexchange::gateway::wire::encode")
+add_test(NAME build.projector_link_probe_control
+    COMMAND "${CMAKE_COMMAND}" --build "${PROJECT_BINARY_DIR}" --target gw_projector_link_probe_control)
+set_tests_properties(build.projector_link_probe_control PROPERTIES RUN_SERIAL TRUE)
+add_test(NAME build.projector_no_order_entry_symbols
+    COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/link/no_order_entry_symbols.sh" "$<TARGET_FILE:oe-projector>"
+        "$<TARGET_FILE:oe-gateway>")
+
 # The users store against a real PostgreSQL in a throwaway container (docker; the image pinned by digest). Built
 # always; registered with GW_PG_TESTS=ON.
 add_executable(gw_pg_tests unit/TestMain.cpp pg/PgStoreTest.cpp)
@@ -675,7 +702,8 @@ if(GW_TEST_BUILDS)
             "oe-projector-tc-faults-nc-hole-marks-all|PROJ_TC_SOURCE_FAULTS+PROJ_NC_HOLE_MARKS_ALL|FollowDuty.cpp,HistoryWork.cpp"
             "oe-projector-tc-faults-nc-start-at-first|PROJ_TC_SOURCE_FAULTS+PROJ_NC_START_AT_FIRST|FollowDuty.cpp,HistoryWork.cpp"
             "oe-projector-tc-faults-nc-behind-silent-only|PROJ_TC_SOURCE_FAULTS+PROJ_NC_BEHIND_SILENT_ONLY|FollowDuty.cpp,HistoryWork.cpp,FollowRules.cpp"
-            "oe-projector-tc-faults-nc-beat-always|PROJ_TC_SOURCE_FAULTS+PROJ_NC_BEAT_ALWAYS|FollowDuty.cpp,HistoryWork.cpp,ProjectionStore.cpp")
+            "oe-projector-tc-faults-nc-beat-always|PROJ_TC_SOURCE_FAULTS+PROJ_NC_BEAT_ALWAYS|FollowDuty.cpp,HistoryWork.cpp,ProjectionStore.cpp"
+            "oe-projector-tc-faults-nc-halt-latch|PROJ_TC_SOURCE_FAULTS+PROJ_NC_HALT_LATCH|FollowDuty.cpp,HistoryWork.cpp")
         string(REPLACE "|" ";" parts "${entry}")
         list(GET parts 0 target)
         list(GET parts 1 defines)
@@ -738,6 +766,8 @@ if(GW_TEST_BUILDS)
                 "beat|oe-projector-tc-faults||embedded" "beat_epoch|oe-projector||embedded"
                 "beat|oe-projector-tc-faults-nc-beat-always|beat without a fresh head|embedded"
                 "beat_epoch|oe-projector-nc-beat-no-epoch|beat across genesis ids|embedded"
+                "halt_restart|oe-projector-tc-faults||embedded"
+                "halt_restart|oe-projector-tc-faults-nc-halt-latch|FAIL halt latched across a restart|embedded"
                 # the pin: caught up on the recording first read, the member restarted, then never past it
                 "successor|oe-projector-nc-pin-recording|PASS caught up on member [0-9] alone.*PASS round 1: member [0-9] rejoined.*PASS round 1: orders acked.*FAIL round 1: projector did not follow the successor recording|embedded")
             foreach(mode embedded external)

@@ -18,8 +18,9 @@ Cases:
                           2 x lease + poll; no seq is committed twice; the standby held no replay and no session
   lease_race              two copies started at once on a fresh database, three times: exactly one writer, dense probe rows
   slow_commit             a batch whose COMMIT returns later than the lease less one renewal interval: the copy steps
-                          down on its own (its lease counts from before the fence, as the database counts it), then
-                          takes the lease again once it expired; no seq is committed twice
+                          down on its own (its lease counts from before the fence, as the database counts it), releases
+                          the lease it stepped down from and is writer again inside one poll interval, not after the
+                          rest of its lease; no seq is committed twice
   hung_writer             the writer stopped (SIGSTOP) inside a batch before its fence, inside a batch after its fence
                           (holding the state row until the server ends its idle transaction), then at an arbitrary
                           point: the standby takes over; resumed, the old writer cannot commit (its fence updates zero
@@ -35,6 +36,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -58,8 +60,8 @@ PG_RETRY_MS = 200
 # takeover still has its transaction and only the fence can stop it
 HUNG_IDLE_IN_TX_MS = 2500
 HUNG_BOUND_S = (max(LEASE_MS, HUNG_IDLE_IN_TX_MS) + LEASE_MS + POLL_MS + PG_RETRY_MS + STATEMENT_TIMEOUT_MS) / 1000.0
-# a writer steps down once a confirmation is older than the lease less one renewal interval
-HOLD_MS = LEASE_MS - LEASE_MS // 3
+# slow_commit (a writer steps down once a confirmation is older than the lease less one renewal interval): the lease of that case, long enough that what is left of it after a step-down is far above a poll
+SLOW_LEASE_MS = 6000
 REBUILD_LOCK_TIMEOUT_MS = 200
 DRIVER_TIMEOUT_MS = 3000
 CONTRACT_RELATIONS = ["gateway_order_history_v1", "gateway_fills_v1", "gateway_history_heartbeat_v1",
@@ -575,28 +577,47 @@ def case_lease_race(ctx):
 def case_slow_commit(ctx):
     url = ctx.pg.fresh("slow1")
     make_probe_table(ctx, "slow1")
-    # the stop sits between the fence and the COMMIT; the server ends that open transaction after a whole lease, later
-    # than this stop
-    p = ctx.projector(url, "embedded", 1, "slow-a.log")
+    # a lease long enough that what is left of it after the step-down is far above one poll interval: a copy that
+    # waited out its own lease would show it. The stop sits between the fence and the COMMIT; the server ends that open
+    # transaction after a whole lease, later than this stop; the driver timeout and the duty watchdog are above it
+    lease_ms = SLOW_LEASE_MS
+    hold_ms = lease_ms - lease_ms // 3
+    extra = {"HISTORY_PROJECTOR_LEASE_MS": str(lease_ms), "HISTORY_PROJECTOR_PG_IDLE_IN_TX_TIMEOUT_MS": str(lease_ms),
+             "HISTORY_PROJECTOR_DRIVER_TIMEOUT_MS": str(2 * lease_ms),
+             "HISTORY_PROJECTOR_DUTY_WATCHDOG_MS": str(2 * lease_ms)}
+    p = ctx.projector(url, "embedded", 1, "slow-a.log", extra=extra)
     check(wait_for(lambda: role(p) == "writer", 20), f"no writer:\n{text_of(p)}")
     top = no_double_write(ctx, "slow1")
     wait_progress(ctx, "slow1", top)
-    pause_s = (HOLD_MS + (LEASE_MS - HOLD_MS) / 2) / 1000.0  # past the step-down point, inside the lease
+    pause_s = (hold_ms + 300) / 1000.0  # past the step-down point, well inside the lease
+    left_s = (lease_ms - hold_ms - 300) / 1000.0
+    taken = text_of(p).count("writer: lease taken")
     p.send_signal(signal.SIGRTMIN + 3)
     check(wait_for(lambda: stopped(p), 5), f"the writer did not stop before its COMMIT:\n{text_of(p)}")
     time.sleep(pause_s)
+    resumed = time.monotonic()
     p.send_signal(signal.SIGCONT)
-    check(wait_for(lambda: "writer lease lost" in text_of(p), 3),
+    check(wait_for(lambda: "writer lease lost" in text_of(p), 3, 0.005),
           f"a COMMIT that returned {pause_s:.2f} s after its fence left the copy a writer past the lease less one "
-          f"renewal interval ({HOLD_MS} ms):\n{text_of(p)}")
+          f"renewal interval ({hold_ms} ms):\n{text_of(p)}")
     check(wait_for(lambda: (health(p) or {}).get("projector", {}).get("lease", {}).get("lost") == 1, 3),
           f"lease lost counter: {health(p)}")
-    # the database still names this copy's old token until the lease ends; then it takes the lease again
-    check(wait_for(lambda: role(p) == "writer", TAKEOVER_BOUND_S + 2), f"did not take the lease again:\n{text_of(p)}")
+    # the copy releases the lease it stepped down from and asks again at once: writer again inside one poll interval
+    # (and the statements), not once the rest of its own lease ran out
+    bound_s = (POLL_MS + STATEMENT_TIMEOUT_MS) / 1000.0
+    again = wait_for(lambda: text_of(p).count("writer: lease taken") > taken, left_s + 3, 0.005)
+    took = time.monotonic() - resumed
+    check(again, f"did not take the lease again:\n{text_of(p)}")
+    check(took <= bound_s, f"took the lease again {took:.2f} s after the step-down, bound {bound_s:.2f} s (one poll "
+                           f"interval and the statements; its own lease had {left_s:.2f} s left):\n{text_of(p)}")
+    check("writer lease lost: stepped down" in text_of(p) and
+          "another copy holds the writer lease" not in text_of(p).split("writer lease lost")[-1],
+          f"the step-down is not logged as one, or as another copy holding the lease:\n{text_of(p)}")
     top = no_double_write(ctx, "slow1")
     wait_progress(ctx, "slow1", top)
     no_double_write(ctx, "slow1")
-    print(f"stepped down after a COMMIT {pause_s:.2f} s late (hold {HOLD_MS} ms, lease {LEASE_MS} ms), then writer again")
+    print(f"stepped down after a COMMIT {pause_s:.2f} s late (hold {hold_ms} ms, lease {lease_ms} ms), writer again "
+          f"{took:.2f} s later")
     stop_clean(p, "writer")
 
 
@@ -650,6 +671,15 @@ def case_hung_writer(ctx):
     stop_clean(standby, "standby")
 
 
+def classified_exit(text, process):
+    """The exit 70 line of a driver loss, as the supervisor's conductor exits print it: the process, the cause, the
+    driver timeout, F3b. A fatal Aeron client error names the timeout it was judged against."""
+    pattern = re.compile(rf"^{re.escape(process)} exit 70: (Aeron client fatal error: .+; the driver timeout is "
+                         rf"{DRIVER_TIMEOUT_MS} ms|.+) \(F3b\)$", re.M)
+    m = pattern.search(text)
+    return m.group(0) if m else None
+
+
 def case_driver_external_killed(ctx):
     url = ctx.pg.fresh("driver1")
     driver, driver_dir = ctx.test_driver("ext")
@@ -668,7 +698,10 @@ def case_driver_external_killed(ctx):
         raise Failure(f"projector alive with a dead driver ({elapsed:.1f} s after the kill, driver timeout "
                       f"{DRIVER_TIMEOUT_MS} ms)")
     check(code == 70, f"exit {code} after the driver was killed, expected 70:\n{text_of(p)}")
-    print(f"exit 70 {elapsed:.2f} s after the driver was killed (driver timeout {DRIVER_TIMEOUT_MS} ms)")
+    line = classified_exit(text_of(p), "oe-projector")
+    check(line is not None, f"exit 70 without its classification (no 'oe-projector exit 70: ... (F3b)' line):\n"
+                            f"{text_of(p)}")
+    print(f"exit 70 {elapsed:.2f} s after the driver was killed (driver timeout {DRIVER_TIMEOUT_MS} ms): {line}")
     driver, driver_dir = ctx.test_driver("ext2")
     p2 = ctx.projector(url, "external", 1, "driver-ext.log", aeron_dir=driver_dir)
     check(wait_for(lambda: role(p2) == "writer", 20), f"restart: no writer:\n{text_of(p2)}")

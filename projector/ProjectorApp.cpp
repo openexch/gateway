@@ -334,26 +334,49 @@ private:
             m_lease.token().c_str(), static_cast<long long>(m_settings.leaseMs),
             static_cast<long long>(state.appliedSeq), state.epoch ? std::to_string(*state.epoch).c_str() : "none");
         m_standbyLogged = false;
+        m_stepDownUnreleased = false;
         if (m_work)
         {
             m_work->onWriter(state);
         }
     }
 
-    void loseLease(const std::string &why, std::int64_t now)
+    // `steppedDown`: this copy gave the lease up by its own clock (the database may still name its token); otherwise
+    // the fence matched no row, so another copy holds the lease.
+    void loseLease(const std::string &why, std::int64_t now, bool steppedDown)
     {
-        m_lease.drop();
         m_shared.writer.store(false, std::memory_order_release);
         update([&](View &v) {
             v.leaseHeld = false;
             v.leaseLost++;
         });
-        std::fprintf(stderr, "oe-projector: CRITICAL writer lease lost: %s; replays and the session are dropped, this "
-            "copy is a standby\n", why.c_str());
+        if (steppedDown)
+        {
+            std::fprintf(stderr, "oe-projector: CRITICAL writer lease lost: stepped down: %s; replays and the session "
+                "are dropped; taking the lease again\n", why.c_str());
+        }
+        else
+        {
+            std::fprintf(stderr, "oe-projector: CRITICAL writer lease lost: %s; replays and the session are dropped, "
+                "this copy is a standby\n", why.c_str());
+        }
         if (m_work)
         {
             m_work->onStandby();
         }
+        m_stepDownUnreleased = steppedDown;
+        if (steppedDown && m_conn.ok())
+        {
+            // the row still names this copy's token with an unexpired lease: release it (fenced on that token, so it
+            // changes nothing when another copy took over meanwhile) and ask again at once, instead of waiting out a
+            // lease this copy itself gave up
+            m_lease.release(m_conn, m_settings.pgStatementTimeoutMs);
+            m_lease.drop();
+            m_standbyLogged = false;
+            m_nextPollNs = now;
+            return;
+        }
+        m_lease.drop();
         m_nextPollNs = now + m_settings.leasePollMs * 1'000'000LL;
     }
 
@@ -378,7 +401,7 @@ private:
             {
                 loseLease("not confirmed within the lease less one renewal interval (" +
                     std::to_string(holdNs / 1'000'000LL) + " of " + std::to_string(m_settings.leaseMs) +
-                    " ms): PostgreSQL unreachable or too slow", now);
+                    " ms): PostgreSQL unreachable or too slow", now, true);
             }
             if (!m_conn.ok())
             {
@@ -442,8 +465,10 @@ private:
                         m_nextPollNs = now + m_settings.leasePollMs * 1'000'000LL;
                         if (!m_standbyLogged)
                         {
-                            std::fprintf(stderr, "oe-projector: standby: another copy holds the writer lease (polling "
-                                "every %lld ms)\n", static_cast<long long>(m_settings.leasePollMs));
+                            std::fprintf(stderr, "oe-projector: standby: %s (polling every %lld ms)\n",
+                                m_stepDownUnreleased ? "the lease this copy stepped down from is not expired yet, or "
+                                    "another copy holds it" : "another copy holds the writer lease",
+                                static_cast<long long>(m_settings.leasePollMs));
                             m_standbyLogged = true;
                         }
                         break;
@@ -525,7 +550,7 @@ private:
                     }
                     break;
                 case Hold::LOST:
-                    loseLease(std::string(step) + ": " + error, after);
+                    loseLease(std::string(step) + ": " + error, after, false);
                     break;
                 case Hold::FAILED:
                     pgFailed(step, error);
@@ -577,6 +602,7 @@ private:
     pg::WarnLimiter m_warn;
     std::int64_t m_nextPollNs = 0;
     bool m_standbyLogged = false;
+    bool m_stepDownUnreleased = false; // stepped down and not writer since: the row may still name this copy
 
     std::thread m_thread;
     std::atomic<bool> m_finished{ false };

@@ -88,6 +88,7 @@ struct ProjectionState
     std::int64_t appliedLogPosition = 0;
     std::int64_t appliedOrderId = 0;
     std::optional<std::string> haltReason;
+    std::optional<std::string> haltDetail;
 };
 
 // An answered head probe (see the beat above).
