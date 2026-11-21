@@ -12,6 +12,7 @@ usage: process_test.py --bin-dir <build dir> --work <dir> <case> [<case> ...]
 import argparse
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -407,6 +408,12 @@ def case_external_driver_killed(ctx, role):
     elapsed = time.monotonic() - killed
     check(code == 70, f"exit {code} after the driver was killed, expected 70:\n{text_of(proc)}")
     check(elapsed < 3.0 + 1.5, f"took {elapsed:.1f} s to notice a dead driver with a 3 s timeout")
+    # the exit is classified as the supervisor's conductor exits are: the process, the cause, the driver timeout, F3b
+    name = "oe-gateway" if role == "gateway" else "oe-stream"
+    classified = re.search(rf"^{name} exit 70: (Aeron client fatal error: .+; the driver timeout is 3000 ms|.+) "
+                           rf"\(F3b\)$", text_of(proc), re.M)
+    check(classified is not None, f"exit 70 without its classification (no '{name} exit 70: ... (F3b)' line):\n"
+                                  f"{text_of(proc)}")
     shutil.rmtree(parent, ignore_errors=True)
 
 

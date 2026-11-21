@@ -25,7 +25,7 @@ namespace {
 constexpr const char *SCHEMA_LOCK_KEY = "8026945547655607139";
 
 // The state row's columns a takeover and a renewal read back.
-constexpr const char *STATE_RETURNING = " RETURNING epoch, applied_seq, applied_log_position, applied_order_id, halt_reason";
+constexpr const char *STATE_RETURNING = " RETURNING epoch, applied_seq, applied_log_position, applied_order_id, halt_reason, halt_detail";
 
 void readState(const Result &r, ProjectionState &state)
 {
@@ -35,6 +35,7 @@ void readState(const Result &r, ProjectionState &state)
     state.appliedLogPosition = std::stoll(PQgetvalue(raw, 0, 2));
     state.appliedOrderId = std::stoll(PQgetvalue(raw, 0, 3));
     state.haltReason = PQgetisnull(raw, 0, 4) ? std::nullopt : std::optional<std::string>(PQgetvalue(raw, 0, 4));
+    state.haltDetail = PQgetisnull(raw, 0, 5) ? std::nullopt : std::optional<std::string>(PQgetvalue(raw, 0, 5));
 }
 
 std::int64_t rowsOf(const Result &r)

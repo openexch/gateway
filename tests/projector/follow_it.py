@@ -53,6 +53,10 @@ On oe-projector-tc-faults (the frame sink drops or delays records of a configure
                killed: no quorum), while halted (a copy with another journal MTU: halt MTU at the head)
   beat_epoch   a database of another genesis whose cursor is far above this core's head: EPOCH_MISMATCH, no beat,
                not ready
+  halt_restart a halt in the state row is not a latch: GAP (every source lacks one record) then a restart with the
+               fault gone, GAP again then a standby taking over from the killed writer, MTU at the head then a restart
+               on the idle cluster: each time the next writer clears the halt and beats again. Its control is
+               oe-projector-tc-faults-nc-halt-latch: a new writer generation does not carry the stored halt
 follow also fills a crossing pair through a BRIDGE session (gw_stream_it_bridge), so the projection holds fill rows,
 and the cases on the fault build check that one switch is counted once (never more switches than attaches).
 
@@ -1347,10 +1351,88 @@ def case_beat_epoch(args, cluster, pg, orders):
     pj.stop()
 
 
+def halt_cleared(pj, pg, db, what, timeout=45):
+    """The copy that writes after a halt clears it and beats again: halt_reason NULL, a young beat_at, /ready true."""
+    def done():
+        beat, applied, age, halt = beat_row(pg, db)
+        return halt is None and age is not None and age < 1500 and pj.ready()
+    t0 = time.monotonic()
+    ok = wait_for(done, timeout, 0.3)
+    took = time.monotonic() - t0
+    beat, applied, age, halt = beat_row(pg, db)
+    f = pj.follow()
+    if not ok:
+        check(False, f"halt latched across a {what} (halt_reason {halt}, beat_at {beat}, applied {applied}, head "
+                     f"{f.get('headSeq')}, ready {pj.ready()}, after {took:.1f} s)", json.dumps(f))
+    else:
+        check(True, f"{what}: halt cleared, beat_at {age} ms old, ready ({took:.1f} s, applied {applied})")
+    return ok
+
+
+def case_halt_restart(args, cluster, pg, orders):
+    """A halt recorded in the state row is not a latch: the copy that writes next (a restart, a standby taking over)
+    starts with it and clears it by the rule that clears it in a running copy (an APPLY; on an idle cluster, the
+    attached source verified up to the cursor at the core's head), then beats again."""
+    check(orders.create(30) == 30, "30 orders acked")
+    db = "pj_halt"
+    url = pg.fresh(db)
+    # 1. a restart: every source lacks record 10 (GAP at 9); the next copy reads with the fault gone
+    a = Projector(args, cluster, url, 35, "halt-a", extra=faults("0:drop=10;1:drop=10;2:drop=10")).start()
+    check(wait_for(lambda: pg.sql(db, "SELECT to_regclass('oe_projection_state') IS NOT NULL") == "t", 30, 0.2),
+          "the projection schema applied")
+    halted = wait_for(lambda: beat_row(pg, db)[3] == "GAP", 60, 0.3)
+    a.stop()
+    if not halted:
+        check(False, f"INCONCLUSIVE: no GAP with record 10 missing on every source (precondition, {beat_row(pg, db)})")
+        return
+    check(beat_row(pg, db)[1] == 9, f"GAP at applied_seq 9 ({beat_row(pg, db)})")
+    b = Projector(args, cluster, url, 36, "halt-b").start()
+    halt_cleared(b, pg, db, "restart")
+    ok, took, f = caught_up(b, at_least=30)
+    check(ok, "the restarted copy at the head", json.dumps(f))
+    base = f.get("headSeq", 30)
+    b.stop()
+    # 2. a standby taking over: every source lacks the fifth record after the cursor under the writer (GAP); a
+    # fault-free standby waits; the writer killed
+    check(orders.create(10) == 10, "10 more orders acked")
+    want = base + 10
+    drop = base + 5
+    c = Projector(args, cluster, url, 37, "halt-c", extra=faults(f"0:drop={drop};1:drop={drop};2:drop={drop}")).start()
+    halted = wait_for(lambda: beat_row(pg, db)[3] == "GAP" and beat_row(pg, db)[1] == drop - 1, 60, 0.3)
+    d = Projector(args, cluster, url, 38, "halt-d").start()
+    standby = wait_for(lambda: "standby: another copy holds the writer lease" in d.run_log(), 20, 0.3)
+    if not halted or not standby:
+        check(False, f"INCONCLUSIVE: GAP at {drop - 1} {halted}, a standby waiting {standby} (precondition, "
+                     f"{beat_row(pg, db)})")
+        c.stop()
+        d.stop()
+        return
+    c.stop(signal.SIGKILL)
+    halt_cleared(d, pg, db, "takeover")
+    ok, took, f = caught_up(d, at_least=want)
+    check(ok, "the copy that took over at the head", json.dumps(f))
+    d.stop()
+    # 3. a restart on an idle cluster: a copy whose journal MTU differs halts MTU with the cursor at the head; the next
+    # copy has no record to apply, so its source's compares up to the cursor clear the halt
+    e = Projector(args, cluster, url, 39, "halt-e", extra={"HISTORY_PROJECTOR_JOURNAL_MTU": str(JOURNAL_MTU * 2)}).start()
+    halted = wait_for(lambda: beat_row(pg, db)[3] == "MTU", 60, 0.3)
+    e.stop()
+    if not halted:
+        check(False, f"INCONCLUSIVE: no MTU halt (precondition, {beat_row(pg, db)})")
+        return
+    g = Projector(args, cluster, url, 40, "halt-g").start()
+    halt_cleared(g, pg, db, "restart on an idle cluster")
+    check(beat_row(pg, db)[1] >= want, f"at the head on the idle cluster (applied_seq {beat_row(pg, db)[1]})")
+    d_ok, row = dense(pg, db)
+    check(d_ok, f"rows dense from 1 ({row})")
+    g.stop()
+
+
 CASES = {"follow": case_follow, "successor": case_successor, "replays": case_replays, "epoch": case_epoch,
          "mtu": case_mtu, "replay_cap": case_replay_cap, "long_overlap": case_long_overlap,
          "regenesis": case_regenesis, "holes": case_holes, "above_one": case_above_one, "slow": case_slow,
-         "writer_reset": case_writer_reset, "beat": case_beat, "beat_epoch": case_beat_epoch}
+         "writer_reset": case_writer_reset, "beat": case_beat, "beat_epoch": case_beat_epoch,
+         "halt_restart": case_halt_restart}
 
 
 def main():

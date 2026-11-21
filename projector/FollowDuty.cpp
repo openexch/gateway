@@ -671,14 +671,43 @@ private:
         m_haltPosted = HaltState{};
         m_readSeq = 0;
         m_haltSince = -1;
+        m_clearHalt = false;
+        bool carried = false;
         if (reset.state.haltReason)
         {
-            m_haltPosted.halt = Halt::GAP; // anything set: the first evaluation writes the halt as it stands now
+#ifdef PROJ_NC_HALT_LATCH
+            // test build only: the stored halt is not carried, so nothing in this generation ever clears it
+            m_haltPosted.halt = Halt::GAP;
             m_haltPosted.detail = *reset.state.haltReason;
+#else
+            // the stored halt is this generation's halt until it is evaluated anew: it clears by the rules that clear
+            // it in the process (an APPLY, or the attached source verified up to the cursor at the head)
+            Halt h = Halt::GAP;
+            if (!haltNamed(*reset.state.haltReason, h) || Halt::NONE == h)
+            {
+                log(rt::LogLevel::WARN, "the state row holds the halt '" + *reset.state.haltReason + "', a name this "
+                    "projector does not know: taken as GAP");
+                h = Halt::GAP;
+            }
+            m_halt = HaltState{ h, reset.state.haltDetail.value_or(std::string()) };
+            m_haltPosted = m_halt;
+            carried = true;
+#endif
         }
         for (SourceState &s : m_sources)
         {
             s.view.mark = Mark::NONE;
+        }
+        if (carried)
+        {
+            // a halt is re-evaluated from the chain start of every source, never from a memo (as the re-evaluation in
+            // the process does)
+            for (std::size_t i = 0; i < m_sources.size(); ++i)
+            {
+                m_memo.invalidate(i, ar::MemoReason::HOLE_VERIFY);
+            }
+            log(rt::LogLevel::INFO, "generation " + std::to_string(reset.generation) + " starts halted " +
+                nameOf(m_halt.halt) + ": every source is read from its chain start");
         }
         if (m_dbEpoch)
         {
@@ -687,7 +716,7 @@ private:
             {
                 for (std::size_t i = 0; i < m_names.size(); ++i)
                 {
-                    if (m_names[i] == row.source && row.epoch == *m_dbEpoch && row.seq <= m_applied)
+                    if (!carried && m_names[i] == row.source && row.epoch == *m_dbEpoch && row.seq <= m_applied)
                     {
                         if (m_memo.seed(i, row.key, row.seq, row.epoch, row.endPosition))
                         {
@@ -1417,8 +1446,27 @@ private:
 
     // ---- /health
 
+    // A halt with nothing left to apply: the attached source, not being left, verified the projection's bytes up to the
+    // cursor, and the core's head (answered on the projection's genesis) is at the cursor. This is how a halt clears on
+    // an idle cluster, where no APPLY comes. A head above the cursor waits for the APPLY instead.
+    bool verifiedAtTheHead() const
+    {
+        if (!m_current || m_choosePending || Mark::NONE != m_sources[*m_current].view.mark)
+        {
+            return false;
+        }
+        return m_applied > 0 && m_readSeq >= m_applied && m_head >= 0 && m_head <= m_applied && m_dbEpoch &&
+            m_genesis == *m_dbEpoch;
+    }
+
     void publishView(std::int64_t now)
     {
+#ifndef PROJ_NC_HALT_LATCH
+        if (Halt::NONE != m_halt.halt && Halt::EPOCH_MISMATCH != m_halt.halt && verifiedAtTheHead())
+        {
+            m_clearHalt = true;
+        }
+#endif
         if (m_clearHalt)
         {
             m_clearHalt = false;

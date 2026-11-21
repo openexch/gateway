@@ -588,6 +588,8 @@ void HistoryWork::committed(const StateAdvance &advance)
     {
         m_state.haltReason = Halt::NONE == m_outcome.halt->halt ? std::nullopt
                                                                 : std::optional<std::string>(nameOf(m_outcome.halt->halt));
+        m_state.haltDetail = Halt::NONE == m_outcome.halt->halt || m_outcome.halt->detail.empty() ? std::nullopt
+                                                                : std::optional<std::string>(m_outcome.halt->detail);
     }
     m_stats.recordsApplied.fetch_add(m_outcome.applied, std::memory_order_relaxed);
     m_stats.skips.fetch_add(m_outcome.equal, std::memory_order_relaxed);
