@@ -756,6 +756,7 @@ private:
                 self->hardClose();
                 return;
             }
+            self->m_impl.counters.framesSent.fetch_add(1, std::memory_order_relaxed);
             self->writeNext();
         });
     }

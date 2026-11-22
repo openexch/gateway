@@ -197,7 +197,11 @@ std::string renderTradesBatch(int marketId, const std::vector<TradeRow> &trades,
         const TradeRow &t = trades[i];
         out += (0 == i ? "" : ",") + std::string("{\"tradeId\":\"") + std::to_string(t.tradeId) + "\",\"price\":" +
             dec(t.price) + ",\"quantity\":" + dec(t.quantity) + ",\"tradeCount\":1,\"side\":\"" +
-            (t.takerIsBuy ? "BUY" : "SELL") + "\",\"timestamp\":" + std::to_string(t.executedAtMs) + "}";
+            (t.takerIsBuy ? "BUY" : "SELL") + "\",\"timestamp\":" + std::to_string(t.executedAtMs) +
+#ifdef MD_NC_TAKER_IN_TRADE
+            ",\"takerUserId\":\"" + std::to_string(t.takerUserId) + "\"" + // control build only (never published)
+#endif
+            "}";
     }
     return out + "],\"timestamp\":" + std::to_string(timestampMs) + "}";
 }

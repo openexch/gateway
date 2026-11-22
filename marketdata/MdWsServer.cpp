@@ -24,6 +24,8 @@
 #include <boost/beast/websocket.hpp>
 #include <boost/json.hpp>
 
+#include "gateway/common/Api.h"
+
 #include "CandleRoute.h"
 
 namespace openexchange { namespace gateway { namespace marketdata {
@@ -41,6 +43,11 @@ std::int64_t monoNs()
 {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
         .count();
+}
+
+std::int64_t monoMs()
+{
+    return monoNs() / 1'000'000LL;
 }
 
 // The client frame -> a command (or a BAD command naming what was wrong). Runs on an I/O thread.
@@ -161,16 +168,41 @@ private:
 
 struct MdWsServer::Impl
 {
-    Impl(MdWsSettings s, MdCommandRing &c, CandleRoute *r) :
-        settings(std::move(s)), commands(c), candles(r), acceptor(net::make_strand(ioc))
+    Impl(MdWsSettings s, MdCommandRing &c, CandleRoute *r, std::atomic<std::int64_t> *mark) :
+        settings(std::move(s)),
+        commands(c),
+        candles(r),
+        inputMarkNs(mark),
+        sources(settings.trustedProxies),
+        connectBuckets(settings.connectRate, settings.connectBurst),
+        messageBuckets(settings.messageRate, settings.messageBurst),
+        acceptor(net::make_strand(ioc))
     {
     }
 
     void accept();
 
+    // A write finished at `nowNs`: the source inputs before it are served.
+    void served(std::int64_t nowNs)
+    {
+        if (nullptr == inputMarkNs)
+        {
+            return;
+        }
+        std::int64_t mark = inputMarkNs->load(std::memory_order_acquire);
+        if (mark >= 0 && mark <= nowNs)
+        {
+            inputMarkNs->compare_exchange_strong(mark, -1, std::memory_order_acq_rel);
+        }
+    }
+
     MdWsSettings settings;
     MdCommandRing &commands;
     CandleRoute *candles;
+    std::atomic<std::int64_t> *inputMarkNs;
+    SourceAddress sources;
+    KeyedRateLimiter connectBuckets;
+    KeyedRateLimiter messageBuckets;
     net::io_context ioc;
     tcp::acceptor acceptor;
     std::uint16_t port = 0;
@@ -215,6 +247,10 @@ private:
             return;
         }
         const auto &req = m_parser->get();
+        if (!takeConnectBudget(req))
+        {
+            return;
+        }
         if (!websocket::is_upgrade(req) && nullptr != m_impl.candles && CandleRoute::owns(req.target()))
         {
             serveRest(req);
@@ -243,6 +279,42 @@ private:
         m_ws.set_option(t);
         m_ws.read_message_max(static_cast<std::size_t>(m_impl.settings.maxFrame));
         m_ws.async_accept(req, beast::bind_front_handler(&WsSession::onAccept, shared_from_this()));
+    }
+
+    // The source of the request and one token of MD_RATE_CONNECT; refused: 429 RATE_LIMITED and the connection closes.
+    bool takeConnectBudget(const http::request<http::empty_body> &req)
+    {
+        beast::error_code ec;
+        const tcp::endpoint peer = beast::get_lowest_layer(m_ws).socket().remote_endpoint(ec);
+        std::vector<std::string_view> forwarded;
+        if (m_impl.sources.enabled())
+        {
+            for (auto range = req.equal_range(m_impl.settings.clientIpHeader); range.first != range.second; ++range.first)
+            {
+                forwarded.emplace_back(range.first->value().data(), range.first->value().size());
+            }
+        }
+        m_source = budgetKey(m_impl.sources.resolve(ec ? net::ip::address() : peer.address(), forwarded),
+            m_impl.settings.sourceV6PrefixBits);
+        const TakeResult t = m_impl.connectBuckets.take(m_source, monoMs());
+        if (t.ok)
+        {
+            return true;
+        }
+        m_impl.counters.limitedConnects.fetch_add(1, std::memory_order_relaxed);
+        api::ErrorSpec spec;
+        spec.status = 429;
+        spec.code = api::code::RATE_LIMITED;
+        spec.text = "too many requests";
+        spec.detail = "the source's request budget (MD_RATE_CONNECT) is spent";
+        spec.retryAfterMs = t.retryAfterMs;
+        ApiResponse a = api::error(spec);
+        RestAnswer answer;
+        answer.status = a.status;
+        answer.body = std::move(a.body);
+        answer.headers = std::move(a.headers);
+        writeRest(req.version(), answer);
+        return false;
     }
 
     // GET /api/candles and its preflight: CandleRoute answers (after a read on md-rest), the answer is written on this
@@ -323,6 +395,27 @@ private:
         }
         const std::string text = beast::buffers_to_string(m_in.data());
         m_in.consume(m_in.size());
+        if (!m_impl.messageBuckets.take(m_source, monoMs()).ok)
+        {
+            // refused: not acted on; the first refusal of a run is answered with one ERROR RATE_LIMITED
+            m_impl.counters.limitedMessages.fetch_add(1, std::memory_order_relaxed);
+            if (!m_limited)
+            {
+                m_limited = true;
+                MdCommand limited;
+                limited.kind = MdCommand::Kind::LIMITED;
+                limited.connId = m_connId;
+                limited.text = "the source's client frame budget (MD_RATE_MESSAGE) is spent: frames are dropped until "
+                    "it refills";
+                if (!m_impl.commands.tryPush(std::move(limited)))
+                {
+                    m_impl.counters.opsRefused.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            read();
+            return;
+        }
+        m_limited = false;
         MdCommand c = parseClientFrame(m_connId, text);
         if (!m_impl.commands.tryPush(std::move(c)))
         {
@@ -352,6 +445,15 @@ private:
             }
             return;
         }
+#ifdef MD_TC_SEND_DROPS
+        // test build only (never published): a sender that drops every frame instead of writing it
+        do
+        {
+            m_outlet->release(1);
+            m_current = Frame{};
+        } while (m_outlet->next(m_current, askResync));
+        return;
+#endif
         m_writing = true;
         m_writeStartNs = monoNs();
         m_ws.text(true);
@@ -369,6 +471,7 @@ private:
             return;
         }
         m_impl.counters.sent[static_cast<std::size_t>(m_current.type)].fetch_add(1, std::memory_order_relaxed);
+        m_impl.served(monoNs());
         m_current = Frame{};
         writeNext();
     }
@@ -440,6 +543,8 @@ private:
     std::optional<http::request_parser<http::empty_body>> m_parser;
     std::shared_ptr<WsOutlet> m_outlet;
     std::uint64_t m_connId = 0;
+    std::string m_source; // the budget key of this connection's source address
+    bool m_limited = false; // inside a run of client frames refused by MD_RATE_MESSAGE
     bool m_open = false;
     bool m_writing = false;
     std::int64_t m_writeStartNs = 0;
@@ -457,7 +562,12 @@ bool WsOutlet::offer(const Frame &frame)
             return false;
         }
         const std::int64_t size = static_cast<std::int64_t>(frame.text->size());
-        if (m_bytes + size > m_queueBytes)
+#ifdef MD_NC_NO_QUEUE_BOUND
+        const bool over = false; // control build only (never published): the queue has no bound
+#else
+        const bool over = m_bytes + size > m_queueBytes;
+#endif
+        if (over)
         {
             // the bound: the queue goes, nothing more is queued until the fresh initial state of a resync
             m_counters.queueDrops.fetch_add(1, std::memory_order_relaxed);
@@ -481,6 +591,10 @@ bool WsOutlet::offer(const Frame &frame)
             m_queue.push_back(frame);
             m_bytes += size;
             queued = true;
+            if (m_bytes > m_counters.queueHighWater.load(std::memory_order_relaxed))
+            {
+                m_counters.queueHighWater.store(m_bytes, std::memory_order_relaxed); // offers come from the duty thread
+            }
             if (!m_writing)
             {
                 m_writing = true; // a running write drains the queue itself; otherwise the strand is kicked
@@ -521,8 +635,9 @@ void MdWsServer::Impl::accept()
     });
 }
 
-MdWsServer::MdWsServer(MdWsSettings settings, MdCommandRing &commands, CandleRoute *candles) :
-    m_impl(std::make_unique<Impl>(std::move(settings), commands, candles))
+MdWsServer::MdWsServer(MdWsSettings settings, MdCommandRing &commands, CandleRoute *candles,
+    std::atomic<std::int64_t> *inputMarkNs) :
+    m_impl(std::make_unique<Impl>(std::move(settings), commands, candles, inputMarkNs))
 {
 }
 
@@ -577,13 +692,31 @@ const MdWsCounters &MdWsServer::counters() const noexcept
 
 bool MdWsServer::clientsServed(std::int64_t nowNs) const noexcept
 {
+#ifdef MD_NC_NO_CLIENTS_SERVED
+    (void)nowNs;
+    return true; // control build only (never published): the condition is not judged
+#else
     const MdWsCounters &c = m_impl->counters;
+    const std::int64_t stallNs = m_impl->settings.sendStallMs * 1'000'000LL;
+    if (c.connections.load(std::memory_order_acquire) <= 0)
+    {
+        return true;
+    }
+    if (nullptr != m_impl->inputMarkNs)
+    {
+        const std::int64_t mark = m_impl->inputMarkNs->load(std::memory_order_acquire);
+        if (mark >= 0 && nowNs - mark >= stallNs)
+        {
+            return false; // a source input with a subscriber and no finished write since
+        }
+    }
     if (c.pending.load(std::memory_order_acquire) <= 0)
     {
         return true;
     }
     const std::int64_t since = c.waitingSinceNs.load(std::memory_order_acquire);
-    return since < 0 || nowNs - since < m_impl->settings.sendStallMs * 1'000'000LL;
+    return since < 0 || nowNs - since < stallNs;
+#endif
 }
 
 void MdWsServer::start()

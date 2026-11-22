@@ -480,6 +480,18 @@ ParseResult<MarketDataSettings> parseMarketDataSettings(const Environment &env, 
     s.pgStatementTimeoutMs = positive(r, "MD_PG_STATEMENT_TIMEOUT_MS", s.pgStatementTimeoutMs);
     s.pgRetryMs = positive(r, "MD_PG_RETRY_MS", s.pgRetryMs);
     s.candlesQueue = positive(r, "MD_CANDLES_QUEUE", s.candlesQueue);
+    s.connectRate = r.rate("MD_RATE_CONNECT", "10/s");
+    s.connectBurst = positive(r, "MD_RATE_CONNECT_BURST", s.connectBurst);
+    s.messageRate = r.rate("MD_RATE_MESSAGE", "50/s");
+    s.messageBurst = positive(r, "MD_RATE_MESSAGE_BURST", s.messageBurst);
+    parseTrustedProxies(r, "MD_TRUSTED_PROXIES", s.trustedProxies);
+    parseClientIpHeader(r, "MD_CLIENT_IP_HEADER", s.clientIpHeader);
+    s.sourceV6PrefixBits = positive(r, "MD_SOURCE_IPV6_PREFIX", s.sourceV6PrefixBits);
+    if (s.sourceV6PrefixBits > 128)
+    {
+        r.problem(INVALID + std::string("MD_SOURCE_IPV6_PREFIX: a prefix length of an IPv6 address (1 to 128), got ") +
+            std::to_string(s.sourceV6PrefixBits));
+    }
 
     // the process shell
     c.ioThreads = positive(r, "MD_IO_THREADS", c.ioThreads);

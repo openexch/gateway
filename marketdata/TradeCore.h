@@ -30,7 +30,8 @@
 // CANDLE_UPDATE per 1m bucket the batch touched, oldest first, with the bucket's whole value.
 //
 // The ticker is tickerOf (Candles.h) over the memory 1m candles, as of max(the wall clock, the newest trade's journal
-// timestamp): a trade stamped ahead of this host's clock still counts. TICKERS is sent every MD_TICKERS_INTERVAL_MS
+// timestamp): a trade stamped ahead of this host's clock still counts. A market with trades and none in the window keeps
+// its newest trade's price with every 24 h value 0 and stays in TICKERS; a market that never traded is absent. TICKERS is sent every MD_TICKERS_INTERVAL_MS
 // when its entries changed (the entries are compared, not the frame's timestamp). The memory keeps the newest
 // MD_RECENT_TRADES trades per market, and the newest MD_CANDLE_HISTORY 1m buckets plus every bucket the 24 h window
 // can still reach.

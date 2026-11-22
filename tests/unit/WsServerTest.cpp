@@ -355,3 +355,24 @@ TEST(ws_no_foreign_event)
     }
     CHECK_MSG(5 == own, "user 602 gets its own events: " + std::to_string(own));
 }
+
+// stream_ws_frames_sent_total: every finished write to a client is counted (the observation's work counter of
+// oe-stream)
+TEST(ws_frames_sent_counted)
+{
+    Edge edge;
+    const std::uint64_t before = edge.server->counters().framesSent.load();
+    WsClient c;
+    CHECK(c.connect(edge.port(), { { "Authorization", "Bearer dev:701" } }));
+    for (int i = 0; i < 3; ++i)
+    {
+        c.send(R"({"op":"ping"})");
+        CHECK(c.until("pong").has_value());
+    }
+    c.send(R"({"op":"subscribe","channels":["orders"]})");
+    CHECK(c.until("snapshot").has_value());
+    const std::uint64_t received = c.frames.size();
+    const std::uint64_t sent = edge.server->counters().framesSent.load() - before;
+    CHECK_MSG(received >= 5 && sent >= received,
+        "frames sent not counted: " + std::to_string(sent) + " counted, " + std::to_string(received) + " received");
+}

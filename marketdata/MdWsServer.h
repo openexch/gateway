@@ -6,8 +6,10 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "gateway/common/DutyBridge.h"
+#include "gateway/common/RateLimit.h"
 
 #include "BookCore.h"
 
@@ -27,6 +29,16 @@
 // whose write has not finished within MD_WS_UNWRITABLE_CLOSE_MS loses its socket. A connection that sent nothing (no
 // frame, no pong to the server's pings) for MD_WS_IDLE_MS is closed. Above MD_WS_MAX_CONNECTIONS a new connection is
 // closed at accept.
+//
+// Budgets per source address (RateLimit.h, the gateway's rules): the source is the socket peer, or, when the peer is
+// one of MD_TRUSTED_PROXIES, the right-most untrusted address of MD_CLIENT_IP_HEADER; an IPv6 source is cut to
+// MD_SOURCE_IPV6_PREFIX bits. Every HTTP request on the port (the /ws upgrade, /api/candles, anything else) takes one
+// token of MD_RATE_CONNECT; an empty bucket is 429 RATE_LIMITED with Retry-After and the connection closes. Every client
+// frame takes one token of MD_RATE_MESSAGE; a refused frame is not acted on, and the first refusal of a run sends one
+// ERROR RATE_LIMITED (the next accepted frame ends the run).
+//
+// clients_served (Readiness.h): false when a source input that had a subscriber (`inputMarkNs`, set by the duty thread)
+// was not followed by any finished write within MD_SEND_STALL_MS, or when a queued frame waited that long.
 
 namespace openexchange { namespace gateway { namespace marketdata {
 
@@ -42,6 +54,7 @@ struct MdCommand
         BAD,
         RESYNC,
         GONE,
+        LIMITED, // a client frame refused by MD_RATE_MESSAGE (the first of a run)
     };
     Kind kind = Kind::NONE;
     std::uint64_t connId = 0;
@@ -64,6 +77,13 @@ struct MdWsSettings
     std::int64_t maxFrame = 65'536;
     std::int64_t sendStallMs = 5000;
     std::size_t maxHeaderBytes = 8192;
+    Rate connectRate{ 10, 1000, "10/s" };
+    std::int64_t connectBurst = 20;
+    Rate messageRate{ 50, 1000, "50/s" };
+    std::int64_t messageBurst = 100;
+    std::vector<std::string> trustedProxies;
+    std::string clientIpHeader = "X-Forwarded-For";
+    int sourceV6PrefixBits = 64;
 };
 
 struct MdWsCounters
@@ -74,6 +94,9 @@ struct MdWsCounters
     std::atomic<std::uint64_t> opsRefused{ 0 };         // client actions dropped because the command ring was full
     std::atomic<std::uint64_t> closedSlow{ 0 };         // md_ws_closed_slow_total
     std::atomic<std::uint64_t> queueDrops{ 0 };         // queues dropped at MD_WS_QUEUE_BYTES
+    std::atomic<std::int64_t> queueHighWater{ 0 };      // the most bytes one connection held queued
+    std::atomic<std::uint64_t> limitedConnects{ 0 };    // HTTP requests refused 429 by MD_RATE_CONNECT
+    std::atomic<std::uint64_t> limitedMessages{ 0 };    // client frames refused by MD_RATE_MESSAGE
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FrameType::COUNT)> sent{}; // md_ws_frames_sent_total
     std::atomic<std::int64_t> pending{ 0 };             // frames queued and not yet written or dropped
     std::atomic<std::int64_t> waitingSinceNs{ -1 };     // the last write progress, or when pending left 0
@@ -84,8 +107,10 @@ class CandleRoute;
 class MdWsServer
 {
 public:
-    // `candles` null: /api/candles is 404 like any other path.
-    MdWsServer(MdWsSettings settings, MdCommandRing &commands, CandleRoute *candles = nullptr);
+    // `candles` null: /api/candles is 404 like any other path. `inputMarkNs` (BookCore's MdStats::inputMarkNs): the
+    // oldest source input with a subscriber that no finished write has followed yet (-1 none); null: not judged.
+    MdWsServer(MdWsSettings settings, MdCommandRing &commands, CandleRoute *candles = nullptr,
+        std::atomic<std::int64_t> *inputMarkNs = nullptr);
     ~MdWsServer();
     MdWsServer(const MdWsServer &) = delete;
     MdWsServer &operator=(const MdWsServer &) = delete;
@@ -96,7 +121,8 @@ public:
     bool stop(std::int64_t boundMs);
     bool accepting() const noexcept { return m_accepting.load(std::memory_order_acquire); }
     const MdWsCounters &counters() const noexcept;
-    // clients_served: no frame has waited for a connected client longer than MD_SEND_STALL_MS.
+    // clients_served: no frame has waited for a connected client longer than MD_SEND_STALL_MS, and no source input with
+    // a subscriber went that long without a finished write after it.
     bool clientsServed(std::int64_t nowNs) const noexcept;
 
     struct Impl;

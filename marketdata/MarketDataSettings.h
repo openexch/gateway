@@ -51,6 +51,13 @@
 //   chain start this often), MD_PG_STATEMENT_TIMEOUT_MS 3000 (every market history statement and connect),
 //   MD_PG_RETRY_MS 1000 (an unreachable market history is tried again after this), MD_CANDLES_QUEUE 64 (GET
 //   /api/candles requests waiting for the market history reader; a full queue answers 503 HISTORY_BUSY);
+//   the public port's budgets, per source address (the gateway's RateLimit and source rules, with defaults taken from
+//   the gateway's own budgets): MD_RATE_CONNECT 10/s + MD_RATE_CONNECT_BURST 20 (WebSocket upgrades and REST requests:
+//   every HTTP request on the public port; above it 429 RATE_LIMITED with Retry-After), MD_RATE_MESSAGE 50/s +
+//   MD_RATE_MESSAGE_BURST 100 (client frames of every connection of the source; a refused frame is not acted on and
+//   the connection gets one ERROR RATE_LIMITED per refused run), MD_TRUSTED_PROXIES none (IP or CIDR list: a peer
+//   inside it is a proxy and the source is read from MD_CLIENT_IP_HEADER, default X-Forwarded-For),
+//   MD_SOURCE_IPV6_PREFIX 64 (an IPv6 source's budget is shared by its /64; 1 to 128);
 //   the process shell's: MD_IO_THREADS 2, MD_IDLE backoff, MD_COMMAND_RING 4096, MD_DUTY_WATCHDOG_MS 5000,
 //   MD_STOP_TIMEOUT_MS 2000, MD_STATUS_INTERVAL_MS 100, MD_EMBEDDED_RETRY_MS 1000 (embedded only);
 //   the ME session's: MD_ME_RECONNECT_MS 1000 (a closed or failed session is replaced after this),
@@ -104,6 +111,14 @@ struct MarketDataSettings
     std::int64_t pgStatementTimeoutMs = 3000;
     std::int64_t pgRetryMs = 1000;
     std::int64_t candlesQueue = 64;
+    // the public port's budgets per source address
+    Rate connectRate;
+    std::int64_t connectBurst = 20;
+    Rate messageRate;
+    std::int64_t messageBurst = 100;
+    std::vector<std::string> trustedProxies;
+    std::string clientIpHeader = "X-Forwarded-For";
+    std::int64_t sourceV6PrefixBits = 64;
 };
 
 ParseResult<MarketDataSettings> parseMarketDataSettings(const Environment &env,

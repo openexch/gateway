@@ -111,6 +111,14 @@ bool mdBooksFresh(const Status &s, std::int64_t nowNs, const MarketDataReadyBoun
     bool any = false;
     for (const MdMarketStatus &m : s.mdMarkets)
     {
+#ifdef MD_NC_SEEN_MARKETS
+        // control build only (never published): judged on the markets seen so far
+        any = true;
+        if (!m.snapshot)
+        {
+            continue;
+        }
+#endif
         if (!m.expected)
         {
             continue;
@@ -128,6 +136,10 @@ bool mdBooksFresh(const Status &s, std::int64_t nowNs, const MarketDataReadyBoun
 
 std::vector<Condition> marketDataReadyConditions(const Status &s, std::int64_t nowNs, const MarketDataReadyBounds &bounds)
 {
+#ifdef MD_NC_READY_LIVENESS
+    (void)s, (void)nowNs, (void)bounds;
+    return { { "process", true } }; // control build only (never published): ready is process liveness
+#endif
     return {
         { condition::DRIVER_CONNECTED, s.driverConnected },
         { condition::ME_SESSION, mdSession(s, nowNs, bounds) },
@@ -142,6 +154,10 @@ std::vector<Condition> marketDataReadyConditions(const Status &s, std::int64_t n
 
 std::vector<Condition> marketDataBookConditions(const Status &s, std::int64_t nowNs, const MarketDataReadyBounds &bounds)
 {
+#ifdef MD_NC_READY_LIVENESS
+    (void)s, (void)nowNs, (void)bounds;
+    return { { "process", true } }; // control build only (never published): ready is process liveness
+#endif
     return {
         { condition::ME_SESSION, mdSession(s, nowNs, bounds) },
         { condition::BOOK_FRESH, mdBooksFresh(s, nowNs, bounds) },

@@ -313,6 +313,8 @@ public:
             std::to_string(w.authFailed.load()));
         line("counter", "ws_ops_refused_total", "Client ops refused because the command ring was full.",
             std::to_string(w.opsRefused.load()));
+        line("counter", "ws_frames_sent_total", "Frames written to clients (a finished WebSocket write).",
+            std::to_string(w.framesSent.load()));
         out += "# HELP " + p + "ws_closed_total Connections closed, by close code.\n# TYPE " + p + "ws_closed_total counter\n";
         for (std::size_t i = 0; i <= st::COUNTED_CLOSE_CODES.size(); ++i)
         {

@@ -40,6 +40,9 @@ struct TradeRow
     bool takerIsBuy = false;
     std::int64_t executedAtMs = 0;
     std::int64_t journalSeq = 0;
+#ifdef MD_NC_TAKER_IN_TRADE
+    std::int64_t takerUserId = 0; // control build only (never published): a party field carried to the public entry
+#endif
     bool operator==(const TradeRow &) const = default;
 };
 

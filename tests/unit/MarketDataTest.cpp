@@ -5,6 +5,7 @@
 //
 // Golden output frames live in tests/golden/marketdata/<name>.json, one frame per file, byte for byte. GW_MD_GOLDEN_WRITE=1
 // rewrites them from this build (review the diff before committing).
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -382,6 +383,10 @@ TEST(md_settings_defaults)
     CHECK(s.wsMaxConnections == 4096 && s.wsQueueBytes == 524'288 && s.wsUnwritableCloseMs == 30'000 &&
         s.wsIdleMs == 60'000 && s.wsMaxFrame == 65'536);
     CHECK(s.corsOrigins.empty());
+    // the public port's budgets: the gateway's defaults (GATEWAY_LOGIN_RATE and GATEWAY_PRINCIPAL_RATE pairs)
+    CHECK(s.connectRate.count == 10 && s.connectRate.periodMs == 1000 && s.connectBurst == 20);
+    CHECK(s.messageRate.count == 50 && s.messageRate.periodMs == 1000 && s.messageBurst == 100);
+    CHECK(s.trustedProxies.empty() && "X-Forwarded-For" == s.clientIpHeader && 64 == s.sourceV6PrefixBits);
     const SettingRecord *queue = recordOf(p.records, "MD_WS_QUEUE_BYTES");
     CHECK(nullptr != queue && "524288" == queue->value && "default" == queue->source);
     const SettingRecord *cred = recordOf(p.records, "ME_AUTH_CREDENTIAL");
@@ -462,6 +467,13 @@ TEST(md_settings_invalid_forms)
         { { "MD_TYPO_SETTING", "1" }, "invalid setting: MD_TYPO_SETTING" },
         { { "MD_JOURNAL_MTU", "100" }, "invalid setting: MD_JOURNAL_MTU" },
         { { "AERON_DIR", "/dev/shm/aeron-host" }, "invalid setting: AERON_DIR" },
+        { { "MD_RATE_CONNECT", "10" }, "invalid setting: MD_RATE_CONNECT" },
+        { { "MD_RATE_MESSAGE", "0/s" }, "invalid setting: MD_RATE_MESSAGE" },
+        { { "MD_RATE_MESSAGE_BURST", "0" }, "invalid setting: MD_RATE_MESSAGE_BURST" },
+        { { "MD_TRUSTED_PROXIES", "10.0.0.0/33" }, "invalid setting: MD_TRUSTED_PROXIES" },
+        { { "MD_TRUSTED_PROXIES", "10.0.0.1,,10.0.0.2" }, "invalid setting: MD_TRUSTED_PROXIES" },
+        { { "MD_CLIENT_IP_HEADER", "X Forwarded" }, "invalid setting: MD_CLIENT_IP_HEADER" },
+        { { "MD_SOURCE_IPV6_PREFIX", "129" }, "invalid setting: MD_SOURCE_IPV6_PREFIX" },
     };
     for (const auto &c : cases)
     {
@@ -472,8 +484,13 @@ TEST(md_settings_invalid_forms)
     }
     auto env = mdEnv();
     env["MD_CORS_ORIGINS"] = "https://openexchange.dev,http://localhost:5173";
+    env["MD_RATE_CONNECT"] = "30/min";
+    env["MD_TRUSTED_PROXIES"] = "10.0.0.0/8,2001:db8::/32";
+    env["MD_CLIENT_IP_HEADER"] = "CF-Connecting-IP";
     const auto ok = md(env);
     CHECK_MSG(ok.ok() && 2 == ok.settings.corsOrigins.size(), joined(ok.errors));
+    CHECK(30 == ok.settings.connectRate.count && 60'000 == ok.settings.connectRate.periodMs &&
+        2 == ok.settings.trustedProxies.size() && "CF-Connecting-IP" == ok.settings.clientIpHeader);
 }
 
 // ---------------------------------------------------------------- the book
@@ -604,7 +621,19 @@ TEST(md_egress_templates_dropped_unread)
     Rig rig;
     auto client = rig.client(1, 3);
     const std::size_t before = client->frames.size();
+    // a 26 (TradeExecutionBatch: user and order ids) moves the dropped counter and nothing else
     rig.egress(JAVA_TRADE_EXECUTION_BATCH_3);
+    {
+        std::uint64_t others = rig.stats.snapshots.load() + rig.stats.deltas.load() + rig.stats.foreignMarket.load() +
+            rig.stats.malformedNoMarket.load() + rig.stats.heartbeats.load() + rig.stats.schemaRefused.load() +
+            rig.stats.staleTerm.load() + rig.stats.breaks.load();
+        for (std::size_t i = 0; i < rig.stats.dropped.size(); ++i)
+        {
+            others += 2 == i ? 0 : rig.stats.dropped[i].load();
+        }
+        CHECK_MSG(1 == rig.stats.dropped[2].load() && 0 == others && client->frames.size() == before,
+            "non-market template was decoded: 26");
+    }
     rig.egress(JAVA_ORDER_STATUS_BATCH);
     CHECK(1 == rig.stats.dropped[2].load()); // 26
     CHECK(1 == rig.stats.dropped[1].load()); // 24
@@ -684,6 +713,49 @@ TEST(md_readiness_expected_set)
     rig.now += 11'000 * MS;
     s = rig.status();
     CHECK(!failing(marketDataSessionConditions(s, rig.now, bounds)).empty());
+}
+
+// ME egress paused with the session kept open: no book frame and no heartbeat for the stale time clears book_fresh and
+// /ready/book (the pid lives); the next snapshots clear it, twice
+TEST(md_readiness_egress_paused)
+{
+    Rig rig;
+    MarketDataReadyBounds bounds{ 10'000, 15'000 };
+    rig.core.onSessionUp(rig.now);
+    for (int round = 0; round < 2; ++round)
+    {
+        rig.egress(JAVA_CLUSTER_HEARTBEAT_V12);
+        rig.egress(snapshot(1, 10 + round, 1, { { 100'000'000, 1, 1 } }, {}));
+        rig.egress(snapshot(2, 20 + round, 1, { { 100'000'000, 1, 1 } }, {}));
+        rig.egress(snapshot(3, 30 + round, 1, { { 100'000'000, 1, 1 } }, {}));
+        Status s = rig.status();
+        CHECK(failing(marketDataBookConditions(s, rig.now, bounds)).empty());
+        rig.now += 16'000 * MS; // paused: nothing arrives
+        rig.core.doWork(rig.now);
+        s = rig.status();
+        const auto book = failing(marketDataBookConditions(s, rig.now, bounds));
+        CHECK_MSG(std::find(book.begin(), book.end(), std::string("book_fresh")) != book.end() &&
+                !failing(marketDataReadyConditions(s, rig.now, bounds)).empty(),
+            "ready without a fresh book");
+    }
+}
+
+// clients_served's input side: a book frame of a market with a subscriber marks an input; one with none does not; the
+// mark goes with the last subscriber
+TEST(md_input_mark)
+{
+    Rig rig;
+    rig.egress(JAVA_CLUSTER_HEARTBEAT_V12);
+    rig.egress(snapshot(1, 10, 1, { { 100'000'000, 1, 1 } }, {}));
+    CHECK(-1 == rig.stats.inputMarkNs.load());
+    auto o = rig.client(1, 3);
+    rig.egress(JAVA_BOOK_SNAPSHOT_20x20);
+    CHECK(rig.now == rig.stats.inputMarkNs.load());
+    rig.now += 5 * MS;
+    rig.egress(JAVA_BOOK_SNAPSHOT_20x20);
+    CHECK(rig.now - 5 * MS == rig.stats.inputMarkNs.load()); // the oldest input not yet followed by a write
+    rig.core.gone(1);
+    CHECK(-1 == rig.stats.inputMarkNs.load());
 }
 
 TEST(md_admin_routes)
