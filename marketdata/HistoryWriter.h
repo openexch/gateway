@@ -6,6 +6,7 @@
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #include "gateway/common/PgConn.h"
 
@@ -20,6 +21,9 @@
 // The start (startCheck, on the main thread before any listener binds): one connect attempt. Reached: the legacy guard
 // (exit 78), the writer lock (held elsewhere: exit 75 with `market history writer lock is held`, before the public
 // port opens), the schema (foreign: exit 78) and md_state are settled on that connection, which the thread keeps.
+// With md_state the writer reads, on the same connection and before it publishes the state, the live path's start
+// (the recent tape and the 1m candles of every expected market); a failed read is a failed open (retried), so the trade
+// path never starts without it.
 // Not reached: the market history is down at the start; the cursor is unknown, so the trade path does not start, and
 // the thread retries every MD_PG_RETRY_MS with the same checks (a lock held by then stops the process with 75).
 // While running: a failed transaction (rolled back) or a lost connection clears history_writable and keeps the batch
@@ -39,6 +43,10 @@ struct HistoryWriterSettings
     std::int64_t retryMs = 1000;
     std::int64_t commitBatch = 512;
     std::int64_t commitIntervalMs = 50;
+    // the live path's start, read with md_state (MarketHistory.h readSeed)
+    std::vector<int> markets;
+    std::int64_t recentTrades = 50;
+    std::int64_t candleHistory = 200;
 };
 
 class HistoryWriter
@@ -52,7 +60,8 @@ public:
     void start();
     bool stop(std::int64_t boundMs);
 
-    // The arrival clock handed to the candle aggregation (only the MD_NC_WALLCLOCK_BUCKET test build reads it).
+    // The wall clock: the 24 h window of the live path's start, and the arrival time handed to the candle aggregation
+    // (only the MD_NC_WALLCLOCK_BUCKET test build reads that).
     std::function<std::int64_t()> arrivalClockMs;
 
 private:

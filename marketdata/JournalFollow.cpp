@@ -332,6 +332,11 @@ private:
             m_next = st.epoch ? st.lastSeq + 1 : 0;
             m_started = true;
             work++;
+            if (nullptr != m_live)
+            {
+                // the memory state at the cursor, before any trade above it
+                m_live->onTradePathStart(r.seed ? std::move(*r.seed) : MarketSeed{});
+            }
             if (st.epoch)
             {
                 m_memo.onReport(*st.epoch, st.lastSeq);

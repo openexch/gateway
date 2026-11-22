@@ -271,8 +271,17 @@ def expect_serving(ctx, proc, env, mode):
     other = Ws(public, "/ws/v2")
     check(" 404 " in other.status_line, f"a path other than /ws: {other.status_line}")
     other.close()
+    # GET /api/candles: answered from the market history only (down here: 503, never a series from memory)
+    status, body = http(public, "/api/candles?marketId=2&interval=5m&limit=10")
+    check(status == 503 and json.loads(body)["code"] == "HISTORY_UNAVAILABLE", f"/api/candles history down: {status} {body}")
+    status, body = http(public, "/api/candles?marketId=2&interval=5m")
+    check(status == 400 and json.loads(body)["detail"] == "limit", f"/api/candles without limit: {status} {body}")
+    status, _ = http(public, "/api/candles", "OPTIONS")
+    check(status == 403, f"a preflight with MD_CORS_ORIGINS=none: {status}")
     _, body = http(admin, "/metrics")
     check('md_ws_frames_sent_total{type="SUBSCRIPTION_CONFIRMED"} 1' in body, "frames sent not counted")
+    check('md_requests_total{route="candles",code="503"} 1' in body and
+          'md_requests_total{route="preflight",code="403"} 1' in body, "candle requests not counted")
     # idle past the driver timeout: the liveness checks must not read an idle process as dead
     time.sleep(4.5)
     check(proc.poll() is None, f"oe-marketdata exited {proc.returncode} while idle:\n{text_of(proc)}")
@@ -280,7 +289,7 @@ def expect_serving(ctx, proc, env, mode):
     for tid in os.listdir(f"/proc/{proc.pid}/task"):
         with open(f"/proc/{proc.pid}/task/{tid}/comm") as f:
             names.append(f.read().strip())
-    for name in ("md-duty", "md-admin", "md-io-0", "md-io-1"):
+    for name in ("md-duty", "md-admin", "md-io-0", "md-io-1", "md-rest-0"):
         check(name in names, f"thread {name} missing: {names}")
 
 

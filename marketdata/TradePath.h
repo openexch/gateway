@@ -161,10 +161,26 @@ struct CommitBatch
     PendingEntry last;                       // the last entry (its source position proves the cursor)
 };
 
+// The memory state of the live path as the relations hold it at the commit cursor md_state was read at: per expected
+// market the newest MD_RECENT_TRADES trades and the 1m candles a subscriber's history and the 24 h ticker need (the
+// newest MD_CANDLE_HISTORY buckets and every bucket of the last 24 h), each oldest first. Read by the writer on the
+// connection that holds the writer lock, right after md_state, so nothing was committed in between.
+struct MarketSeed
+{
+    struct Market
+    {
+        std::int32_t marketId = 0;
+        std::vector<TradeRow> tape;
+        std::vector<CandleRow> candles1m;
+    };
+    std::vector<Market> markets;
+};
+
 // What the writer reports to the duty (collected once per duty cycle).
 struct WriterReport
 {
     std::optional<MdState> state;           // set once, when md_state was read at start (or after a reset)
+    std::optional<MarketSeed> seed;         // with the state: the live path's start
     std::int64_t committedSeq = -1;         // -1: no commit since the last collect
     std::optional<PendingEntry> proof;      // the last committed entry
 };
@@ -183,7 +199,7 @@ public:
     WriterReport collect();
 
     // ---- md-pg
-    void publishState(const MdState &state);
+    void publishState(const MdState &state, MarketSeed seed = {});
     // The next batch, at most `max` entries; empty `trades` and `entries` 0 when nothing is pending. Needs the state.
     bool nextBatch(std::size_t max, CommitBatch &out) const;
     void committed(const CommitBatch &batch);
@@ -220,6 +236,7 @@ private:
     mutable std::size_t m_inFlight = 0;      // front entries handed to the writer's current batch
     std::optional<MdState> m_state;          // as the writer knows it (the cursor moves with each commit)
     std::optional<MdState> m_stateReport;    // not collected yet
+    std::optional<MarketSeed> m_seedReport;
     std::int64_t m_bindEpoch = 0;
     std::int64_t m_bindFirst = 0;
     std::int64_t m_reportCommitted = -1;
@@ -231,10 +248,13 @@ private:
 };
 
 // The live path's view of a trade (the tape frames it): handed on once, in journal order, never while a halt is set.
+// onTradePathStart comes once, before the first trade: the memory state as the relations hold it at the cursor the
+// trade path starts from (the trades that follow it are exactly the ones above that cursor).
 class LiveTrades
 {
 public:
     virtual ~LiveTrades() = default;
+    virtual void onTradePathStart(MarketSeed seed) = 0;
     virtual void onLiveTrade(const TradeRow &trade) = 0;
 };
 

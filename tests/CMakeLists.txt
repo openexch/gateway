@@ -505,9 +505,12 @@ endif()
 # (tests/golden/marketdata), the relay's fields, the frame shapes, readiness on the expected set, the admin routes.
 set(GW_MD_TEST_SOURCES "${PROJECT_SOURCE_DIR}/marketdata/MarketDataSettings.cpp"
     "${PROJECT_SOURCE_DIR}/marketdata/BookCore.cpp" "${PROJECT_SOURCE_DIR}/marketdata/BookFrames.cpp"
-    "${PROJECT_SOURCE_DIR}/marketdata/Candles.cpp" "${PROJECT_SOURCE_DIR}/marketdata/TradePath.cpp")
+    "${PROJECT_SOURCE_DIR}/marketdata/Candles.cpp" "${PROJECT_SOURCE_DIR}/marketdata/TradePath.cpp"
+    "${PROJECT_SOURCE_DIR}/marketdata/TradeCore.cpp" "${PROJECT_SOURCE_DIR}/marketdata/CandleRoute.cpp"
+    "${PROJECT_SOURCE_DIR}/marketdata/MarketHistory.cpp")
 function(gw_md_test target)
-    add_executable(${target} unit/TestMain.cpp unit/MarketDataTest.cpp unit/MarketDataTradeTest.cpp ${GW_MD_TEST_SOURCES})
+    add_executable(${target} unit/TestMain.cpp unit/MarketDataTest.cpp unit/MarketDataTradeTest.cpp
+        unit/MarketDataLiveTest.cpp ${GW_MD_TEST_SOURCES})
     target_include_directories(${target} PRIVATE unit "${GW_CT_GOLDEN_DIR}" "${PROJECT_SOURCE_DIR}/marketdata")
     target_compile_definitions(${target} PRIVATE GW_NO_ORDER_ENTRY
         GW_MD_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/golden/marketdata" ${ARGN})
@@ -533,7 +536,12 @@ add_test(NAME marketdata COMMAND gw_md_tests)
 #   MD_NC_NO_EPOCH_CHECK         a record of another meEpoch taken like any other
 #   MD_NC_NO_PREFIX_CHECK        a jump over the next record taken as if the records in between did not exist
 #   MD_NC_NO_LIVE_EMIT_CURSOR    a trade read again is handed to the live path again
+# and of the live side:
+#   MD_NC_EMPTY_SERIES           empty tape and candle series sent while the market history was down at the start
+#   MD_NC_REST_FROM_MEMORY       GET /api/candles answers a failed history read with 200 and the candles in hand
 set(GW_MD_CONTROLS
+    "MD_NC_EMPTY_SERIES|md_live_history_down_at_start|empty series sent without the history"
+    "MD_NC_REST_FROM_MEMORY|md_candles_route_history_down|REST candles answered without the history"
     "MD_NC_WALLCLOCK_BUCKET|md_candles_function_of_trade_set|candle bucket depends on arrival time"
     "MD_NC_QUOTE_64|md_candles_function_of_trade_set|quote volume overflow"
     "MD_NC_NO_MARKET_CHECK|md_trade_take_record|trade stored for a market with no book"
@@ -565,6 +573,7 @@ endforeach()
 #   MD_NC_COMMIT_SPLIT     the cursor commits in a transaction of its own before the rows
 #   MD_NC_NO_WRITER_LOCK   the start takes no writer lock
 #   MD_NC_WALLCLOCK_BUCKET / MD_NC_QUOTE_64   as in the T0 controls, against the stored rows
+#   MD_NC_REST_FROM_MEMORY  GET /api/candles answers a failed read with 200
 add_executable(gw_md_pg_tests unit/TestMain.cpp pg/MarketHistoryPgTest.cpp)
 target_include_directories(gw_md_pg_tests PRIVATE unit pg)
 target_link_libraries(gw_md_pg_tests PRIVATE cluster_tools::runtime_embedded_driver oe_marketdata_app gw_common)
@@ -573,7 +582,8 @@ set(GW_MD_PG_CONTROLS
     "MD_NC_COMMIT_SPLIT|MarketHistory.cpp|md_history_exactly_once|missing trade [0-9]+"
     "MD_NC_NO_WRITER_LOCK|MarketHistory.cpp|md_history_start|two market history writers"
     "MD_NC_WALLCLOCK_BUCKET|Candles.cpp|md_candles_batch_splits|candle bucket depends on arrival time"
-    "MD_NC_QUOTE_64|Candles.cpp|md_candles_batch_splits|quote volume overflow")
+    "MD_NC_QUOTE_64|Candles.cpp|md_candles_batch_splits|quote volume overflow"
+    "MD_NC_REST_FROM_MEMORY|CandleRoute.cpp|md_live_start_and_candles_route|REST candles answered without the history")
 set(GW_MD_PG_CONTROL_TESTS "")
 foreach(entry IN LISTS GW_MD_PG_CONTROLS)
     string(REPLACE "|" ";" parts "${entry}")
@@ -591,7 +601,7 @@ foreach(entry IN LISTS GW_MD_PG_CONTROLS)
 endforeach()
 if(GW_PG_TESTS)
     foreach(case md_history_start md_history_exactly_once md_history_another_writer md_candles_batch_splits
-            md_writer_outage)
+            md_writer_outage md_live_start_and_candles_route)
         add_test(NAME pg.marketdata.${case} COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/pg/pg_it.py"
             --binary "$<TARGET_FILE:gw_md_pg_tests>" --image "${GW_PG_TEST_IMAGE}" ${case})
         set_tests_properties(pg.marketdata.${case} PROPERTIES TIMEOUT 300 LABELS "pg;marketdata" RUN_SERIAL TRUE)
@@ -919,6 +929,8 @@ if(GW_TEST_BUILDS)
     #   MD_NC_NO_SCHEMA_CHECK    a frame the gate refused for its schema decoded as a trade
     #   MD_NC_NO_WRITER_LOCK     no writer lock at the start
     #   MD_NC_NO_MARKET_CHECK    a trade of a market outside MD_EXPECTED_MARKETS stored
+    #   MD_NC_EMPTY_SERIES       empty tape and candle series sent while the history was down at the start
+    #   MD_NC_REST_FROM_MEMORY   GET /api/candles answers a failed history read with 200
     foreach(entry "oe-marketdata-tc-commit-pause|MD_TC_COMMIT_PAUSE|HistoryWriter.cpp"
             "oe-marketdata-tc-commit-pause-nc-commit-split|MD_TC_COMMIT_PAUSE+MD_NC_COMMIT_SPLIT|HistoryWriter.cpp,MarketHistory.cpp"
             "oe-marketdata-nc-no-epoch-check|MD_NC_NO_EPOCH_CHECK|TradePath.cpp"
@@ -926,7 +938,9 @@ if(GW_TEST_BUILDS)
             "oe-marketdata-nc-no-partial-flag|MD_NC_NO_PARTIAL_FLAG|JournalFollow.cpp"
             "oe-marketdata-nc-no-schema-check|MD_NC_NO_SCHEMA_CHECK|JournalFollow.cpp"
             "oe-marketdata-nc-no-writer-lock|MD_NC_NO_WRITER_LOCK|MarketHistory.cpp"
-            "oe-marketdata-nc-no-market-check|MD_NC_NO_MARKET_CHECK|TradePath.cpp")
+            "oe-marketdata-nc-no-market-check|MD_NC_NO_MARKET_CHECK|TradePath.cpp"
+            "oe-marketdata-nc-empty-series|MD_NC_EMPTY_SERIES|BookCore.cpp"
+            "oe-marketdata-nc-rest-from-memory|MD_NC_REST_FROM_MEMORY|CandleRoute.cpp")
         string(REPLACE "|" ";" parts "${entry}")
         list(GET parts 0 target)
         list(GET parts 1 defines)
@@ -949,7 +963,9 @@ if(GW_TEST_BUILDS)
             --fixture-src "${GW_CLUSTER_TOOLS_SOURCE_DIR}/archive/it/JournalArchiveFixture.java"
             --fixture-dir "${GW_CLUSTER_TOOLS_SOURCE_DIR}/archive/tests/fixtures/mejournal")
         # case|binary|failure text of a control (empty: the case must pass)
-        foreach(entry "exactly_once|oe-marketdata-tc-commit-pause|" "epoch|oe-marketdata|" "purged|oe-marketdata|"
+        foreach(entry "live|oe-marketdata|" "live|oe-marketdata-nc-empty-series|empty series sent without the history"
+                "live|oe-marketdata-nc-rest-from-memory|REST candles answered without the history"
+                "exactly_once|oe-marketdata-tc-commit-pause|" "epoch|oe-marketdata|" "purged|oe-marketdata|"
                 "schema|oe-marketdata|" "second_instance|oe-marketdata|" "unknown_market|oe-marketdata|"
                 "exactly_once|oe-marketdata-tc-commit-pause-nc-commit-split|missing trade [0-9]+"
                 "epoch|oe-marketdata-nc-no-epoch-check|trades of two genesis epochs in one history"

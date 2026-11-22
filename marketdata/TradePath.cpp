@@ -180,6 +180,8 @@ WriterReport TradeLedger::collect()
     WriterReport r;
     r.state = std::move(m_stateReport);
     m_stateReport.reset();
+    r.seed = std::move(m_seedReport);
+    m_seedReport.reset();
     r.committedSeq = m_reportCommitted;
     r.proof = std::move(m_reportProof);
     m_reportProof.reset();
@@ -187,12 +189,13 @@ WriterReport TradeLedger::collect()
     return r;
 }
 
-void TradeLedger::publishState(const MdState &state)
+void TradeLedger::publishState(const MdState &state, MarketSeed seed)
 {
     {
         std::lock_guard<std::mutex> lock(m_lock);
         m_state = state;
         m_stateReport = state;
+        m_seedReport = std::move(seed);
         m_committed.store(state.lastSeq, std::memory_order_release);
         epoch.store(state.epoch.value_or(0), std::memory_order_release);
         firstSeq.store(state.firstSeq.value_or(0), std::memory_order_release);

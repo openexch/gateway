@@ -12,6 +12,9 @@
 //                            md_candles rows and equal tickers at one fixed "as of" time; the 128-bit quote volume exact
 //   md_writer_outage         the writer thread (md-pg) with the database frozen twice: history_writable clears, nothing
 //                            pending is dropped, every record commits once after each return (recoveries >= 2)
+//   md_live_start_and_candles_route  the live path's start the writer reads with md_state (the recent tape and the 1m
+//                            candles of each market) equals the stored set; GET /api/candles answers the stored buckets,
+//                            and with the database frozen (twice) 503 HISTORY_UNAVAILABLE, never a series from memory
 // The control builds (tests/CMakeLists.txt) switch one rule off each and must fail with the named text.
 #include <unistd.h>
 
@@ -19,6 +22,7 @@
 #include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <future>
 #include <map>
 #include <random>
 #include <set>
@@ -28,6 +32,8 @@
 
 #include "Check.h"
 #include "PgTestSupport.h"
+#include "BookFrames.h"
+#include "CandleRoute.h"
 #include "Candles.h"
 #include "HistoryWriter.h"
 #include "MarketHistory.h"
@@ -516,4 +522,110 @@ TEST(md_writer_outage)
     w.stop(3000);
     checkTrades(url, tradesOf(j));
     CHECK(candleDump(url) == expectedDump(tradesOf(j)));
+}
+
+TEST(md_live_start_and_candles_route)
+{
+    const std::string url = gwtest::freshDatabase("md_live");
+    const std::vector<PendingEntry> j = journal(31, 600);
+    commitAll(url, j, 64, 0);
+    const std::vector<TradeRow> set = tradesOf(j);
+    const std::int64_t clock = set.back().executedAtMs + 23 * 3'600'000LL + 1'800'000LL; // the window holds a part
+    TradeLedger ledger(16);
+    HistoryWriterSettings s;
+    s.pg = options(url);
+    s.markets = { 1, 2, 3 };
+    s.recentTrades = 5;
+    s.candleHistory = 10;
+    HistoryWriter w(s, ledger);
+    w.arrivalClockMs = [clock] { return clock; };
+    CHECK(0 == w.startCheck());
+    const WriterReport r = ledger.collect();
+    CHECK(r.state.has_value() && r.seed.has_value());
+    if (r.seed)
+    {
+        CHECK(3 == r.seed->markets.size());
+        const auto candles = aggregate(set);
+        for (const MarketSeed::Market &m : r.seed->markets)
+        {
+            std::vector<TradeRow> mine;
+            for (const TradeRow &t : set)
+            {
+                if (t.marketId == m.marketId)
+                {
+                    mine.push_back(t);
+                }
+            }
+            const std::vector<TradeRow> tape(mine.end() - 5, mine.end());
+            CHECK_MSG(tape == m.tape, "seed tape of market " + std::to_string(m.marketId));
+            std::vector<CandleRow> minutes;
+            for (const auto &kv : candles)
+            {
+                if (kv.second.marketId == m.marketId && 60 == kv.second.intervalS)
+                {
+                    minutes.push_back(kv.second);
+                }
+            }
+            std::vector<CandleRow> want;
+            for (std::size_t i = 0; i < minutes.size(); ++i)
+            {
+                if (i + 10 >= minutes.size() || minutes[i].bucketStartMs >= clock - TICKER_WINDOW_MS - 60'000)
+                {
+                    want.push_back(minutes[i]);
+                }
+            }
+            CHECK_MSG(want == m.candles1m, "seed candles of market " + std::to_string(m.marketId) + ": " +
+                std::to_string(m.candles1m.size()) + " for " + std::to_string(want.size()));
+            CHECK(want.size() > 10 && want.size() < minutes.size()); // both parts of the rule were exercised
+        }
+    }
+    // GET /api/candles over its own connection
+    CandleRouteSettings rs;
+    rs.pg = options(url);
+    rs.pg.statementTimeoutMs = 1000;
+    rs.expectedMarkets = { 1, 2, 3 };
+    rs.limitMax = 500;
+    CandleRoute route(rs);
+    route.start();
+    auto get = [&route](const std::string &target) {
+        std::promise<RestAnswer> p;
+        auto f = p.get_future();
+        route.handle("GET", target, std::nullopt, [&p](RestAnswer a) { p.set_value(std::move(a)); });
+        return std::future_status::ready == f.wait_for(std::chrono::seconds(20)) ? f.get() : RestAnswer{ 0, "", {} };
+    };
+    std::vector<CandleRow> five;
+    for (const auto &kv : aggregate(set))
+    {
+        if (2 == kv.second.marketId && 300 == kv.second.intervalS)
+        {
+            five.push_back(kv.second);
+        }
+    }
+    const std::vector<CandleRow> newest(five.end() - std::min<std::ptrdiff_t>(7, static_cast<std::ptrdiff_t>(five.size())),
+        five.end());
+    const std::string body = renderCandlesBody(2, "5m", newest);
+    RestAnswer a = get("/api/candles?marketId=2&interval=5m&limit=7");
+    CHECK_MSG(200 == a.status && body == a.body, std::to_string(a.status) + " " + a.body);
+    for (int outage = 1; outage <= 2; ++outage)
+    {
+        gwtest::run("GW_TEST_PG_PAUSE");
+        a = get("/api/candles?marketId=2&interval=5m&limit=7");
+        gwtest::run("GW_TEST_PG_UNPAUSE");
+        std::printf("outage %d: GET /api/candles -> %u %s\n", outage, a.status, a.body.c_str());
+        CHECK_MSG(503 == a.status && std::string::npos != a.body.find("HISTORY_UNAVAILABLE"),
+            "REST candles answered without the history: " + std::to_string(a.status));
+        bool back = false;
+        for (int tries = 0; tries < 50 && !back; ++tries)
+        {
+            a = get("/api/candles?marketId=2&interval=5m&limit=7");
+            back = 200 == a.status && body == a.body;
+            if (!back)
+            {
+                sleepMs(200);
+            }
+        }
+        CHECK_MSG(back, "the route did not answer again after the history returned");
+    }
+    route.stop(3000);
+    w.stop(3000);
 }

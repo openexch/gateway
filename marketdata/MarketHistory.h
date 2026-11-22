@@ -95,6 +95,11 @@ bool readCandles(PgConn &conn, std::int64_t timeoutMs, std::int32_t marketId, st
 bool readCandlesSince(PgConn &conn, std::int64_t timeoutMs, std::int32_t marketId, std::int32_t intervalS,
     std::int64_t fromMs, std::vector<CandleRow> &out, std::string &error);
 
+// The live path's start (TradePath.h MarketSeed) for `markets`: the newest `recentTrades` trades and the 1m candles
+// that are the newest `candleHistory` buckets or start at or after `nowMs` - 24 h - 1 min, each oldest first.
+bool readSeed(PgConn &conn, std::int64_t timeoutMs, const std::vector<int> &markets, std::int64_t recentTrades,
+    std::int64_t candleHistory, std::int64_t nowMs, MarketSeed &out, std::string &error);
+
 }}}
 
 #endif

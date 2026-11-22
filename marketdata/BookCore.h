@@ -40,12 +40,20 @@
 // the one rule readiness uses (Readiness.h mdBookState).
 //
 // Subscriptions (the rule match-gateway had): one market per connection; `subscribe` replaces it; there is no
-// unsubscribe. On subscribe: SUBSCRIPTION_CONFIRMED, the book snapshot, and, while this build has no trade path, one
-// ERROR HISTORY_UNAVAILABLE naming the parts it stands for (tape, candles, ticker): an empty series is never sent as if
-// it were whole. `refresh` sends the initial state again. Every frame of a connection leaves in the order this thread
-// queued it, so live frames wait behind the initial state.
+// unsubscribe. A new connection gets the all-market TICKERS at once, before any subscribe. On subscribe:
+// SUBSCRIPTION_CONFIRMED, then the initial state: the market's TICKER_STATS, the all-market TICKERS, the book
+// snapshot, the recent tape (TRADES_BATCH) and the 1m CANDLE_HISTORY. `refresh` (and a resync after a queue bound)
+// sends the initial state again. Every frame of a connection leaves in the order this thread queued it, so live
+// frames wait behind the initial state.
+// Before the trade path started (TradeCore: the market history was down at the start) the tape, the candles and the
+// ticker do not exist: the initial state is the book snapshot and one ERROR HISTORY_UNAVAILABLE naming the parts it
+// stands for (tape, candles, ticker), and a new connection gets no TICKERS. An empty series is never sent as if it were
+// whole. When the trade path starts, every connection gets a fresh initial state (TICKERS alone while it has no
+// market). Live trade frames (TradeCore's flush) go to the market's subscribers, TICKERS to every connection.
 
 namespace openexchange { namespace gateway { namespace marketdata {
+
+class TradeCore;
 
 static_assert(MD_MARKET_SLOTS == static_cast<std::size_t>(cluster_tools::domain::forwarder::TICK_MARKETS),
     "the readiness slots are the library's ladders");
@@ -57,6 +65,11 @@ enum class FrameType : std::uint8_t
     SUBSCRIPTION_CONFIRMED,
     PONG,
     ERROR,
+    TRADES_BATCH,
+    TICKER_STATS,
+    TICKERS,
+    CANDLE_HISTORY,
+    CANDLE_UPDATE,
     COUNT
 };
 const char *nameOf(FrameType type) noexcept;
@@ -109,6 +122,8 @@ class BookCore
 {
 public:
     BookCore(BookCoreSettings settings, MdStats &stats, std::function<std::int64_t()> wallClockMs);
+    // The trade side (the duty thread's). Null: no trade path (the initial state is the book and HISTORY_UNAVAILABLE).
+    void attachTrades(TradeCore *trades) noexcept { m_trades = trades; }
 
     // ---- the ME session (the duty thread)
     void onSessionUp(std::int64_t nowNs);
@@ -127,7 +142,7 @@ public:
     void resync(std::uint64_t connId, std::int64_t nowNs); // the connection drained after its queue bound
     void gone(std::uint64_t connId);
 
-    // Stale transitions by age; returns the work done.
+    // Stale transitions by age, the trade path's start, its flushes and TICKERS; returns the work done.
     int doWork(std::int64_t nowNs);
 
     void fillStatus(Status &status) const;
@@ -163,6 +178,8 @@ private:
     void emitStale(int marketId, std::int64_t nowNs);
     Frame snapshotFrame(int marketId, std::int64_t nowNs, Sent *kind) const;
     void initialState(std::uint64_t connId, Conn &conn, std::int64_t nowNs);
+    bool tradesLive() const noexcept { return nullptr != m_trades && m_tradesLive; }
+    int tradeWork(std::int64_t nowNs);
     void send(Conn &conn, const Frame &frame);
     Market &market(int marketId) { return m_markets[static_cast<std::size_t>(marketId - 1)]; }
     const Market &market(int marketId) const { return m_markets[static_cast<std::size_t>(marketId - 1)]; }
@@ -175,6 +192,8 @@ private:
     cluster_tools::domain::forwarder::BookFrame m_frame; // decode scratch (large: kept out of the stack)
     std::array<Market, MD_MARKET_SLOTS> m_markets{};
     std::unordered_map<std::uint64_t, Conn> m_conns;
+    TradeCore *m_trades = nullptr;
+    bool m_tradesLive = false; // the trade path started and every connection had its fresh initial state
     bool m_sessionUp = false;
     std::int64_t m_lastHeartbeatNs = -1;
     std::int64_t m_meEpoch = 0;

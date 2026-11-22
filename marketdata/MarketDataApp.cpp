@@ -17,18 +17,22 @@
 #include "gateway/common/ProcessShell.h"
 
 #include "BookCore.h"
+#include "CandleRoute.h"
 #include "HistoryWriter.h"
 #include "JournalFollow.h"
 #include "MarketDataSettings.h"
 #include "MdWsServer.h"
+#include "TradeCore.h"
 
 // oe-marketdata - the public market data of the exchange: the order books from the ME's egress over one GATEWAY-class
 // ME session of its own, served on a public WebSocket with no auth, and the trade path: the ME journal's trades read
 // through the members' archives (JournalFollow) into the market history database (HistoryWriter). Stateless on the
 // book side (a restart starts with empty ladders that heal on the ME's next snapshot); the trade path's only cursor is
-// md_state.last_journal_seq. Threads: main (the supervisor), md-duty (the ME session, BookCore: every ladder and
-// subscription, and the journal follower), md-pg (the market history writer), md-io-<n> (the public sockets, client
-// frames, writes), md-admin. Exit codes: ExitCodes.h (75 also: the market history writer lock is held, or the market
+// md_state.last_journal_seq. The tape, the 1m candles and the tickers are memory state (TradeCore), started from the
+// relations and moved by the live trades; GET /api/candles answers from the relations only (CandleRoute). Threads: main
+// (the supervisor), md-duty (the ME session, BookCore: every ladder and subscription, TradeCore and the journal
+// follower), md-pg (the market history writer), md-rest (the candle route's reads), md-io-<n> (the public sockets,
+// client frames, writes), md-admin. Exit codes: ExitCodes.h (75 also: the market history writer lock is held, or the market
 // history has another writer). The service sends the ME no ingress but the session keepalive.
 
 namespace openexchange { namespace gateway { namespace marketdata {
@@ -49,6 +53,22 @@ std::int64_t wallClockMs()
 {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
         .count();
+}
+
+std::int64_t monoNs()
+{
+    return rt::Supervisor::monotonicNs();
+}
+
+TradeCoreSettings tradeCoreSettings(const MarketDataSettings &s)
+{
+    TradeCoreSettings t;
+    t.expectedMarkets = s.expectedMarkets;
+    t.recentTrades = static_cast<std::size_t>(s.recentTrades);
+    t.candleHistory = static_cast<std::size_t>(s.candleHistory);
+    t.flushMs = s.tradeFlushMs;
+    t.tickersIntervalMs = s.tickersIntervalMs;
+    return t;
 }
 
 BookCoreSettings coreSettings(const MarketDataSettings &s)
@@ -73,9 +93,11 @@ public:
         m_transport(context.aeron),
         m_client(m_transport, meClientSettings(s)),
         m_core(coreSettings(s), stats, &wallClockMs),
+        m_tradeCore(tradeCoreSettings(s), &wallClockMs, &monoNs),
         m_follow(context, s, trades, [this] { m_client.doWork(); },
-            [&stats] { return stats.schemaRefused.load(std::memory_order_relaxed); }, nullptr)
+            [&stats] { return stats.schemaRefused.load(std::memory_order_relaxed); }, &m_tradeCore)
     {
+        m_core.attachTrades(&m_tradeCore);
     }
 
     int doWork() override
@@ -229,6 +251,7 @@ private:
     at::AeronTransport m_transport;
     MeClient m_client;
     BookCore m_core;
+    TradeCore m_tradeCore;
     JournalFollow m_follow;
     Link m_link = Link::DOWN;
     std::int64_t m_nextConnectNs = 0;
@@ -245,6 +268,16 @@ public:
         HistoryWriter &writer) :
         m_settings(s), m_stats(stats), m_trades(trades), m_writer(writer)
     {
+        CandleRouteSettings rest;
+        rest.pg.url = s.pgUrl;
+        rest.pg.user = s.pgUser;
+        rest.pg.passwordFile = s.pgPasswordFile;
+        rest.pg.statementTimeoutMs = s.pgStatementTimeoutMs;
+        rest.corsOrigins = s.corsOrigins;
+        rest.expectedMarkets = s.expectedMarkets;
+        rest.limitMax = s.candlesLimitMax;
+        rest.queue = static_cast<std::size_t>(s.candlesQueue);
+        m_candles = std::make_unique<CandleRoute>(rest);
         MdWsSettings ws;
         ws.host = s.common.publicBind.host;
         ws.port = s.common.publicBind.port;
@@ -255,7 +288,7 @@ public:
         ws.idleMs = s.wsIdleMs;
         ws.maxFrame = s.wsMaxFrame;
         ws.sendStallMs = s.sendStallMs;
-        m_server = std::make_unique<MdWsServer>(ws, commands);
+        m_server = std::make_unique<MdWsServer>(ws, commands, m_candles.get());
     }
     ~MarketDataFront() override { stop(m_settings.common.stopTimeoutMs); }
 
@@ -263,12 +296,14 @@ public:
     void start() override
     {
         m_writer.start();
+        m_candles->start();
         m_server->start();
     }
     bool stop(std::int64_t boundMs) override
     {
         const bool ws = m_server->stop(boundMs);
-        return m_writer.stop(boundMs) && ws;
+        const bool rest = m_candles->stop(boundMs);
+        return m_writer.stop(boundMs) && ws && rest;
     }
     bool accepting() const override { return m_server->accepting(); }
 
@@ -411,6 +446,13 @@ public:
             line("counter", "live_trades_total", "Trades handed to the live path (each once, never under a halt).",
                 std::to_string(v.liveEmitted));
         }
+        out += "# HELP " + p + "requests_total Public HTTP requests answered, by route and status.\n# TYPE " + p +
+            "requests_total counter\n";
+        for (const auto &kv : m_candles->requests())
+        {
+            out += p + "requests_total{route=\"" + kv.first.first + "\",code=\"" + std::to_string(kv.first.second) +
+                "\"} " + std::to_string(kv.second) + "\n";
+        }
         out += "# HELP " + p + "ws_frames_sent_total Frames written to clients, by type.\n# TYPE " + p +
             "ws_frames_sent_total counter\n";
         for (std::size_t i = 0; i < static_cast<std::size_t>(FrameType::COUNT); ++i)
@@ -426,6 +468,7 @@ private:
     const MdStats &m_stats;
     TradeShared &m_trades;
     HistoryWriter &m_writer;
+    std::unique_ptr<CandleRoute> m_candles;
     std::unique_ptr<MdWsServer> m_server;
 };
 
@@ -439,6 +482,9 @@ HistoryWriterSettings writerSettings(const MarketDataSettings &s)
     w.retryMs = s.pgRetryMs;
     w.commitBatch = s.commitBatch;
     w.commitIntervalMs = s.commitIntervalMs;
+    w.markets = s.expectedMarkets;
+    w.recentTrades = s.recentTrades;
+    w.candleHistory = s.candleHistory;
     return w;
 }
 

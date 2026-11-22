@@ -479,6 +479,7 @@ ParseResult<MarketDataSettings> parseMarketDataSettings(const Environment &env, 
     s.gapRescanMs = positive(r, "MD_GAP_RESCAN_MS", s.gapRescanMs);
     s.pgStatementTimeoutMs = positive(r, "MD_PG_STATEMENT_TIMEOUT_MS", s.pgStatementTimeoutMs);
     s.pgRetryMs = positive(r, "MD_PG_RETRY_MS", s.pgRetryMs);
+    s.candlesQueue = positive(r, "MD_CANDLES_QUEUE", s.candlesQueue);
 
     // the process shell
     c.ioThreads = positive(r, "MD_IO_THREADS", c.ioThreads);

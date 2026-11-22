@@ -16,7 +16,7 @@
 // theirs in oe-stream). The I/O threads accept, parse client frames and write; they never touch a book or a
 // subscription (the duty thread's BookCore), and the duty thread never touches a socket.
 //
-// Path /ws, nothing else (404). Client frames, JSON: {"action":"subscribe","marketId":N}, {"action":"refresh",
+// Path /ws, and GET /api/candles (CandleRoute, with its CORS preflight), nothing else (404). Client frames, JSON: {"action":"subscribe","marketId":N}, {"action":"refresh",
 // "marketId":N}, {"action":"ping"}. Anything else becomes an ERROR frame (BAD_REQUEST) sent in order by the duty thread.
 // A frame above MD_WS_MAX_FRAME closes 1009. Every accepted action goes to the duty thread through the bounded command
 // ring (MD_COMMAND_RING); a full ring drops the action and counts it (the open itself is closed 1013).
@@ -79,10 +79,13 @@ struct MdWsCounters
     std::atomic<std::int64_t> waitingSinceNs{ -1 };     // the last write progress, or when pending left 0
 };
 
+class CandleRoute;
+
 class MdWsServer
 {
 public:
-    MdWsServer(MdWsSettings settings, MdCommandRing &commands);
+    // `candles` null: /api/candles is 404 like any other path.
+    MdWsServer(MdWsSettings settings, MdCommandRing &commands, CandleRoute *candles = nullptr);
     ~MdWsServer();
     MdWsServer(const MdWsServer &) = delete;
     MdWsServer &operator=(const MdWsServer &) = delete;

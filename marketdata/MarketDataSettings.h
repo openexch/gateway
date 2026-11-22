@@ -49,7 +49,8 @@
 //   that never resolves; below MD_DUTY_WATCHDOG_MS: such a call blocks the duty thread), MD_SOURCE_BACKOFF_MS 1000 (a
 //   journal source that faulted is asked again after this), MD_GAP_RESCAN_MS 5000 (a GAP re-reads every source from its
 //   chain start this often), MD_PG_STATEMENT_TIMEOUT_MS 3000 (every market history statement and connect),
-//   MD_PG_RETRY_MS 1000 (an unreachable market history is tried again after this);
+//   MD_PG_RETRY_MS 1000 (an unreachable market history is tried again after this), MD_CANDLES_QUEUE 64 (GET
+//   /api/candles requests waiting for the market history reader; a full queue answers 503 HISTORY_BUSY);
 //   the process shell's: MD_IO_THREADS 2, MD_IDLE backoff, MD_COMMAND_RING 4096, MD_DUTY_WATCHDOG_MS 5000,
 //   MD_STOP_TIMEOUT_MS 2000, MD_STATUS_INTERVAL_MS 100, MD_EMBEDDED_RETRY_MS 1000 (embedded only);
 //   the ME session's: MD_ME_RECONNECT_MS 1000 (a closed or failed session is replaced after this),
@@ -102,6 +103,7 @@ struct MarketDataSettings
     std::int64_t gapRescanMs = 5000;
     std::int64_t pgStatementTimeoutMs = 3000;
     std::int64_t pgRetryMs = 1000;
+    std::int64_t candlesQueue = 64;
 };
 
 ParseResult<MarketDataSettings> parseMarketDataSettings(const Environment &env,

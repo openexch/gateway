@@ -19,12 +19,20 @@ Cases (each prints PASS/FAIL lines; a control build must fail with its text):
                   `market history writer lock is held` before its public port opens; the first is untouched
   unknown_market  a trade of a market outside MD_EXPECTED_MARKETS: the halt UNKNOWN_MARKET, neither
                   stored nor skipped; a restart with the market in the set stores it once
+  live            the public trade surface: twice, the service started with the market history frozen: a subscriber
+                  gets the book and one ERROR HISTORY_UNAVAILABLE naming tape, candles, ticker, no handshake TICKERS,
+                  no series, and GET /api/candles is 503; when the history returns the trade path starts and every
+                  connection gets a fresh initial state (TICKERS included) from the stored history; live trades
+                  then reach the subscriber as TRADES_BATCH, TICKER_STATS and CANDLE_UPDATE, no tradeId twice, none
+                  missing; GET /api/candles equals a recomputation from the trade set; the CORS preflight of the
+                  listed origin is accepted, another refused
 
 usage: md_trade_it.py --bin-dir <dir> --work <dir> --image <postgres image> --aeron-jar <aeron-all.jar>
                       --fixture-src <JournalArchiveFixture.java> --fixture-dir <mejournal fixtures>
                       --mode embedded|external [--binary <name>] <case>
 """
 import argparse
+import base64
 import json
 import os
 import secrets
@@ -85,6 +93,102 @@ def wait_until(cond, timeout, step=0.05):
     return cond()
 
 
+def http_full(port, path, method="GET", headers=None):
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, resp.read().decode(), dict(resp.headers)
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode(), dict(e.headers)
+    except OSError as e:
+        return 0, str(e), {}
+
+
+def money(units, scale=8):
+    """The service's decimal text: an exact integer of 10^-scale units, cut to 8 fraction digits toward zero."""
+    neg = units < 0
+    u = abs(units)
+    u = u // 10 ** (scale - 8) if scale > 8 else u * 10 ** (8 - scale)
+    whole, frac = divmod(u, 10 ** 8)
+    text = str(whole)
+    if frac:
+        text += "." + f"{frac:08d}".rstrip("0")
+    return ("-" if neg and u else "") + text
+
+
+class Ws:
+    """A minimal WebSocket client (RFC 6455, text frames, masked client frames; answers the server's pings)."""
+
+    def __init__(self, port, path="/ws"):
+        self.sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        key = base64.b64encode(os.urandom(16)).decode()
+        self.sock.sendall((f"GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\n"
+                           f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                break
+            head += chunk
+        self.status_line = head.split(b"\r\n", 1)[0].decode()
+        check(" 101 " in self.status_line, f"/ws upgrade: {self.status_line}")
+        self.buffer = head.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in head else b""
+        self.frames = []
+
+    def _send(self, op, payload):
+        mask = os.urandom(4)
+        n = len(payload)
+        header = bytes([0x80 | op]) + (bytes([0x80 | n]) if n < 126 else bytes([0x80 | 126]) + struct.pack(">H", n))
+        self.sock.sendall(header + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+    def send(self, obj):
+        self._send(0x1, json.dumps(obj).encode())
+
+    def _read(self, n):
+        while len(self.buffer) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise Failure("the WebSocket closed")
+            self.buffer += chunk
+        out, self.buffer = self.buffer[:n], self.buffer[n:]
+        return out
+
+    def recv(self, timeout=10):
+        """The next text frame, or None when none came within `timeout` seconds."""
+        self.sock.settimeout(timeout)
+        try:
+            while True:
+                b0, b1 = self._read(2)
+                n = b1 & 0x7F
+                if n == 126:
+                    n = struct.unpack(">H", self._read(2))[0]
+                elif n == 127:
+                    n = struct.unpack(">Q", self._read(8))[0]
+                payload = self._read(n)
+                op = b0 & 0x0F
+                if op == 0x1:
+                    frame = json.loads(payload.decode())
+                    self.frames.append(frame)
+                    return frame
+                if op == 0x8:
+                    raise Failure("the WebSocket closed")
+                if op == 0x9:
+                    self._send(0xA, payload)
+        except socket.timeout:
+            return None
+
+    def drain(self, quiet=1.0):
+        out = []
+        while True:
+            f = self.recv(quiet)
+            if f is None:
+                return out
+            out.append(f)
+
+    def close(self):
+        self.sock.close()
+
+
 # ---- journal records (schema 4, version 1): record 1 Trade (block 109) and record 2 Terminal (block 62)
 
 def trade_frame(seq, epoch, trade_id, market, price, qty, taker_is_buy, ts, schema=4):
@@ -107,14 +211,15 @@ def terminal_frame(seq, epoch):
 class Journal:
     """What the test appended, so the expected trade set is known exactly."""
 
-    def __init__(self):
+    def __init__(self, ts0=TS0):
         self.trades = {}  # seq -> (market, trade_id, price, qty, taker_is_buy, ts)
         self.head = 0
+        self.ts0 = ts0
 
     def trade(self, seq, epoch, trade_id, market=1, schema=4):
         price = 100_000_000 * (40_000 + (seq * 37) % 900)
         qty = 1_000_000 * (1 + (seq * 13) % 500)
-        ts = TS0 + seq * 7_000
+        ts = self.ts0 + seq * 7_000
         buy = seq % 2 == 0
         if schema == 4:
             self.trades[seq] = (market, trade_id, price, qty, buy, ts)
@@ -175,11 +280,18 @@ class Postgres:
     def md(self, statement):
         return self.sql("r01_marketdata", statement)
 
+    def pause(self):
+        subprocess.run(["docker", "pause", self.name], check=True, capture_output=True)
+
+    def unpause(self):
+        subprocess.run(["docker", "unpause", self.name], capture_output=True)
+
     def reset(self):
         # the console's marketdata-reset and the genesis reset, the service stopped first
         self.md("TRUNCATE md_trades, md_candles, md_state")
 
     def close(self):
+        self.unpause()
         subprocess.run(["docker", "rm", "-f", self.name], capture_output=True)
 
 
@@ -596,7 +708,126 @@ def case_unknown_market(ctx):
     md.stop()
 
 
+def trade_ids(frames):
+    """The tradeIds of the TRADES_BATCH frames in the order sent; `trade <id> sent twice to one connection`."""
+    seen = []
+    for f in frames:
+        if f.get("type") == "TRADES_BATCH":
+            for t in f["trades"]:
+                if t["tradeId"] in seen:
+                    raise Failure(f"trade {t['tradeId']} sent twice to one connection")
+                seen.append(t["tradeId"])
+    return seen
+
+
+def expected_tape(journal, market, last):
+    return [str(v[1]) for seq, v in sorted(journal.trades.items()) if v[0] == market][-last:]
+
+
+def candles_json(journal, market, interval, limit):
+    rows = sorted((k[2], v) for k, v in expected_candles(journal.trades).items() if k[0] == market and k[1] == interval)
+    return [{"time": b // 1000, "open": money(v[0]), "high": money(v[1]), "low": money(v[2]), "close": money(v[3]),
+             "volume": money(v[4]), "tradeCount": v[6]} for b, v in rows[-limit:]]
+
+
+def case_live(ctx):
+    a = ctx.archive("a")
+    # trades of the last hours, so the 24 h ticker (as of the wall clock) holds them
+    j = Journal(ts0=(int(time.time() * 1000) - 3 * 3_600_000) // 60_000 * 60_000)
+    market_of = lambda seq: 1 + seq % 3  # noqa: E731
+    append_records(a, j, 1, 120, EPOCH_A, market_of=market_of)
+    origin = "https://ui.example.test"
+    extra = {"MD_CORS_ORIGINS": origin, "MD_PG_STATEMENT_TIMEOUT_MS": "1000", "MD_PG_RETRY_MS": "500",
+             "MD_RECENT_TRADES": "20"}
+    md = ctx.md("history", a, extra=extra)
+    md.wait_started()
+    md.wait_committed(120)
+    md.stop()
+    downs = 0
+    for round_no in (1, 2):
+        ctx.pg.pause()
+        md = ctx.md(f"down-{round_no}", a, extra=extra)
+        try:
+            ok = wait_until(lambda: http(md.admin, "/health")[0] in (200, 503), 30, 0.1)
+            check(ok, f"round {round_no}: no /health:\n{md.text()[-2000:]}")
+            check(not (md.trades() or {}).get("started"), f"round {round_no}: the trade path started with the history "
+                                                           f"frozen")
+            downs += 1
+            bare = Ws(md.public)
+            sub = Ws(md.public)
+            sub.send({"action": "subscribe", "marketId": 1})
+            first = sub.drain(1.5)
+            if any(f["type"] in ("TRADES_BATCH", "CANDLE_HISTORY", "TICKER_STATS", "TICKERS") for f in first):
+                raise Failure("empty series sent without the history")
+            types = [f["type"] for f in first]
+            check(types == ["SUBSCRIPTION_CONFIRMED", "BOOK_SNAPSHOT", "ERROR"], f"round {round_no}: down at start: {types}")
+            check(first[2]["code"] == "HISTORY_UNAVAILABLE" and first[2]["parts"] == ["tape", "candles", "ticker"],
+                  f"round {round_no}: {first[2]}")
+            check(bare.recv(0.5) is None, f"round {round_no}: handshake TICKERS sent without the history")
+            status, body, _ = http_full(md.public, "/api/candles?marketId=1&interval=5m&limit=10")
+            if status != 503:
+                raise Failure(f"REST candles answered without the history: {status} {body}")
+            check(json.loads(body)["code"] == "HISTORY_UNAVAILABLE", f"/api/candles: {body}")
+            print(f"PASS round {round_no} history down at start: book + ERROR HISTORY_UNAVAILABLE [tape, candles, "
+                  f"ticker], no TICKERS, no series, /api/candles 503")
+        finally:
+            ctx.pg.unpause()
+        md.wait_started(60)
+        fresh = []
+        while len(fresh) < 5:
+            f = sub.recv(15)
+            check(f is not None, f"round {round_no}: no fresh initial state after the history returned: {fresh}")
+            fresh.append(f)
+        check([f["type"] for f in fresh] == ["TICKER_STATS", "TICKERS", "BOOK_SNAPSHOT", "TRADES_BATCH",
+                                            "CANDLE_HISTORY"], f"round {round_no}: fresh state {[f['type'] for f in fresh]}")
+        hello = bare.recv(15)
+        check(hello is not None and hello["type"] == "TICKERS", f"round {round_no}: no TICKERS after the start: {hello}")
+        check(trade_ids(fresh) == expected_tape(j, 1, 20), f"round {round_no}: the initial tape is not the stored one: "
+                                                          f"{trade_ids(fresh)}")
+        check(fresh[4]["candles"] == candles_json(j, 1, 60, 200), f"round {round_no}: the 1m history differs")
+        last1 = j.trades[max(seq for seq, v in j.trades.items() if v[0] == 1)]
+        check(fresh[0]["marketId"] == 1 and fresh[0]["timestamp"] == last1[5] and fresh[0]["lastPrice"] == money(last1[2]),
+              f"round {round_no}: TICKER_STATS {fresh[0]}")
+        # live trades: each once, none missing
+        first_new = j.head + 1
+        append_records(a, j, first_new, first_new + 59, EPOCH_A, market_of=market_of)
+        md.wait_committed(j.head)
+        want = [str(v[1]) for seq, v in sorted(j.trades.items()) if v[0] == 1 and seq >= first_new]
+        def live_seen():
+            sub.drain(0.3)
+            ids = trade_ids(sub.frames)
+            return all(t in ids for t in want)
+        check(wait_until(live_seen, 20, 0.1), f"round {round_no}: live trades missing: "
+                                               f"{[t for t in want if t not in trade_ids(sub.frames)]}")
+        ids = trade_ids(sub.frames)
+        check(ids[-len(want):] == want, f"round {round_no}: live trades out of journal order")
+        kinds = {f["type"] for f in sub.frames[8:]}
+        check({"TRADES_BATCH", "TICKER_STATS", "CANDLE_UPDATE"} <= kinds, f"round {round_no}: live frames {kinds}")
+        status, body, headers = http_full(md.public, "/api/candles?marketId=1&interval=5m&limit=500",
+                                          headers={"Origin": origin})
+        check(status == 200, f"/api/candles {status} {body}")
+        got = json.loads(body)
+        check(got["marketId"] == 1 and got["interval"] == "5m", f"/api/candles envelope {body[:200]}")
+        check(got["candles"] == candles_json(j, 1, 300, 500), "/api/candles differs from a recomputation")
+        check(headers.get("Access-Control-Allow-Origin") == origin, f"/api/candles CORS header {headers}")
+        status, _, headers = http_full(md.public, "/api/candles", "OPTIONS", {"Origin": origin,
+                                       "Access-Control-Request-Method": "GET"})
+        if status != 204:
+            raise Failure("preflight refused for the UI origin")
+        status, _, _ = http_full(md.public, "/api/candles", "OPTIONS", {"Origin": "https://other.example.test"})
+        check(status == 403, f"a preflight from another origin: {status}")
+        print(f"PASS round {round_no}: fresh initial state from the stored history, {len(want)} live trades once each "
+              f"in journal order, /api/candles equals a recomputation, CORS")
+        bare.close()
+        sub.close()
+        md.stop()
+    if downs < 2:
+        raise Inconclusive("market history was never down")
+    ctx.check_trade_set(j)
+
+
 CASES = {
+    "live": case_live,
     "exactly_once": case_exactly_once,
     "epoch": case_epoch,
     "purged": case_purged,
