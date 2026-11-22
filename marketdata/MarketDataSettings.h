@@ -45,6 +45,11 @@
 //   MD_TICKERS_INTERVAL_MS 1000, MD_PENDING_TRADES 65536, MD_COMMIT_BATCH 512, MD_COMMIT_INTERVAL_MS 50,
 //   MD_RECENT_TRADES 50, MD_CANDLE_HISTORY 200, MD_CANDLES_LIMIT_MAX 500, MD_WS_MAX_CONNECTIONS 4096,
 //   MD_WS_QUEUE_BYTES 524288, MD_WS_UNWRITABLE_CLOSE_MS 30000, MD_WS_IDLE_MS 60000, MD_WS_MAX_FRAME 65536;
+//   the trade path's: MD_ARCHIVE_TIMEOUT_MS 3000 (an archive control call, a replay that never connects, an endpoint
+//   that never resolves; below MD_DUTY_WATCHDOG_MS: such a call blocks the duty thread), MD_SOURCE_BACKOFF_MS 1000 (a
+//   journal source that faulted is asked again after this), MD_GAP_RESCAN_MS 5000 (a GAP re-reads every source from its
+//   chain start this often), MD_PG_STATEMENT_TIMEOUT_MS 3000 (every market history statement and connect),
+//   MD_PG_RETRY_MS 1000 (an unreachable market history is tried again after this);
 //   the process shell's: MD_IO_THREADS 2, MD_IDLE backoff, MD_COMMAND_RING 4096, MD_DUTY_WATCHDOG_MS 5000,
 //   MD_STOP_TIMEOUT_MS 2000, MD_STATUS_INTERVAL_MS 100, MD_EMBEDDED_RETRY_MS 1000 (embedded only);
 //   the ME session's: MD_ME_RECONNECT_MS 1000 (a closed or failed session is replaced after this),
@@ -92,6 +97,11 @@ struct MarketDataSettings
     std::int64_t wsUnwritableCloseMs = 30'000;
     std::int64_t wsIdleMs = 60'000;
     std::int64_t wsMaxFrame = 65'536;
+    std::int64_t archiveTimeoutMs = 3000;
+    std::int64_t sourceBackoffMs = 1000;
+    std::int64_t gapRescanMs = 5000;
+    std::int64_t pgStatementTimeoutMs = 3000;
+    std::int64_t pgRetryMs = 1000;
 };
 
 ParseResult<MarketDataSettings> parseMarketDataSettings(const Environment &env,

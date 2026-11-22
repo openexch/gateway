@@ -504,14 +504,15 @@ endif()
 # oe-marketdata T0: settings, the book side over the engines' golden egress bytes, the golden output frames
 # (tests/golden/marketdata), the relay's fields, the frame shapes, readiness on the expected set, the admin routes.
 set(GW_MD_TEST_SOURCES "${PROJECT_SOURCE_DIR}/marketdata/MarketDataSettings.cpp"
-    "${PROJECT_SOURCE_DIR}/marketdata/BookCore.cpp" "${PROJECT_SOURCE_DIR}/marketdata/BookFrames.cpp")
+    "${PROJECT_SOURCE_DIR}/marketdata/BookCore.cpp" "${PROJECT_SOURCE_DIR}/marketdata/BookFrames.cpp"
+    "${PROJECT_SOURCE_DIR}/marketdata/Candles.cpp" "${PROJECT_SOURCE_DIR}/marketdata/TradePath.cpp")
 function(gw_md_test target)
-    add_executable(${target} unit/TestMain.cpp unit/MarketDataTest.cpp ${GW_MD_TEST_SOURCES})
+    add_executable(${target} unit/TestMain.cpp unit/MarketDataTest.cpp unit/MarketDataTradeTest.cpp ${GW_MD_TEST_SOURCES})
     target_include_directories(${target} PRIVATE unit "${GW_CT_GOLDEN_DIR}" "${PROJECT_SOURCE_DIR}/marketdata")
     target_compile_definitions(${target} PRIVATE GW_NO_ORDER_ENTRY
         GW_MD_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/golden/marketdata" ${ARGN})
     target_link_libraries(${target} PRIVATE gw_common cluster_tools::forwarder_codec cluster_tools::forwarder_domain
-        cluster_tools::archive_core)
+        cluster_tools::journal_codec cluster_tools::archive_core)
     target_compile_options(${target} PRIVATE ${GW_WARNINGS})
 endfunction()
 gw_md_test(gw_md_tests)
@@ -525,7 +526,20 @@ add_test(NAME marketdata COMMAND gw_md_tests)
 #   MD_NC_NO_BOOK_VERSION        bookVersion left out of the book frames
 #   MD_NC_NUMBER_PRICE           prices and quantities written as JSON numbers
 #   MD_NC_RENAMED_UPDATE_TYPE    a change's updateType written under another name
+# and of the trade path (the pure part; the PostgreSQL and process parts are registered below):
+#   MD_NC_WALLCLOCK_BUCKET       a candle bucket from the time the trade arrived, not from its journal timestamp
+#   MD_NC_QUOTE_64               the quote volume as a 64-bit product
+#   MD_NC_NO_MARKET_CHECK        a trade of a market outside MD_EXPECTED_MARKETS taken like any other
+#   MD_NC_NO_EPOCH_CHECK         a record of another meEpoch taken like any other
+#   MD_NC_NO_PREFIX_CHECK        a jump over the next record taken as if the records in between did not exist
+#   MD_NC_NO_LIVE_EMIT_CURSOR    a trade read again is handed to the live path again
 set(GW_MD_CONTROLS
+    "MD_NC_WALLCLOCK_BUCKET|md_candles_function_of_trade_set|candle bucket depends on arrival time"
+    "MD_NC_QUOTE_64|md_candles_function_of_trade_set|quote volume overflow"
+    "MD_NC_NO_MARKET_CHECK|md_trade_take_record|trade stored for a market with no book"
+    "MD_NC_NO_EPOCH_CHECK|md_trade_forward_rule|trades of two genesis epochs in one history"
+    "MD_NC_NO_PREFIX_CHECK|md_trade_forward_rule|trades skipped over a purged prefix"
+    "MD_NC_NO_LIVE_EMIT_CURSOR|md_trade_live_emit_cursor|trade [0-9]+ sent twice to one connection"
     "MD_NC_NO_CHAIN_CHECK|md_book_chain_break_marks_stale|book served across a version break"
     "MD_NC_DEFAULT_PUBLIC_BIND|md_settings_required_keys|service started without MD_PUBLIC_BIND"
     "MD_NC_NO_EXPECTED_SET_CHECK|md_expected_set|book served for a market outside the expected set"
@@ -544,6 +558,55 @@ foreach(control IN LISTS GW_MD_CONTROLS)
     add_test(NAME marketdata.${target} COMMAND ${target} ${case})
     set_tests_properties(marketdata.${target} PROPERTIES PASS_REGULAR_EXPRESSION "${text}")
 endforeach()
+
+# oe-marketdata's market history against PostgreSQL (tests/pg/MarketHistoryPgTest.cpp through pg_it.py): the start
+# checks, the one-transaction commit with the writer killed, the batch splits, the writer
+# thread through two outages; and the controls (the source named is compiled into the test with the define):
+#   MD_NC_COMMIT_SPLIT     the cursor commits in a transaction of its own before the rows
+#   MD_NC_NO_WRITER_LOCK   the start takes no writer lock
+#   MD_NC_WALLCLOCK_BUCKET / MD_NC_QUOTE_64   as in the T0 controls, against the stored rows
+add_executable(gw_md_pg_tests unit/TestMain.cpp pg/MarketHistoryPgTest.cpp)
+target_include_directories(gw_md_pg_tests PRIVATE unit pg)
+target_link_libraries(gw_md_pg_tests PRIVATE cluster_tools::runtime_embedded_driver oe_marketdata_app gw_common)
+target_compile_options(gw_md_pg_tests PRIVATE ${GW_WARNINGS})
+set(GW_MD_PG_CONTROLS
+    "MD_NC_COMMIT_SPLIT|MarketHistory.cpp|md_history_exactly_once|missing trade [0-9]+"
+    "MD_NC_NO_WRITER_LOCK|MarketHistory.cpp|md_history_start|two market history writers"
+    "MD_NC_WALLCLOCK_BUCKET|Candles.cpp|md_candles_batch_splits|candle bucket depends on arrival time"
+    "MD_NC_QUOTE_64|Candles.cpp|md_candles_batch_splits|quote volume overflow")
+set(GW_MD_PG_CONTROL_TESTS "")
+foreach(entry IN LISTS GW_MD_PG_CONTROLS)
+    string(REPLACE "|" ";" parts "${entry}")
+    list(GET parts 0 define)
+    list(GET parts 1 source)
+    list(GET parts 2 case)
+    list(GET parts 3 text)
+    string(TOLOWER "${define}" target)
+    string(REPLACE "md_nc_" "gw_md_pg_nc_" target "${target}")
+    add_executable(${target} unit/TestMain.cpp pg/MarketHistoryPgTest.cpp "${PROJECT_SOURCE_DIR}/marketdata/${source}")
+    target_include_directories(${target} PRIVATE unit pg)
+    target_compile_definitions(${target} PRIVATE ${define})
+    target_link_libraries(${target} PRIVATE cluster_tools::runtime_embedded_driver oe_marketdata_app gw_common)
+    list(APPEND GW_MD_PG_CONTROL_TESTS "${target}|${case}|${text}")
+endforeach()
+if(GW_PG_TESTS)
+    foreach(case md_history_start md_history_exactly_once md_history_another_writer md_candles_batch_splits
+            md_writer_outage)
+        add_test(NAME pg.marketdata.${case} COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/pg/pg_it.py"
+            --binary "$<TARGET_FILE:gw_md_pg_tests>" --image "${GW_PG_TEST_IMAGE}" ${case})
+        set_tests_properties(pg.marketdata.${case} PROPERTIES TIMEOUT 300 LABELS "pg;marketdata" RUN_SERIAL TRUE)
+    endforeach()
+    foreach(entry IN LISTS GW_MD_PG_CONTROL_TESTS)
+        string(REPLACE "|" ";" parts "${entry}")
+        list(GET parts 0 target)
+        list(GET parts 1 case)
+        list(GET parts 2 text)
+        add_test(NAME pg.${target} COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/pg/pg_it.py"
+            --binary "$<TARGET_FILE:${target}>" --image "${GW_PG_TEST_IMAGE}" ${case})
+        set_tests_properties(pg.${target} PROPERTIES TIMEOUT 300 LABELS "pg;marketdata" RUN_SERIAL TRUE
+            PASS_REGULAR_EXPRESSION "${text}")
+    endforeach()
+endif()
 
 add_test(NAME lock COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/lock/lock_test.sh" "${PROJECT_SOURCE_DIR}" "${CMAKE_COMMAND}"
     "${CMAKE_CURRENT_BINARY_DIR}/lock-work")
@@ -839,6 +902,80 @@ if(GW_TEST_BUILDS)
                         --image "${GW_PG_TEST_IMAGE}" --mode ${mode} --work "${CMAKE_CURRENT_BINARY_DIR}/it-work/${name}"
                         --port-base ${_port} --binary ${binary} --core-driver ${core} ${case})
                 set_tests_properties(${name} PROPERTIES TIMEOUT 600 LABELS t1 RUN_SERIAL TRUE)
+                if(NOT text STREQUAL "")
+                    set_tests_properties(${name} PROPERTIES PASS_REGULAR_EXPRESSION "${text}")
+                endif()
+            endforeach()
+        endforeach()
+    endif()
+
+    # oe-marketdata test builds (never published): the commit pause the trade-path T1 kills the writer in
+    # (MD_TC_COMMIT_PAUSE, HistoryWriter.cpp), and the controls of the trade path, one rule off each (the sources named
+    # are compiled into the binary with the defines):
+    #   MD_NC_COMMIT_SPLIT       (with the pause) the cursor commits apart from the rows
+    #   MD_NC_NO_EPOCH_CHECK     a record of another genesis taken like any other
+    #   MD_NC_NO_PREFIX_CHECK    a jump over the next record taken
+    #   MD_NC_NO_PARTIAL_FLAG    a history that starts above journalSeq 1 recorded as starting at 1
+    #   MD_NC_NO_SCHEMA_CHECK    a frame the gate refused for its schema decoded as a trade
+    #   MD_NC_NO_WRITER_LOCK     no writer lock at the start
+    #   MD_NC_NO_MARKET_CHECK    a trade of a market outside MD_EXPECTED_MARKETS stored
+    foreach(entry "oe-marketdata-tc-commit-pause|MD_TC_COMMIT_PAUSE|HistoryWriter.cpp"
+            "oe-marketdata-tc-commit-pause-nc-commit-split|MD_TC_COMMIT_PAUSE+MD_NC_COMMIT_SPLIT|HistoryWriter.cpp,MarketHistory.cpp"
+            "oe-marketdata-nc-no-epoch-check|MD_NC_NO_EPOCH_CHECK|TradePath.cpp"
+            "oe-marketdata-nc-no-prefix-check|MD_NC_NO_PREFIX_CHECK|TradePath.cpp"
+            "oe-marketdata-nc-no-partial-flag|MD_NC_NO_PARTIAL_FLAG|JournalFollow.cpp"
+            "oe-marketdata-nc-no-schema-check|MD_NC_NO_SCHEMA_CHECK|JournalFollow.cpp"
+            "oe-marketdata-nc-no-writer-lock|MD_NC_NO_WRITER_LOCK|MarketHistory.cpp"
+            "oe-marketdata-nc-no-market-check|MD_NC_NO_MARKET_CHECK|TradePath.cpp")
+        string(REPLACE "|" ";" parts "${entry}")
+        list(GET parts 0 target)
+        list(GET parts 1 defines)
+        list(GET parts 2 sources)
+        string(REPLACE "+" ";" defines "${defines}")
+        string(REPLACE "," ";" sources "${sources}")
+        list(TRANSFORM sources PREPEND "${PROJECT_SOURCE_DIR}/marketdata/")
+        add_executable(${target} "${PROJECT_SOURCE_DIR}/marketdata/main.cpp" ${sources})
+        target_include_directories(${target} PRIVATE "${PROJECT_SOURCE_DIR}/marketdata")
+        target_compile_definitions(${target} PRIVATE ${defines} GW_NO_ORDER_ENTRY)
+        target_link_libraries(${target} PRIVATE cluster_tools::runtime_embedded_driver oe_marketdata_app)
+    endforeach()
+    # T1: the trade path through the real binary against an ME-journal-shaped archive (the cluster-tools
+    # JournalArchiveFixture on the pinned aeron-all jar) and a throwaway PostgreSQL container
+    # (tests/marketdata/md_trade_it.py); both driver modes, and the controls.
+    set(GW_IT_AERON_ALL_JAR "" CACHE FILEPATH "aeron-all jar of the pinned Aeron version (the archive fixture of the T1 trade path)")
+    if(GW_IT_AERON_ALL_JAR AND GW_PG_TESTS)
+        set(GW_MD_TRADE_IT Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/marketdata/md_trade_it.py"
+            --bin-dir "${PROJECT_BINARY_DIR}/bin" --image "${GW_PG_TEST_IMAGE}" --aeron-jar "${GW_IT_AERON_ALL_JAR}"
+            --fixture-src "${GW_CLUSTER_TOOLS_SOURCE_DIR}/archive/it/JournalArchiveFixture.java"
+            --fixture-dir "${GW_CLUSTER_TOOLS_SOURCE_DIR}/archive/tests/fixtures/mejournal")
+        # case|binary|failure text of a control (empty: the case must pass)
+        foreach(entry "exactly_once|oe-marketdata-tc-commit-pause|" "epoch|oe-marketdata|" "purged|oe-marketdata|"
+                "schema|oe-marketdata|" "second_instance|oe-marketdata|" "unknown_market|oe-marketdata|"
+                "exactly_once|oe-marketdata-tc-commit-pause-nc-commit-split|missing trade [0-9]+"
+                "epoch|oe-marketdata-nc-no-epoch-check|trades of two genesis epochs in one history"
+                "purged|oe-marketdata-nc-no-prefix-check|trades skipped over a purged prefix"
+                "purged|oe-marketdata-nc-no-partial-flag|partial history reported as whole"
+                "schema|oe-marketdata-nc-no-schema-check|journal decoded under the wrong schema"
+                "second_instance|oe-marketdata-nc-no-writer-lock|two market history writers"
+                "unknown_market|oe-marketdata-nc-no-market-check|trade stored for a market with no book")
+            string(REPLACE "|" ";" parts "${entry}")
+            list(GET parts 0 case)
+            list(GET parts 1 binary)
+            list(GET parts 2 text)
+            set(modes embedded external)
+            if(NOT text STREQUAL "")
+                set(modes embedded) # a control runs in one mode: the rule it switches off does not depend on the driver
+                string(REPLACE "oe-marketdata-" "" nc "${binary}")
+                string(REPLACE "-" "_" nc "${nc}")
+                set(base it.marketdata.${case}.${nc})
+            else()
+                set(base it.marketdata.${case})
+            endif()
+            foreach(mode IN LISTS modes)
+                set(name ${base}.${mode})
+                add_test(NAME ${name} COMMAND ${GW_MD_TRADE_IT} --work "${CMAKE_CURRENT_BINARY_DIR}/it-work/${name}"
+                    --mode ${mode} --binary ${binary} ${case})
+                set_tests_properties(${name} PROPERTIES TIMEOUT 300 LABELS "t1;marketdata" RUN_SERIAL TRUE)
                 if(NOT text STREQUAL "")
                     set_tests_properties(${name} PROPERTIES PASS_REGULAR_EXPRESSION "${text}")
                 endif()

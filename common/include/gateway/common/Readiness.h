@@ -43,7 +43,10 @@
 //   book_fresh          every market of MD_EXPECTED_MARKETS (never "the markets seen so far") has a snapshot of this ME
 //                       session, an OK ladder, and either a book frame younger than MD_BOOK_STALE_MS or no level on
 //                       either side with a fresh heartbeat (an emptied book does not turn stale by being quiet)
-//   journal_attached, journal_fresh, history_writable   the trade path (false while this build has no journal follower)
+//   journal_attached    a journal source is attached (the follower is FOLLOWING)
+//   journal_fresh       its stall verdicts are clean within two MD_SOURCE_PROBE_MS and no record read waits on the
+//                       market history longer than MD_HISTORY_STALE_MS
+//   history_writable    the market history writer committed (or found nothing to commit) since its last failure
 //   no_halt             no halt of the trade path is set
 //   clients_served      no frame waits for a connected client longer than MD_SEND_STALL_MS
 // oe-marketdata /ready/book: me_session, book_fresh, clients_served. /ready/session: me_session.

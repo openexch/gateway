@@ -119,6 +119,19 @@ file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/gateway/projection_
     @ONLY)
 
 
+# The market history schema (sql/market_history_v1.sql), embedded with its sha256: oe-marketdata applies it to an empty
+# database and refuses one whose relations differ.
+set(GW_MARKET_HISTORY_SCHEMA_FILE "${CMAKE_CURRENT_SOURCE_DIR}/sql/market_history_v1.sql")
+file(READ "${GW_MARKET_HISTORY_SCHEMA_FILE}" _market_history_sql)
+file(SHA256 "${GW_MARKET_HISTORY_SCHEMA_FILE}" _market_history_sha)
+if(_market_history_sql MATCHES "\\)gwsql\"")
+    message(FATAL_ERROR "${GW_MARKET_HISTORY_SCHEMA_FILE} contains the embedding delimiter )gwsql\"")
+endif()
+file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/gateway/market_history_schema.inc"
+    CONTENT "constexpr const char *MARKET_HISTORY_SCHEMA_SQL = R\"gwsql(${_market_history_sql})gwsql\";\nconstexpr const char *MARKET_HISTORY_SCHEMA_SHA256 = \"${_market_history_sha}\";\n"
+    @ONLY)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${GW_MARKET_HISTORY_SCHEMA_FILE}")
+
 set(GW_WARNINGS -Wall -Wextra -Wpedantic -Werror)
 
 # gw_common: the one library both binaries link. Never links the embedded driver (a library must not: only a final
@@ -198,11 +211,12 @@ target_compile_definitions(oe_projector_app PRIVATE GW_NO_ORDER_ENTRY ${GW_PROJE
 # (forwarder_domain, forwarder_codec); the ME journal follower and its trade decode (journal_codec, archive_aeron) are
 # the trade path's.
 set(GW_MARKETDATA_SOURCES marketdata/MarketDataApp.cpp marketdata/MarketDataSettings.cpp marketdata/BookCore.cpp
-    marketdata/BookFrames.cpp marketdata/MdWsServer.cpp)
+    marketdata/BookFrames.cpp marketdata/MdWsServer.cpp marketdata/Candles.cpp marketdata/TradePath.cpp
+    marketdata/MarketHistory.cpp marketdata/HistoryWriter.cpp marketdata/JournalFollow.cpp)
 add_library(oe_marketdata_app STATIC ${GW_MARKETDATA_SOURCES})
 target_include_directories(oe_marketdata_app PUBLIC marketdata)
 target_link_libraries(oe_marketdata_app PUBLIC gw_common cluster_tools::forwarder_codec cluster_tools::forwarder_domain
-    cluster_tools::archive_core)
+    cluster_tools::journal_codec cluster_tools::archive_aeron cluster_tools::archive_core)
 target_compile_options(oe_marketdata_app PRIVATE ${GW_WARNINGS})
 target_compile_definitions(oe_marketdata_app PRIVATE GW_NO_ORDER_ENTRY)
 

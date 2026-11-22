@@ -1,6 +1,8 @@
 #include "MarketDataApp.h"
 
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <utility>
@@ -10,18 +12,24 @@
 #include "cluster_tools/runtime/LogRing.h"
 #include "cluster_tools/runtime/Supervisor.h"
 
+#include "gateway/common/Admin.h"
 #include "gateway/common/Environment.h"
 #include "gateway/common/ProcessShell.h"
 
 #include "BookCore.h"
+#include "HistoryWriter.h"
+#include "JournalFollow.h"
 #include "MarketDataSettings.h"
 #include "MdWsServer.h"
 
 // oe-marketdata - the public market data of the exchange: the order books from the ME's egress over one GATEWAY-class
-// ME session of its own, served on a public WebSocket with no auth. Stateless on the book side (a restart starts with
-// empty ladders that heal on the ME's next snapshot). Threads: main (the supervisor), md-duty (the ME session and
-// BookCore: every ladder and subscription), md-io-<n> (the public sockets, client frames, writes), md-admin. Exit
-// codes: ExitCodes.h. The service sends the ME no ingress but the session keepalive.
+// ME session of its own, served on a public WebSocket with no auth, and the trade path: the ME journal's trades read
+// through the members' archives (JournalFollow) into the market history database (HistoryWriter). Stateless on the
+// book side (a restart starts with empty ladders that heal on the ME's next snapshot); the trade path's only cursor is
+// md_state.last_journal_seq. Threads: main (the supervisor), md-duty (the ME session, BookCore: every ladder and
+// subscription, and the journal follower), md-pg (the market history writer), md-io-<n> (the public sockets, client
+// frames, writes), md-admin. Exit codes: ExitCodes.h (75 also: the market history writer lock is held, or the market
+// history has another writer). The service sends the ME no ingress but the session keepalive.
 
 namespace openexchange { namespace gateway { namespace marketdata {
 
@@ -56,13 +64,17 @@ BookCoreSettings coreSettings(const MarketDataSettings &s)
 class MarketDataDuty final : public DutyWork
 {
 public:
-    MarketDataDuty(const DutyContext &context, const MarketDataSettings &s, MdCommandRing &commands, MdStats &stats) :
+    MarketDataDuty(const DutyContext &context, const MarketDataSettings &s, MdCommandRing &commands, MdStats &stats,
+        TradeShared &trades) :
         m_settings(s),
         m_commands(commands),
         m_log(context.log),
+        m_trades(trades),
         m_transport(context.aeron),
         m_client(m_transport, meClientSettings(s)),
-        m_core(coreSettings(s), stats, &wallClockMs)
+        m_core(coreSettings(s), stats, &wallClockMs),
+        m_follow(context, s, trades, [this] { m_client.doWork(); },
+            [&stats] { return stats.schemaRefused.load(std::memory_order_relaxed); }, nullptr)
     {
     }
 
@@ -100,6 +112,7 @@ public:
                 EGRESS_PER_CYCLE);
         }
         work += m_core.doWork(now);
+        work += m_follow.doWork(now);
         return work;
     }
 
@@ -109,10 +122,15 @@ public:
         status.connected = Link::UP == m_link;
         status.sessionEpoch = static_cast<std::int64_t>(m_client.sessionEpoch());
         status.leaderMemberId = Link::UP == m_link ? m_client.leaderMemberId() : -1;
+        m_follow.fillStatus(status, rt::Supervisor::monotonicNs());
     }
 
-    int exitCode() const override { return 0; }
-    void close() override { m_client.close(); }
+    int exitCode() const override { return m_trades.ledger.fatalExit.load(std::memory_order_acquire); }
+    void close() override
+    {
+        m_follow.close();
+        m_client.close();
+    }
 
 private:
     enum class Link : std::uint8_t
@@ -207,9 +225,11 @@ private:
     const MarketDataSettings &m_settings;
     MdCommandRing &m_commands;
     rt::LogRing *m_log;
+    TradeShared &m_trades;
     at::AeronTransport m_transport;
     MeClient m_client;
     BookCore m_core;
+    JournalFollow m_follow;
     Link m_link = Link::DOWN;
     std::int64_t m_nextConnectNs = 0;
     std::int64_t m_term = -1;
@@ -221,8 +241,9 @@ private:
 class MarketDataFront final : public FrontWork
 {
 public:
-    MarketDataFront(const MarketDataSettings &s, MdCommandRing &commands, const MdStats &stats) :
-        m_settings(s), m_stats(stats)
+    MarketDataFront(const MarketDataSettings &s, MdCommandRing &commands, const MdStats &stats, TradeShared &trades,
+        HistoryWriter &writer) :
+        m_settings(s), m_stats(stats), m_trades(trades), m_writer(writer)
     {
         MdWsSettings ws;
         ws.host = s.common.publicBind.host;
@@ -239,8 +260,16 @@ public:
     ~MarketDataFront() override { stop(m_settings.common.stopTimeoutMs); }
 
     bool bind(std::string &error) override { return m_server->bind(error); }
-    void start() override { m_server->start(); }
-    bool stop(std::int64_t boundMs) override { return m_server->stop(boundMs); }
+    void start() override
+    {
+        m_writer.start();
+        m_server->start();
+    }
+    bool stop(std::int64_t boundMs) override
+    {
+        const bool ws = m_server->stop(boundMs);
+        return m_writer.stop(boundMs) && ws;
+    }
     bool accepting() const override { return m_server->accepting(); }
 
     void fillStatus(Status &status) const override
@@ -259,7 +288,48 @@ public:
         }
         return ",\"ws\":{\"accepting\":" + std::string(m_server->accepting() ? "true" : "false") + ",\"connections\":" +
             std::to_string(w.connections.load()) + ",\"refusedConnections\":" + std::to_string(w.refused.load()) +
-            "},\"expectedMarkets\":[" + markets + "]";
+            "},\"expectedMarkets\":[" + markets + "]" + tradesJson();
+    }
+
+    // the trade path: the halt by name, the two cursors, the sources and the market history writer
+    std::string tradesJson() const
+    {
+        const TradeView v = m_trades.view.get();
+        const TradeLedger &l = m_trades.ledger;
+        auto q = [](const std::string &t) { return "\"" + jsonEscape(t) + "\""; };
+        auto n = [](std::uint64_t x) { return std::to_string(x); };
+        std::string halts;
+        for (std::size_t i = 1; i < v.halts.size(); ++i)
+        {
+            if (v.halts[i])
+            {
+                halts += (halts.empty() ? "" : ",") + q(nameOf(static_cast<MdHalt>(i)));
+            }
+        }
+        std::string marks;
+        for (std::size_t i = 0; i < v.marks.size(); ++i)
+        {
+            marks += (i ? "," : "") + q(v.marks[i]);
+        }
+        const std::int64_t oldest = l.oldestReadAtNs();
+        return ",\"trades\":{\"started\":" + std::string(v.started ? "true" : "false") + ",\"halt\":" +
+            (MdHalt::NONE == v.halt ? std::string("null") : q(nameOf(v.halt))) + ",\"haltDetail\":" +
+            (MdHalt::NONE == v.halt ? std::string("null") : q(v.haltDetail)) + ",\"halts\":[" + halts + "]" +
+            ",\"epoch\":" + (v.epoch ? std::to_string(*v.epoch) : std::string("null")) + ",\"committedSeq\":" +
+            std::to_string(l.committedSeq()) + ",\"readSeq\":" + std::to_string(v.next > 0 ? v.next - 1 : 0) +
+            ",\"liveEmitSeq\":" + std::to_string(v.liveEmit) + ",\"liveEmitted\":" + n(v.liveEmitted) +
+            ",\"firstSeq\":" + std::to_string(l.firstSeq.load()) + ",\"partial\":" + (l.partial.load() ? "true" : "false") +
+            ",\"pending\":" + std::to_string(l.pending()) + ",\"pendingAgeMs\":" +
+            (oldest < 0 ? std::string("0") : std::to_string((rt::Supervisor::monotonicNs() - oldest) / 1'000'000LL)) +
+            ",\"source\":" + (v.source ? std::to_string(*v.source) : std::string("null")) + ",\"phase\":" + q(v.phase) +
+            ",\"attached\":" + (v.attached ? "true" : "false") + ",\"fresh\":" + (v.fresh ? "true" : "false") +
+            ",\"sources\":[" + marks + "],\"counts\":{\"switches\":" + n(v.switches) + ",\"holes\":" + n(v.holes) +
+            ",\"belowRange\":" + n(v.belowRange) + ",\"refusals\":" + n(v.refusals) + ",\"reReads\":" + n(v.reReads) +
+            ",\"rescans\":" + n(v.rescans) + ",\"pausedFull\":" + n(v.pausedFull) + "}" +
+            ",\"history\":{\"connected\":" + (l.connected.load() ? "true" : "false") + ",\"writable\":" +
+            (l.writable.load() ? "true" : "false") + ",\"commits\":" + n(l.commits.load()) + ",\"failures\":" +
+            n(l.failures.load()) + ",\"recoveries\":" + n(l.recoveries.load()) + ",\"lastError\":" + q(l.lastError()) +
+            "}}";
     }
 
     std::string metrics(const std::string &p) const override
@@ -308,6 +378,39 @@ public:
             std::to_string(w.queueDrops.load()));
         line("counter", "ws_closed_slow_total", "Connections closed after MD_WS_UNWRITABLE_CLOSE_MS without a finished "
             "write.", std::to_string(w.closedSlow.load()));
+        // the trade path. journal_seq is the committed cursor md_state.last_journal_seq and nothing else (the console's
+        // journal retention reads it): the read position and the live-emit cursor run ahead of it
+        {
+            const TradeView v = m_trades.view.get();
+            const TradeLedger &l = m_trades.ledger;
+            line("gauge", "journal_seq", "md_state.last_journal_seq: every ME journal record up to it is stored.",
+                std::to_string(l.committedSeq()));
+            line("counter", "trades_committed_total", "Trades committed to the market history.",
+                std::to_string(l.tradesCommitted.load()));
+            line("gauge", "pending_trades", "Journal records read and not yet committed.", std::to_string(l.pending()));
+            const std::int64_t oldest = l.oldestReadAtNs();
+            line("gauge", "history_age_ms", "Age of the oldest record read and not yet committed (0 = none).",
+                oldest < 0 ? std::string("0") : std::to_string((rt::Supervisor::monotonicNs() - oldest) / 1'000'000LL));
+            line("gauge", "history_partial", "1 when the market history starts above the journal's first record.",
+                l.partial.load() ? "1" : "0");
+            line("counter", "history_recoveries_total", "Times the market history became writable again after a failure.",
+                std::to_string(l.recoveries.load()));
+            out += "# HELP " + p + "halt The trade path's halts, by kind (1 = set).\n# TYPE " + p + "halt gauge\n";
+            for (std::size_t i = 1; i < v.halts.size(); ++i)
+            {
+                out += p + "halt{kind=\"" + nameOf(static_cast<MdHalt>(i)) + "\"} " + (v.halts[i] ? "1" : "0") + "\n";
+            }
+            out += "# HELP " + p + "source_stalls_total Stall verdicts of the journal followers, by reason.\n# TYPE " + p +
+                "source_stalls_total counter\n";
+            for (std::size_t i = 0; i < static_cast<std::size_t>(cluster_tools::archive::StallReason::COUNT); ++i)
+            {
+                const auto reason = static_cast<cluster_tools::archive::StallReason>(i);
+                out += p + "source_stalls_total{reason=\"" + cluster_tools::archive::stallLabel(reason) + "\"} " +
+                    std::to_string(m_trades.archiveMetrics.stalls(reason)) + "\n";
+            }
+            line("counter", "live_trades_total", "Trades handed to the live path (each once, never under a halt).",
+                std::to_string(v.liveEmitted));
+        }
         out += "# HELP " + p + "ws_frames_sent_total Frames written to clients, by type.\n# TYPE " + p +
             "ws_frames_sent_total counter\n";
         for (std::size_t i = 0; i < static_cast<std::size_t>(FrameType::COUNT); ++i)
@@ -321,8 +424,23 @@ public:
 private:
     const MarketDataSettings &m_settings;
     const MdStats &m_stats;
+    TradeShared &m_trades;
+    HistoryWriter &m_writer;
     std::unique_ptr<MdWsServer> m_server;
 };
+
+HistoryWriterSettings writerSettings(const MarketDataSettings &s)
+{
+    HistoryWriterSettings w;
+    w.pg.url = s.pgUrl;
+    w.pg.user = s.pgUser;
+    w.pg.passwordFile = s.pgPasswordFile;
+    w.pg.statementTimeoutMs = s.pgStatementTimeoutMs;
+    w.retryMs = s.pgRetryMs;
+    w.commitBatch = s.commitBatch;
+    w.commitIntervalMs = s.commitIntervalMs;
+    return w;
+}
 
 }
 
@@ -343,6 +461,17 @@ int marketDataMain()
         return refuseConfiguration("oe-marketdata", parsed.errors);
     }
     const MarketDataSettings &s = parsed.settings;
+    // the market history first: the legacy guard (78), the writer lock (75) and the schema (78) are settled before any
+    // listener binds; an unreachable database only delays the trade path (the book path does not wait for it)
+    TradeShared trades(static_cast<std::size_t>(s.pendingTrades));
+    HistoryWriter writer(writerSettings(s), trades.ledger);
+    writer.arrivalClockMs = &wallClockMs;
+    if (const int code = writer.startCheck(); 0 != code)
+    {
+        std::fprintf(stderr, "oe-marketdata: refused to start (exit %d)\n", code);
+        std::fflush(stderr);
+        std::_Exit(code);
+    }
     ProcessIdentity identity;
     identity.role = Role::MARKETDATA;
     identity.processName = "oe-marketdata";
@@ -359,11 +488,11 @@ int marketDataMain()
     // live until the process exits (runProcess does not return)
     MdCommandRing commands(static_cast<std::size_t>(s.common.commandRing));
     MdStats stats;
-    inputs.makeDuty = [&s, &commands, &stats](const DutyContext &context) -> std::unique_ptr<DutyWork> {
-        return std::make_unique<MarketDataDuty>(context, s, commands, stats);
+    inputs.makeDuty = [&s, &commands, &stats, &trades](const DutyContext &context) -> std::unique_ptr<DutyWork> {
+        return std::make_unique<MarketDataDuty>(context, s, commands, stats, trades);
     };
-    inputs.makeFront = [&s, &commands, &stats]() -> std::unique_ptr<FrontWork> {
-        return std::make_unique<MarketDataFront>(s, commands, stats);
+    inputs.makeFront = [&s, &commands, &stats, &trades, &writer]() -> std::unique_ptr<FrontWork> {
+        return std::make_unique<MarketDataFront>(s, commands, stats, trades, writer);
     };
     runProcess(identity, inputs);
 }

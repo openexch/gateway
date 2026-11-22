@@ -70,7 +70,7 @@ struct Status
     std::int64_t mdMeEpoch = 0;            // the meEpoch of the last heartbeat (0 = none yet)
     std::array<MdMarketStatus, MD_MARKET_SLOTS> mdMarkets{};
     bool mdClientsServed = true;           // no frame waits for a client longer than MD_SEND_STALL_MS
-    bool mdJournalAttached = false;        // the trade path: false until the journal follower exists in this build
+    bool mdJournalAttached = false;        // the trade path (JournalFollow, HistoryWriter)
     bool mdJournalFresh = false;
     bool mdHistoryWritable = false;
     bool mdHalted = false;
