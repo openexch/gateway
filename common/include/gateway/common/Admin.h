@@ -18,8 +18,9 @@
 //                    state, readiness with every condition, the treasury lane (oe-gateway), and every setting in force
 //                    with where it came from (secrets redacted).
 //   /ready           200 "ready" or 503 with JSON {"ready":false,"failing":[names]} (Readiness.h).
-//   /ready/session   oe-gateway only: connected and registered.
-//   /metrics         Prometheus text, prefix gateway_, stream_ or projector_.
+//   /ready/session   oe-gateway: connected and registered; oe-marketdata: me_session.
+//   /ready/book      oe-marketdata only: me_session, book_fresh, clients_served.
+//   /metrics         Prometheus text, prefix gateway_, stream_, projector_ or md_.
 // oe-projector: /ready also names the copy's part ("role":"writer" or "standby"); /health carries the projector block
 // its writer thread renders (FrontWork::healthJson) and no gateway or stream block.
 // Pure: route() renders from an AdminView the admin thread assembles at request time, so the tests need no process.
@@ -52,6 +53,7 @@ struct AdminView
     GatewayReadyBounds gatewayBounds;
     StreamReadyBounds streamBounds;
     ProjectorReadyBounds projectorBounds;
+    MarketDataReadyBounds marketDataBounds;
     std::string treasuryLane;  // oe-gateway: "off" or "on"
     const std::vector<SettingRecord> *settings = nullptr;
     std::string frontHealth;   // members the public side adds to /health (",\"auth\":{...}")
@@ -63,7 +65,7 @@ cluster_tools::runtime::HttpResponse adminRoute(const cluster_tools::runtime::Ht
 std::string renderHealth(const AdminView &view, int &status);
 std::string renderMetrics(const AdminView &view);
 std::string jsonEscape(const std::string &text);
-// The metric prefix of a role: gateway_, stream_, projector_.
+// The metric prefix of a role: gateway_, stream_, projector_, md_.
 const char *metricPrefix(Role role) noexcept;
 
 }}

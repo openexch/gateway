@@ -113,6 +113,7 @@ struct ProcessInputs
     GatewayReadyBounds gatewayBounds;
     StreamReadyBounds streamBounds;
     ProjectorReadyBounds projectorBounds;
+    MarketDataReadyBounds marketDataBounds;
     std::string treasuryLane = "off";
     ProcessHooks hooks;
     std::function<std::unique_ptr<DutyWork>(const DutyContext &)> makeDuty; // empty = no duty work (no session)

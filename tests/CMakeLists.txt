@@ -501,6 +501,50 @@ if(GW_PG_TESTS)
     endforeach()
 endif()
 
+# oe-marketdata T0: settings, the book side over the engines' golden egress bytes, the golden output frames
+# (tests/golden/marketdata), the relay's fields, the frame shapes, readiness on the expected set, the admin routes.
+set(GW_MD_TEST_SOURCES "${PROJECT_SOURCE_DIR}/marketdata/MarketDataSettings.cpp"
+    "${PROJECT_SOURCE_DIR}/marketdata/BookCore.cpp" "${PROJECT_SOURCE_DIR}/marketdata/BookFrames.cpp")
+function(gw_md_test target)
+    add_executable(${target} unit/TestMain.cpp unit/MarketDataTest.cpp ${GW_MD_TEST_SOURCES})
+    target_include_directories(${target} PRIVATE unit "${GW_CT_GOLDEN_DIR}" "${PROJECT_SOURCE_DIR}/marketdata")
+    target_compile_definitions(${target} PRIVATE GW_NO_ORDER_ENTRY
+        GW_MD_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/golden/marketdata" ${ARGN})
+    target_link_libraries(${target} PRIVATE gw_common cluster_tools::forwarder_codec cluster_tools::forwarder_domain
+        cluster_tools::archive_core)
+    target_compile_options(${target} PRIVATE ${GW_WARNINGS})
+endfunction()
+gw_md_test(gw_md_tests)
+add_test(NAME marketdata COMMAND gw_md_tests)
+# Controls for the market data rows: each build compiles the marketdata sources with one rule switched off (test-only
+# defines, never in a binary) and runs the case that guards it; the case must fail with the named text.
+#   MD_NC_NO_CHAIN_CHECK         every decoded delta is sent, whatever the ladder made of it
+#   MD_NC_DEFAULT_PUBLIC_BIND    MD_PUBLIC_BIND falls back to a default port
+#   MD_NC_NO_EXPECTED_SET_CHECK  every market of the library is served, MD_EXPECTED_MARKETS or not
+#   MD_NC_MARKETID_STRING        marketId written as a JSON string
+#   MD_NC_NO_BOOK_VERSION        bookVersion left out of the book frames
+#   MD_NC_NUMBER_PRICE           prices and quantities written as JSON numbers
+#   MD_NC_RENAMED_UPDATE_TYPE    a change's updateType written under another name
+set(GW_MD_CONTROLS
+    "MD_NC_NO_CHAIN_CHECK|md_book_chain_break_marks_stale|book served across a version break"
+    "MD_NC_DEFAULT_PUBLIC_BIND|md_settings_required_keys|service started without MD_PUBLIC_BIND"
+    "MD_NC_NO_EXPECTED_SET_CHECK|md_expected_set|book served for a market outside the expected set"
+    "MD_NC_MARKETID_STRING|md_relay_fields|relay field has the wrong JSON type: marketId"
+    "MD_NC_NO_BOOK_VERSION|md_relay_fields|relay reads book version 0"
+    "MD_NC_NUMBER_PRICE|md_frame_shapes|price is not a decimal string"
+    "MD_NC_RENAMED_UPDATE_TYPE|md_frame_shapes|simulator cannot decode BOOK_DELTA")
+foreach(control IN LISTS GW_MD_CONTROLS)
+    string(REPLACE "|" ";" parts "${control}")
+    list(GET parts 0 define)
+    list(GET parts 1 case)
+    list(GET parts 2 text)
+    string(TOLOWER "${define}" target)
+    string(REPLACE "md_nc_" "gw_md_nc_" target "${target}")
+    gw_md_test(${target} ${define})
+    add_test(NAME marketdata.${target} COMMAND ${target} ${case})
+    set_tests_properties(marketdata.${target} PROPERTIES PASS_REGULAR_EXPRESSION "${text}")
+endforeach()
+
 add_test(NAME lock COMMAND "${CMAKE_CURRENT_SOURCE_DIR}/lock/lock_test.sh" "${PROJECT_SOURCE_DIR}" "${CMAKE_COMMAND}"
     "${CMAKE_CURRENT_BINARY_DIR}/lock-work")
 
@@ -818,4 +862,13 @@ if(GW_TEST_BUILDS)
             --bin-dir "${PROJECT_BINARY_DIR}/bin" --work "${CMAKE_CURRENT_BINARY_DIR}/process-work/gateway.public_bind_in_use"
             gateway.public_bind_in_use)
     set_tests_properties(process.gateway.public_bind_in_use PROPERTIES TIMEOUT 120 LABELS process)
+    # oe-marketdata: the same shell, both driver modes, and its public WebSocket with no credential
+    foreach(case config_refused config_bad_values embedded_start_stop external_start_stop external_without_driver
+            external_driver_killed)
+        add_test(NAME process.marketdata.${case}
+            COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/process/md_process_test.py"
+                --bin-dir "${PROJECT_BINARY_DIR}/bin" --work "${CMAKE_CURRENT_BINARY_DIR}/process-work/marketdata.${case}"
+                ${case})
+        set_tests_properties(process.marketdata.${case} PROPERTIES TIMEOUT 120 LABELS process)
+    endforeach()
 endif()

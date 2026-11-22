@@ -29,6 +29,7 @@ std::vector<Condition> readyConditions(const AdminView &v)
     {
         case Role::GATEWAY: return gatewayReadyConditions(v.status, v.nowNs, v.gatewayBounds);
         case Role::STREAM: return streamReadyConditions(v.status, v.nowNs, v.streamBounds);
+        case Role::MARKETDATA: return marketDataReadyConditions(v.status, v.nowNs, v.marketDataBounds);
         case Role::PROJECTOR: break;
     }
     return projectorReadyConditions(v.status, v.nowNs, v.projectorBounds);
@@ -80,6 +81,7 @@ const char *metricPrefix(Role role) noexcept
     {
         case Role::GATEWAY: return "gateway_";
         case Role::STREAM: return "stream_";
+        case Role::MARKETDATA: return "md_";
         case Role::PROJECTOR: break;
     }
     return "projector_";
@@ -152,6 +154,29 @@ std::string renderHealth(const AdminView &v, int &status)
         out += ",\"events\":{\"gapOpen\":" + std::string(b(s.gapOpen)) + ",\"headProbeAgeMs\":" +
             ageMs(s.lastHeadProbeNs, v.nowNs) + "}";
     }
+    else if (Role::MARKETDATA == v.role)
+    {
+        out += ",\"me\":{\"sessionUp\":" + std::string(b(s.mdSessionUp)) + ",\"heartbeatAgeMs\":" +
+            ageMs(s.mdLastHeartbeatNs, v.nowNs) + ",\"meEpoch\":" + std::to_string(s.mdMeEpoch) + "}";
+        out += ",\"books\":{";
+        bool first = true;
+        for (std::size_t i = 0; i < s.mdMarkets.size(); ++i)
+        {
+            const MdMarketStatus &m = s.mdMarkets[i];
+            if (!m.expected)
+            {
+                continue;
+            }
+            out += (first ? "\"" : ",\"") + std::to_string(i + 1) + "\":{\"state\":" +
+                q(nameOf(mdBookState(m, s.mdLastHeartbeatNs, v.nowNs, v.marketDataBounds))) + ",\"empty\":" +
+                b(m.empty) + ",\"lastFrameAgeMs\":" + ageMs(m.lastBookFrameNs, v.nowNs) + "}";
+            first = false;
+        }
+        out += "}";
+        out += ",\"tradePath\":{\"journalAttached\":" + std::string(b(s.mdJournalAttached)) + ",\"journalFresh\":" +
+            b(s.mdJournalFresh) + ",\"historyWritable\":" + b(s.mdHistoryWritable) + ",\"halt\":" +
+            (s.mdHalted ? "true" : "null") + "}";
+    }
     out += v.frontHealth;
     out += ",\"ready\":" + std::string(b(failing(conditions).empty())) + ",\"conditions\":" + conditionsJson(conditions);
     out += ",\"aeronErrors\":" + std::to_string(s.aeronErrors) + ",\"logDropped\":" + std::to_string(v.logDropped);
@@ -199,7 +224,10 @@ std::string renderMetrics(const AdminView &v)
     gauge("session_connected", "1 while a session to a leader is open.", s.connected ? "1" : "0");
     gauge("session_registered", "1 after the registration ack of the current session.", s.registered ? "1" : "0");
     counter("session_epoch", "Sessions opened since start.", std::to_string(s.sessionEpoch));
-    // the core session's counters (both binaries: each holds one GATEWAY-class session)
+    // the core session's counters (oe-gateway and oe-stream: each holds one GATEWAY-class core session; oe-marketdata
+    // holds an ME session and renders its own counters)
+    const bool coreSession = Role::MARKETDATA != v.role;
+    if (coreSession)
     {
         counter("session_registrations_total", "Registration rounds that reached REGISTERED (the AdminAck arrived).",
             std::to_string(s.registrations));
@@ -214,6 +242,7 @@ std::string renderMetrics(const AdminView &v)
         counter("outcome_unknown_total", "Requests that reached their deadline offered and unanswered (504).",
             std::to_string(s.outcomeUnknown));
     }
+    if (coreSession)
     {
         counter("query_budget_wait_seconds", "Total time core queries waited for a query budget token.",
             std::to_string(static_cast<double>(s.queryBudgetWaitNs) / 1e9));
@@ -245,7 +274,8 @@ rt::HttpResponse adminRoute(const rt::HttpRequest &request, const AdminView &vie
     rt::HttpResponse r;
     const std::string path = request.path.substr(0, request.path.find('?'));
     const bool known = "/health" == path || "/ready" == path || "/metrics" == path ||
-        ("/ready/session" == path && Role::GATEWAY == view.role);
+        ("/ready/session" == path && (Role::GATEWAY == view.role || Role::MARKETDATA == view.role)) ||
+        ("/ready/book" == path && Role::MARKETDATA == view.role);
     if (!known)
     {
         r.status = 404;
@@ -272,7 +302,13 @@ rt::HttpResponse adminRoute(const rt::HttpRequest &request, const AdminView &vie
     }
     if ("/ready/session" == path)
     {
-        return readyResponse(gatewaySessionConditions(view.status));
+        return readyResponse(Role::MARKETDATA == view.role
+                ? marketDataSessionConditions(view.status, view.nowNs, view.marketDataBounds)
+                : gatewaySessionConditions(view.status));
+    }
+    if ("/ready/book" == path)
+    {
+        return readyResponse(marketDataBookConditions(view.status, view.nowNs, view.marketDataBounds));
     }
     r.status = 200;
     r.contentType = PROMETHEUS;

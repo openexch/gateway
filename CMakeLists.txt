@@ -1,6 +1,7 @@
 # openexch/gateway - oe-gateway (REST) and oe-stream (WebSocket user streams), two stateless C++20 processes in front
-# of the core, and oe-projector (the history projector: the core's order journal into the history relations the
-# gateway reads, the only binary here that writes a database), sharing one static library, gw_common.
+# of the core, oe-projector (the history projector: the core's order journal into the history relations the
+# gateway reads, the only binary here that writes a database), and oe-marketdata (the public market data: the ME's
+# books on a public WebSocket), sharing one static library, gw_common.
 #
 # Build:
 #   scripts/build-cluster-tools.sh <cache-dir> <prefix>     (fetches, verifies and installs the pinned cluster-tools)
@@ -37,7 +38,7 @@ include(GatewayDeps)
 set(GW_DEPS_PREFIX "" CACHE PATH "the prefix scripts/build-deps.sh installed Boost, OpenSSL and libpq to")
 gw_check_deps("${CMAKE_CURRENT_SOURCE_DIR}/dependencies.lock" "${GW_DEPS_PREFIX}")
 find_package(cluster_tools CONFIG REQUIRED COMPONENTS client_core runtime client client_aeron runtime_aeron sbe_codecs
-    runtime_embedded_driver archive_core archive_aeron aeron_archive_client)
+    runtime_embedded_driver archive_core archive_aeron aeron_archive_client forwarder_domain forwarder_codec journal_codec)
 gw_check_cluster_tools_package()
 
 # OE_PROJECTOR_CONTROL: a test build of oe-projector (never published) with one control define, or several joined by
@@ -192,6 +193,19 @@ target_link_libraries(oe_projector_app PUBLIC gw_common cluster_tools::archive_a
 target_compile_options(oe_projector_app PRIVATE ${GW_WARNINGS})
 target_compile_definitions(oe_projector_app PRIVATE GW_NO_ORDER_ENTRY ${GW_PROJECTOR_CONTROL_DEFINITIONS})
 
+# oe-marketdata: built like the stream (GW_NO_ORDER_ENTRY, no gw_order_entry): it holds a GATEWAY-class ME session that
+# sends no ingress but its keepalive. The book ladder and the ME book egress decode are the cluster-tools package's
+# (forwarder_domain, forwarder_codec); the ME journal follower and its trade decode (journal_codec, archive_aeron) are
+# the trade path's.
+set(GW_MARKETDATA_SOURCES marketdata/MarketDataApp.cpp marketdata/MarketDataSettings.cpp marketdata/BookCore.cpp
+    marketdata/BookFrames.cpp marketdata/MdWsServer.cpp)
+add_library(oe_marketdata_app STATIC ${GW_MARKETDATA_SOURCES})
+target_include_directories(oe_marketdata_app PUBLIC marketdata)
+target_link_libraries(oe_marketdata_app PUBLIC gw_common cluster_tools::forwarder_codec cluster_tools::forwarder_domain
+    cluster_tools::archive_core)
+target_compile_options(oe_marketdata_app PRIVATE ${GW_WARNINGS})
+target_compile_definitions(oe_marketdata_app PRIVATE GW_NO_ORDER_ENTRY)
+
 # The binaries: the embedded driver first in the link list (its archive resolves the C client symbols before
 # aeron_static is scanned).
 add_executable(oe-gateway gateway/main.cpp)
@@ -202,10 +216,13 @@ target_compile_definitions(oe-stream PRIVATE GW_NO_ORDER_ENTRY)
 add_executable(oe-projector projector/main.cpp)
 target_link_libraries(oe-projector PRIVATE cluster_tools::runtime_embedded_driver oe_projector_app)
 target_compile_definitions(oe-projector PRIVATE GW_NO_ORDER_ENTRY ${GW_PROJECTOR_CONTROL_DEFINITIONS})
+add_executable(oe-marketdata marketdata/main.cpp)
+target_link_libraries(oe-marketdata PRIVATE cluster_tools::runtime_embedded_driver oe_marketdata_app)
+target_compile_definitions(oe-marketdata PRIVATE GW_NO_ORDER_ENTRY)
 if(OE_PROJECTOR_CONTROL)
     install(TARGETS oe-projector RUNTIME DESTINATION bin) # a control tree installs its oe-projector alone
 else()
-    install(TARGETS oe-gateway oe-stream oe-projector RUNTIME DESTINATION bin)
+    install(TARGETS oe-gateway oe-stream oe-projector oe-marketdata RUNTIME DESTINATION bin)
 endif()
 
 include(CTest)

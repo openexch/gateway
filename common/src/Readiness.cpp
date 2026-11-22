@@ -58,6 +58,102 @@ std::vector<Condition> projectorReadyConditions(const Status &s, std::int64_t no
     };
 }
 
+const char *nameOf(MdBookState state) noexcept
+{
+    switch (state)
+    {
+        case MdBookState::NOT_EXPECTED: return "not_expected";
+        case MdBookState::FRESH: return "fresh";
+        case MdBookState::NO_SNAPSHOT: return "no_snapshot";
+        case MdBookState::BROKEN: return "broken";
+        case MdBookState::STALE: break;
+    }
+    return "stale";
+}
+
+bool mdHeartbeatFresh(std::int64_t lastHeartbeatNs, std::int64_t nowNs, const MarketDataReadyBounds &bounds) noexcept
+{
+    return lastHeartbeatNs >= 0 && nowNs - lastHeartbeatNs < bounds.egressStaleMs * 1'000'000LL;
+}
+
+MdBookState mdBookState(const MdMarketStatus &m, std::int64_t lastHeartbeatNs, std::int64_t nowNs,
+    const MarketDataReadyBounds &bounds) noexcept
+{
+    if (!m.expected)
+    {
+        return MdBookState::NOT_EXPECTED;
+    }
+    if (!m.snapshot)
+    {
+        return MdBookState::NO_SNAPSHOT;
+    }
+    if (!m.ladderOk)
+    {
+        return MdBookState::BROKEN;
+    }
+    const bool recentFrame = m.lastBookFrameNs >= 0 && nowNs - m.lastBookFrameNs < bounds.bookStaleMs * 1'000'000LL;
+    if (recentFrame || (m.empty && mdHeartbeatFresh(lastHeartbeatNs, nowNs, bounds)))
+    {
+        return MdBookState::FRESH;
+    }
+    return MdBookState::STALE;
+}
+
+namespace {
+
+bool mdSession(const Status &s, std::int64_t nowNs, const MarketDataReadyBounds &bounds)
+{
+    return s.mdSessionUp && mdHeartbeatFresh(s.mdLastHeartbeatNs, nowNs, bounds);
+}
+
+bool mdBooksFresh(const Status &s, std::int64_t nowNs, const MarketDataReadyBounds &bounds)
+{
+    bool any = false;
+    for (const MdMarketStatus &m : s.mdMarkets)
+    {
+        if (!m.expected)
+        {
+            continue;
+        }
+        any = true;
+        if (MdBookState::FRESH != mdBookState(m, s.mdLastHeartbeatNs, nowNs, bounds))
+        {
+            return false;
+        }
+    }
+    return any; // an empty expected set is refused by the settings; never ready on it
+}
+
+}
+
+std::vector<Condition> marketDataReadyConditions(const Status &s, std::int64_t nowNs, const MarketDataReadyBounds &bounds)
+{
+    return {
+        { condition::DRIVER_CONNECTED, s.driverConnected },
+        { condition::ME_SESSION, mdSession(s, nowNs, bounds) },
+        { condition::BOOK_FRESH, mdBooksFresh(s, nowNs, bounds) },
+        { condition::JOURNAL_ATTACHED, s.mdJournalAttached },
+        { condition::JOURNAL_FRESH, s.mdJournalFresh },
+        { condition::HISTORY_WRITABLE, s.mdHistoryWritable },
+        { condition::NO_HALT, !s.mdHalted },
+        { condition::CLIENTS_SERVED, s.mdClientsServed },
+    };
+}
+
+std::vector<Condition> marketDataBookConditions(const Status &s, std::int64_t nowNs, const MarketDataReadyBounds &bounds)
+{
+    return {
+        { condition::ME_SESSION, mdSession(s, nowNs, bounds) },
+        { condition::BOOK_FRESH, mdBooksFresh(s, nowNs, bounds) },
+        { condition::CLIENTS_SERVED, s.mdClientsServed },
+    };
+}
+
+std::vector<Condition> marketDataSessionConditions(const Status &s, std::int64_t nowNs, const MarketDataReadyBounds &bounds)
+{
+    return { { condition::ME_SESSION, mdSession(s, nowNs, bounds) } };
+}
+
 std::vector<std::string> failing(const std::vector<Condition> &conditions)
 {
     std::vector<std::string> out;

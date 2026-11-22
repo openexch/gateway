@@ -144,6 +144,7 @@ void runProcess(const ProcessIdentity &id, const ProcessInputs &in)
     base.gatewayBounds = in.gatewayBounds;
     base.streamBounds = in.streamBounds;
     base.projectorBounds = in.projectorBounds;
+    base.marketDataBounds = in.marketDataBounds;
     base.treasuryLane = in.treasuryLane;
     base.settings = in.records;
 

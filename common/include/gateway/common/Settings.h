@@ -54,7 +54,8 @@ enum class Role : std::uint8_t
 {
     GATEWAY,  // oe-gateway
     STREAM,   // oe-stream
-    PROJECTOR // oe-projector (projector/ProjectorSettings.h)
+    PROJECTOR, // oe-projector (projector/ProjectorSettings.h)
+    MARKETDATA // oe-marketdata (marketdata/MarketDataSettings.h)
 };
 
 enum class DriverMode : std::uint8_t
