@@ -741,7 +741,7 @@ int projectorMain(int argc, char **argv, const ProjectorHooks &hooks)
         }
         else
         {
-            std::fprintf(stderr, "oe-projector: unknown argument '%s'\nusage: oe-projector [--rebuild] (settings from "
+            std::fprintf(stderr, "oe-projector: unknown argument '%s'\nusage: oe-projector [--rebuild | --version] (settings from "
                 "the environment, HISTORY_PROJECTOR_*)\n", argv[i]);
             return EXIT_USAGE;
         }

@@ -1,0 +1,307 @@
+# Publishes the arm64 binaries of this repository (oe-gateway, oe-stream, oe-projector, oe-marketdata) to S3 under their
+# commit sha, so the demo box deploys by downloading rather than by compiling. Nothing is ever built on the box: it is a
+# small machine running the live money path. Same bucket, OIDC role, prefix discipline and manifest as the
+# cluster-tools publish job, which this workflow mirrors deliberately.
+#
+# Separate from ci.yml on purpose: ci.yml proves the build and the tests on x86 for every PR; this workflow builds the
+# release binaries on the architecture the box runs (aarch64) and refuses to publish on a red test. The test gate lives
+# inside the single job: ctest runs before anything is uploaded.
+name: publish
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    # Opt-in per repo, the same switch the other publishing repos use. Publishing needs an S3 bucket and an OIDC role
+    # that do not exist in a fresh clone or a fork, and a workflow that hard-fails on absent infrastructure turns main
+    # red for a reason unrelated to the code. Turn it on with:
+    #   gh variable set ARTIFACT_PUBLISH --body true -R openexch/gateway
+    # (The IAM role's trust policy must also list this repo; cloud-console's scripts/setup-artifact-pipeline.sh is the
+    # record of that list.)
+    if: github.event_name == 'push' && vars.ARTIFACT_PUBLISH == 'true'
+    # One publish at a time per repo, the next one queues; a branch run and a tag run never cancel each other, each
+    # publishes its own prefix. The pointer move below still refuses to go backwards, because a displaced or retried run
+    # can arrive late.
+    concurrency:
+      group: publish-${{ github.repository }}
+      cancel-in-progress: false
+    # Native arm64: the box is an aarch64 m7g. No cross-compile, no qemu: the binaries are built, tested and started on
+    # the architecture they will run on.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write # OIDC: no long-lived AWS keys in this repo
+    env:
+      BUCKET: openexch-build-artifacts-675715936685
+      # The prefix builds are addressed by. The box asks for named files inside it, so more files under the same prefix
+      # later is additive.
+      ARTIFACT: gateway
+      # The four process binaries. Boost, OpenSSL and libpq are linked statically from the pinned tarballs
+      # (scripts/build-deps.sh) and Aeron statically from the pinned cluster-tools package, so the closure check below
+      # admits stock system libraries only.
+      BINARIES: oe-gateway oe-stream oe-projector oe-marketdata
+      # Aeron 1.53.1 (inside the cluster-tools package) and this repository's cmake_minimum_required need cmake >= 3.30;
+      # ubuntu 24.04's apt ships 3.28. The same pinned Kitware tarball the cluster-tools publish job installs.
+      CMAKE_VERSION: 3.31.6
+    steps:
+      - uses: actions/checkout@v7
+
+      # SBE codegen of the pinned cluster-tools package is java (sbe-tool and agrona, fetched and verified by the lock).
+      - name: Set up Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends uuid-dev ninja-build
+
+      - name: Install cmake
+        run: |
+          set -euo pipefail
+          curl -sfL "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-$(uname -m).tar.gz" \
+            -o "${RUNNER_TEMP}/cmake.tgz"
+          tar -xzf "${RUNNER_TEMP}/cmake.tgz" -C "${RUNNER_TEMP}"
+          echo "${RUNNER_TEMP}/cmake-${CMAKE_VERSION}-linux-$(uname -m)/bin" >> "$GITHUB_PATH"
+
+      # The caches only save work: the package is checked against the lock again at configure (source sha, money schema
+      # sha256 and version), the deps prefix by its stamp, so a stale cache is refused, never used.
+      - name: Restore the cluster-tools package built from the lock
+        id: ct-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ct-prefix
+          key: cluster-tools-${{ runner.os }}-arm64-${{ hashFiles('dependencies.lock', 'scripts/build-cluster-tools.sh', 'scripts/fetch-cluster-tools.sh') }}
+
+      - name: Fetch and verify cluster-tools by the lock
+        # the verified tree also carries the golden corpus the codec tests read (GW_CLUSTER_TOOLS_SOURCE_DIR)
+        run: |
+          set -euo pipefail
+          scripts/fetch-cluster-tools.sh "${RUNNER_TEMP}/ct-cache" --verify-only > "${RUNNER_TEMP}/ct-args"
+          echo "CT_SOURCE_DIR=$(sed -n 's/^-DCLUSTER_TOOLS_SOURCE_DIR=//p' "${RUNNER_TEMP}/ct-args")" >> "$GITHUB_ENV"
+
+      - name: Build and install the pinned cluster-tools package
+        if: steps.ct-cache.outputs.cache-hit != 'true'
+        run: JOBS="$(nproc)" scripts/build-cluster-tools.sh "${RUNNER_TEMP}/ct-cache" "${RUNNER_TEMP}/ct-prefix"
+
+      - name: Restore the Boost, OpenSSL and libpq prefix built from the lock
+        id: deps-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/deps-prefix
+          key: gateway-deps-${{ runner.os }}-arm64-${{ hashFiles('dependencies.lock', 'scripts/build-deps.sh') }}
+
+      - name: Build Boost, OpenSSL and libpq from the pinned tarballs
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        run: JOBS="$(nproc)" scripts/build-deps.sh "${RUNNER_TEMP}/deps-cache" "${RUNNER_TEMP}/deps-prefix"
+
+      # Where this build belongs, and the version string it carries. A branch push is addressed by commit sha and is
+      # fetchable but not deployable in production; a tag push is addressed by the tag under releases/ and is the only
+      # thing the release channel installs. Both are published: replaying an old incident needs the commit build that
+      # produced its state, whether or not it was ever released.
+      - name: Work out where this build belongs
+        id: dest
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+            echo "prefix=${ARTIFACT}/releases/${TAG}" >> "$GITHUB_OUTPUT"
+            echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+            echo "version=${TAG}" >> "$GITHUB_OUTPUT"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prefix=${ARTIFACT}/${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "version=main.$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+          # Stamped once here and reused, so the value in the manifest is the one the pointer comparison sorts on.
+          echo "builtAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      # Release because these binaries are what the box runs, not a test build. The source commit is named explicitly
+      # (GW_BUILD_SOURCE_SHA), never left to `git rev-parse` at configure: it is what `--version` and /health "build"
+      # report, and what the release cut's arm64 sibling check compares. The test builds and the users-store tests
+      # (PostgreSQL in docker) are part of the gate; the test binaries live under tests/ and are never published.
+      - name: Configure
+        env:
+          GW_VERSION_STRING: ${{ steps.dest.outputs.version }}
+        run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="${RUNNER_TEMP}/ct-prefix"
+          -DGW_TEST_BUILDS=ON -DGW_PG_TESTS=ON -DGW_CLUSTER_TOOLS_SOURCE_DIR="${CT_SOURCE_DIR}"
+          -DGW_DEPS_PREFIX="${RUNNER_TEMP}/deps-prefix" -DGW_BUILD_SOURCE_SHA="${GITHUB_SHA}"
+          -DGW_VERSION="${GW_VERSION_STRING}"
+
+      - name: Build
+        run: cmake --build build
+
+      # The publish gate: the same suite ci.yml runs on x86, here on the deploy architecture, in the same job that
+      # uploads. Red here means nothing reaches the bucket.
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Assemble the artifacts
+        run: |
+          set -euo pipefail
+          mkdir dist
+          for f in ${BINARIES}; do
+            cp "build/bin/$f" "dist/$f"
+          done
+          # A projector control build (OE_PROJECTOR_CONTROL) carries "+control." in its version; this tree must not be one
+          if grep -q 'OE_PROJECTOR_CONTROL:STRING=.' build/CMakeCache.txt; then
+            echo "::error::the publish tree is a projector control build"; exit 1
+          fi
+          strip dist/*
+          ls -la dist/
+
+      # Prove the shipped set is self-sufficient BEFORE it is uploaded. Every dynamic dependency must resolve to a
+      # library a stock ubuntu 24.04 arm64 install already has: the runner has -dev packages the box does not, so an
+      # allowlist, not just "ldd found everything here". libuuid.so.1 (Aeron's driver) is package libuuid1, priority
+      # required in ubuntu 24.04.
+      - name: Verify the set runs on a bare box
+        run: |
+          set -euo pipefail
+          cd dist
+          for f in ${BINARIES}; do
+            echo "== $f"
+            ldd "$f"
+            if ldd "$f" | grep -q 'not found'; then
+              echo "::error::$f has unresolved dependencies"; exit 1
+            fi
+            # Anchored on the .so suffix so libc cannot admit libcrypto; the loader is matched by its absolute path too
+            BAD=$(ldd "$f" | awk '{print $1}' | grep -vE \
+              '^(linux-vdso\.so|(/lib/)?ld-linux-aarch64\.so|libc\.so|libm\.so|libpthread\.so|libdl\.so|librt\.so|libstdc\+\+\.so|libgcc_s\.so|libuuid\.so)' \
+              || true)
+            if [ -n "$BAD" ]; then
+              echo "::error::$f depends on libraries a bare box does not have: $BAD"
+              exit 1
+            fi
+          done
+          # And they start. `--version` reports the commit this job built (the line the box self-check reads), and an
+          # empty environment refuses to start with 78 naming the first required key.
+          for f in ${BINARIES}; do
+            case "$f" in
+              oe-gateway) KEY=GATEWAY_DRIVER_MODE ;;
+              oe-stream) KEY=STREAM_DRIVER_MODE ;;
+              oe-projector) KEY=HISTORY_PROJECTOR_DRIVER_MODE ;;
+              oe-marketdata) KEY=MD_DRIVER_MODE ;;
+            esac
+            env -i "./$f" --version > "$f.version"
+            cat "$f.version"
+            grep -q " source ${GITHUB_SHA} " "$f.version" \
+              || { echo "::error::$f --version does not report ${GITHUB_SHA}"; exit 1; }
+            rc=0
+            env -i timeout 10 "./$f" > "$f.smoke" 2>&1 || rc=$?
+            [ "$rc" -eq 78 ] || { cat "$f.smoke"; echo "::error::$f without env exited $rc, expected 78"; exit 1; }
+            grep -q "$KEY" "$f.smoke" || { cat "$f.smoke"; echo "::error::$f did not name $KEY"; exit 1; }
+          done
+          rm -f ./*.version ./*.smoke
+          echo "bare-box closure and start smoke verified"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::675715936685:role/openexch-ci-artifact-publisher
+          aws-region: eu-central-1
+
+      # Payload first, manifest last. S3 has no atomic multi-object write, so until the manifest lands the prefix is an
+      # upload in progress and the box must refuse to deploy from it. The manifest is the cluster-tools one plus, per
+      # file, the architecture (goos/goarch: the console checks them before it installs) and the commit the binary
+      # reported when this job ran it (reportedSha: the release cut's arm64 sibling compares it with the cut).
+      - name: Publish
+        env:
+          DEST: ${{ steps.dest.outputs.prefix }}
+          TAG: ${{ steps.dest.outputs.tag }}
+          BUILT_AT: ${{ steps.dest.outputs.builtAt }}
+        run: |
+          set -euo pipefail
+          PREFIX="s3://${BUCKET}/${DEST}"
+
+          ENTRIES=""
+          for f in ${BINARIES}; do
+            SUM=$(sha256sum "dist/$f" | cut -d' ' -f1)
+            BYTES=$(stat -c%s "dist/$f")
+            REPORTED=$(env -i "dist/$f" --version | sed -n 's/.* source \([0-9a-f]\{40\}\) .*/\1/p')
+            [ "${REPORTED}" = "${GITHUB_SHA}" ] || { echo "::error::$f reports '${REPORTED}', not ${GITHUB_SHA}"; exit 1; }
+            aws s3 cp "dist/$f" "${PREFIX}/${f}" \
+              --checksum-algorithm SHA256 --no-progress
+            ENTRIES="${ENTRIES}${ENTRIES:+,}{\"name\": \"${f}\", \"sha256\": \"${SUM}\", \"bytes\": ${BYTES}, \"goos\": \"linux\", \"goarch\": \"arm64\", \"reportedSha\": \"${REPORTED}\"}"
+          done
+
+          # The tag field makes a release prefix self-describing: a per-commit build copied into releases/ carries no tag
+          # and gets caught rather than deployed.
+          cat > manifest.json <<JSON
+          {
+            "repo": "${ARTIFACT}",
+            "sha": "${GITHUB_SHA}",
+            "shortSha": "$(git rev-parse --short HEAD)",
+            "ref": "${GITHUB_REF}",
+            "tag": "${TAG}",
+            "builtAt": "${BUILT_AT}",
+            "runId": "${GITHUB_RUN_ID}",
+            "artifacts": [${ENTRIES}]
+          }
+          JSON
+          python3 -I -c 'import json,sys; m = json.load(open("manifest.json")); assert len(m["artifacts"]) == 4' || {
+            echo "::error::the manifest this job just wrote is not valid JSON with four artifacts"
+            exit 1
+          }
+          aws s3 cp manifest.json "${PREFIX}/manifest.json" --no-progress
+
+      # A publish step that cannot tell "uploaded" from "did nothing" is a step that says yes. Read every file back and
+      # compare bytes, the manifest included.
+      - name: Verify the uploads landed
+        env:
+          DEST: ${{ steps.dest.outputs.prefix }}
+        run: |
+          set -euo pipefail
+          for f in ${BINARIES}; do
+            aws s3 cp "s3://${BUCKET}/${DEST}/${f}" ./roundtrip --no-progress
+            diff <(sha256sum < "dist/$f") <(sha256sum < ./roundtrip) \
+              || { echo "::error::$f did not round-trip"; exit 1; }
+            echo "$f round-tripped"
+          done
+          aws s3 cp "s3://${BUCKET}/${DEST}/manifest.json" ./roundtrip --no-progress
+          diff manifest.json ./roundtrip || { echo "::error::manifest.json did not round-trip"; exit 1; }
+          echo "manifest.json round-tripped"
+
+      # Branch pushes only. The pointer moves after the payload is verified readable, so "latest" can never name a prefix
+      # that is not fully there. Releases have NO pointer: the newest release is computed by listing the prefixes,
+      # because two tags' runs can finish out of order.
+      - name: Move the latest pointer
+        if: steps.dest.outputs.release == 'false'
+        env:
+          BUILT_AT: ${{ steps.dest.outputs.builtAt }}
+        run: |
+          set -euo pipefail
+          # Compare before writing: a displaced pending run or a retried old one can arrive late, and a pointer that
+          # went backwards would hand the box an older build than it already had. ISO-8601 UTC sorts lexicographically,
+          # so the string comparison IS a time comparison.
+          CURRENT=$(aws s3 cp "s3://${BUCKET}/${ARTIFACT}/latest" - 2>/dev/null || true)
+          if [ -n "$CURRENT" ] && [ "$CURRENT" != "${GITHUB_SHA}" ]; then
+            CURRENT_AT=$(aws s3 cp "s3://${BUCKET}/${ARTIFACT}/${CURRENT}/manifest.json" - \
+              2>/dev/null | jq -r '.builtAt // ""' || true)
+            if [ -n "$CURRENT_AT" ] && [ "$CURRENT_AT" \> "$BUILT_AT" ]; then
+              echo "latest already names ${CURRENT} built at ${CURRENT_AT}, which is newer than"
+              echo "this build (${BUILT_AT}); leaving the pointer alone."
+              exit 0
+            fi
+          fi
+
+          printf '%s' "${GITHUB_SHA}" > latest
+          aws s3 cp latest "s3://${BUCKET}/${ARTIFACT}/latest" \
+            --content-type text/plain --no-progress
+
+      - name: Say what was published
+        env:
+          DEST: ${{ steps.dest.outputs.prefix }}
+        run: echo "published s3://${BUCKET}/${DEST}"
