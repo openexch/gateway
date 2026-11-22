@@ -19,6 +19,8 @@
 #include <boost/beast/core/flat_buffer.hpp>
 #include <boost/beast/http.hpp>
 
+#include "gateway/common/FrontLog.h"
+
 namespace openexchange { namespace gateway { namespace stream {
 
 namespace net = boost::asio;
@@ -37,6 +39,8 @@ struct Lookup
     std::string error;
 };
 
+namespace node_error = engine::node_error;
+
 struct NodeAddress
 {
     engine::NodeEndpointSpec spec;
@@ -44,6 +48,7 @@ struct NodeAddress
     std::vector<tcp::endpoint> endpoints; // the address the requests use (empty: not known yet)
     std::shared_ptr<Lookup> lookup;       // a lookup still running (at most one per node)
     std::string error;                    // why the address is not known this round
+    const char *code = nullptr;           // its node_error code
 };
 
 namespace {
@@ -120,6 +125,7 @@ std::unique_ptr<NodeAddress> makeAddress(const engine::NodeEndpointSpec &spec)
 void prepare(NodeAddress &a, Clock::time_point deadline, std::int64_t timeoutMs)
 {
     a.error.clear();
+    a.code = nullptr;
     if (a.literal || !a.endpoints.empty())
     {
         return;
@@ -132,12 +138,32 @@ void prepare(NodeAddress &a, Clock::time_point deadline, std::int64_t timeoutMs)
     if (!a.lookup->cv.wait_until(lock, deadline, [&a] { return a.lookup->done; }))
     {
         a.error = "name lookup of " + a.spec.host + " still running after " + std::to_string(timeoutMs) + " ms";
+        a.code = node_error::TIMEOUT;
         return; // the same lookup is waited for again next round; no second one is started
     }
     a.endpoints = std::move(a.lookup->endpoints);
     a.error = a.lookup->error;
+    a.code = a.error.empty() ? nullptr : node_error::UNREACHABLE;
     lock.unlock();
     a.lookup.reset();
+}
+
+// The node_error code of a request that got no answer.
+const char *failureCode(bool timedOut, const boost::system::error_code &ec)
+{
+    if (timedOut || net::error::timed_out == ec)
+    {
+        return node_error::TIMEOUT;
+    }
+    if (net::error::connection_refused == ec)
+    {
+        return node_error::REFUSED;
+    }
+    if (ec.category() == http::make_error_code(http::error::body_limit).category())
+    {
+        return node_error::BAD_ANSWER; // over the body or header bound, or not HTTP
+    }
+    return node_error::UNREACHABLE;
 }
 
 std::string hostHeader(const engine::NodeEndpointSpec &node)
@@ -217,6 +243,7 @@ private:
             m_answer.answered = false;
             m_answer.error = m_timedOut ? "no answer within " + std::to_string(m_timeoutMs) + " ms"
                                         : std::string(step) + ": " + ec.message();
+            m_answer.code = failureCode(m_timedOut, ec);
         }
     }
 
@@ -262,6 +289,7 @@ std::vector<HttpAnswer> fetchAll(const std::vector<std::pair<NodeAddress *, std:
         if (a.endpoints.empty())
         {
             answers[i].error = a.error.empty() ? "no address for " + a.spec.host : a.error;
+            answers[i].code = nullptr != a.code ? a.code : node_error::UNREACHABLE;
             continue;
         }
         std::make_shared<Fetch>(ioc, a, requests[i].second, deadline, timeoutMs, maxBodyBytes, answers[i])->run();
@@ -308,6 +336,7 @@ EnginePoller::EnginePoller(EnginePollerSettings settings, EngineRing &out, Engin
             m_addresses.push_back(makeAddress(n));
         }
     }
+    m_loggedDetail.resize(m_addresses.size());
 }
 
 EnginePoller::~EnginePoller()
@@ -437,7 +466,9 @@ void EnginePoller::roundOnce(std::int64_t nowWallMs, std::int64_t nowSteadyMs)
             s.metricsAnswered = m.answered;
             s.metricsStatus = m.status;
             s.metricsBody = m.body;
-            s.error = !h.error.empty() ? h.error : m.error;
+            const HttpAnswer &failed = !h.error.empty() ? h : m;
+            s.error = failed.error;
+            s.failure = failed.code;
         }
         return round;
     };
@@ -453,6 +484,7 @@ void EnginePoller::roundOnce(std::int64_t nowWallMs, std::int64_t nowSteadyMs)
                 std::make_shared<const std::string>(engine::electionFrame(model->key(), e)) });
         }
     }
+    logReasons();
     const std::uint64_t unchangedBefore = m_gate.suppressedUnchanged();
     if (auto frame = m_gate.offer(engine::engineFrame(m_core, m_me), nowSteadyMs))
     {
@@ -462,6 +494,38 @@ void EnginePoller::roundOnce(std::int64_t nowWallMs, std::int64_t nowSteadyMs)
     }
     m_stats.unchanged.fetch_add(m_gate.suppressedUnchanged() - unchangedBefore, std::memory_order_relaxed);
     flush();
+}
+
+void EnginePoller::logReasons()
+{
+    std::size_t at = 0;
+    for (const engine::ClusterModel *model : { &m_core, &m_me })
+    {
+        for (const engine::NodeView &n : model->nodes())
+        {
+            if (at >= m_loggedDetail.size())
+            {
+                return;
+            }
+            std::string &last = m_loggedDetail[at++];
+            const std::string now = n.errorDetail.value_or("");
+            if (now == last)
+            {
+                continue;
+            }
+            if (now.empty())
+            {
+                frontLog(FrontLevel::INFO, "engine status: %s node %lld answers again", model->key(),
+                    static_cast<long long>(n.id));
+            }
+            else
+            {
+                frontLog(FrontLevel::WARN, "engine status: %s node %lld %s: %s", model->key(),
+                    static_cast<long long>(n.id), n.error.value_or("").c_str(), now.c_str());
+            }
+            last = now;
+        }
+    }
 }
 
 void EnginePoller::hand(EngineOut out)

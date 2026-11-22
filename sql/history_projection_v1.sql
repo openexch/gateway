@@ -160,10 +160,11 @@ CREATE VIEW gateway_fills_v1 AS
       FROM oe_fills;
 
 -- One row per journal record of an order, ordered by event_seq and by nothing else (core_log_position is not unique).
--- oe_order_events_order_key (order_id, journal_seq) serves the gateway's trail read.
+-- oe_order_events_order_key (order_id, journal_seq) serves the gateway's trail read. me_log_position is the matching
+-- engine's egress sequence of the causing record (the journal's field name), me_timestamp_ms that record's ME time.
 CREATE VIEW gateway_order_trail_v1 AS
     SELECT order_id, user_id, journal_seq AS event_seq, event, status, core_log_position, me_epoch, me_log_position,
-           me_journal_seq, liquidity, trade_id, last_price, last_qty, hold_remaining, at_ms
+           me_journal_seq, liquidity, trade_id, last_price, last_qty, hold_remaining, at_ms, me_timestamp_ms
       FROM oe_order_events;
 
 -- No row until this projection's first beat: the gateway answers 503 HISTORY_UNAVAILABLE while there is none (also

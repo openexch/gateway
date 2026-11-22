@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <charconv>
 
+#include "gateway/build_info.h"
 #include "gateway/common/Api.h"
 
 namespace openexchange { namespace gateway { namespace stream { namespace engine {
@@ -250,17 +251,30 @@ NodeView ClusterModel::readNode(const NodeEndpointSpec &spec, const NodeSample &
 {
     NodeView v;
     v.id = spec.memberId;
+    // `error` is a fixed code; the text, which can name hosts and addresses, goes only to errorDetail (never rendered)
+    auto fail = [&v](const char *code, std::string detail) {
+        v.error = std::string(code);
+        v.errorDetail = std::move(detail);
+    };
+    const char *failed = s.failure.empty() ? node_error::UNREACHABLE : s.failure.c_str();
     if (!s.healthAnswered && !s.metricsAnswered)
     {
         v.role = std::string("unreachable");
-        v.error = s.error.empty() ? std::string("no answer") : s.error;
+        fail(failed, s.error.empty() ? std::string("no answer") : s.error);
         return v;
     }
     if (!s.healthAnswered || !s.metricsAnswered || 200 != s.metricsStatus)
     {
-        v.error = !s.healthAnswered ? "/health did not answer" + (s.error.empty() ? std::string() : ": " + s.error)
-            : !s.metricsAnswered    ? "/metrics did not answer" + (s.error.empty() ? std::string() : ": " + s.error)
-                                    : "/metrics answered " + std::to_string(s.metricsStatus);
+        if (!s.healthAnswered || !s.metricsAnswered)
+        {
+            fail(s.failure.empty() ? node_error::BAD_ANSWER : failed,
+                std::string(!s.healthAnswered ? "/health" : "/metrics") + " did not answer" +
+                    (s.error.empty() ? std::string() : ": " + s.error));
+        }
+        else
+        {
+            fail(node_error::BAD_ANSWER, "/metrics answered " + std::to_string(s.metricsStatus));
+        }
         return v;
     }
     const std::optional<HealthBody> h = parseHealth(s.healthBody);
@@ -268,19 +282,25 @@ NodeView ClusterModel::readNode(const NodeEndpointSpec &spec, const NodeSample &
     const std::optional<std::int64_t> member = metricInt(m, m_prefix + "member_id");
     if (!h)
     {
-        v.error = std::string("/health body is not a node probe");
+        fail(node_error::BAD_ANSWER, "/health body is not a node probe");
         return v;
     }
     if (!member || *member != spec.memberId)
     {
-        v.error = member ? "the endpoint reports member id " + std::to_string(*member)
-                         : "the endpoint reports no " + m_prefix + "member_id";
+        if (member)
+        {
+            fail(node_error::WRONG_MEMBER, "the endpoint reports member id " + std::to_string(*member));
+        }
+        else
+        {
+            fail(node_error::BAD_ANSWER, "the endpoint reports no " + m_prefix + "member_id");
+        }
         return v;
     }
     v.role = roleName(h->role.value_or(""));
     if (!v.role)
     {
-        v.error = "unknown role " + h->role.value_or("");
+        fail(node_error::BAD_ANSWER, "unknown role " + h->role.value_or(""));
     }
     v.live = 200 == s.healthStatus;
     v.recovery = h->recovery;
@@ -427,6 +447,7 @@ std::vector<Election> ClusterModel::ingest(const std::vector<NodeSample> &round,
         {
             n.role = std::string("follower");
             n.error.reset();
+            n.errorDetail.reset();
         }
     }
 #endif
@@ -537,7 +558,12 @@ std::string ClusterModel::json() const
             num(n.behindBytes) + ",\"entriesBehind\":null,\"snapshot\":{\"position\":" + num(n.snapshot.position) +
             ",\"atMs\":" + num(n.snapshot.atMs) + ",\"stateHash\":" + str(n.snapshot.stateHash) + ",\"agreement\":" +
             str(n.snapshot.agreement) + "},\"version\":" + str(n.version) + ",\"buildCommit\":" + str(n.buildCommit) +
-            ",\"error\":" + str(n.error) + "}";
+            ",\"error\":" +
+#ifdef GW_NC_ENGINE_ERROR_TEXT
+            str(n.errorDetail ? n.errorDetail : n.error) + "}"; // test-only control: the failure text in the frame
+#else
+            str(n.error) + "}";
+#endif
     }
     out += "],\"lastElection\":";
     if (m_lastElection)
@@ -556,8 +582,14 @@ std::string ClusterModel::json() const
     return out;
 }
 
-std::string engineFrame(const ClusterModel &core, const ClusterModel &me)
+BuildIdentity streamBuild()
 {
+    return BuildIdentity{ GW_VERSION, GW_SOURCE_SHA };
+}
+
+std::string engineFrame(const ClusterModel &core, const ClusterModel &me, const BuildIdentity &stream)
+{
+    auto text = [](const std::string &v) { return v.empty() ? std::optional<std::string>() : std::optional<std::string>(v); };
     const NodeView *coreLeader = core.leader();
     const NodeView *meLeader = me.leader();
     const std::optional<std::int64_t> consumed = nullptr != coreLeader ? coreLeader->feedCursor : std::nullopt;
@@ -568,7 +600,8 @@ std::string engineFrame(const ClusterModel &core, const ClusterModel &me)
                                                                 : std::nullopt;
     return "{\"type\":\"engine\",\"core\":" + core.json() + ",\"matchingEngine\":" + me.json() +
         ",\"bridge\":{\"consumedJournalSeq\":" + num(consumed) + ",\"meJournalSeq\":" + num(head) +
-        ",\"entriesBehind\":" + num(behind) + "}}";
+        ",\"entriesBehind\":" + num(behind) + "},\"stream\":{\"version\":" + str(text(stream.version)) +
+        ",\"buildCommit\":" + str(text(stream.buildCommit)) + "}}";
 }
 
 std::string electionFrame(const char *clusterKey, const Election &e)

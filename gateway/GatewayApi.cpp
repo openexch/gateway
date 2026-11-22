@@ -181,6 +181,8 @@ void GatewayApi::finish(const Ex &ex, const char *route, ApiResponse response)
             if (*origin == allowed)
             {
                 response.headers.emplace_back("Access-Control-Allow-Origin", allowed);
+                // a browser script reads only the safelisted headers unless told: Retry-After of every 429 and 503
+                response.headers.emplace_back("Access-Control-Expose-Headers", "Retry-After");
                 response.headers.emplace_back("Vary", "Origin");
                 break;
             }
@@ -251,6 +253,7 @@ void GatewayApi::handle(Ex ex)
         { "/api/v2/orders/history", "GET", &GatewayApi::ordersHistory, "orders_history" },
         { "/api/v2/fills", "GET", &GatewayApi::fills, "fills" },
         { "/api/v2/balances", "GET", &GatewayApi::balances, "balances" },
+        { "/api/v2/balances/movements", "GET", &GatewayApi::balanceMovements, "balances_movements" },
         { "/api/v2/balances/deposit", "POST", &GatewayApi::deposit, "balances_deposit" },
         { "/api/v2/balances/withdraw", "POST", &GatewayApi::withdraw, "balances_withdraw" },
     };

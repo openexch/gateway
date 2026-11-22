@@ -215,3 +215,73 @@ TEST(history_row_json)
     CHECK_MSG(!fillJson(bad, json, key, problem) &&
             problem == "column maker is not a boolean (row trade_id 77, order_id 900)", problem);
 }
+
+// Balance movements: the statement (owner filter, asset filter, keyset on (journal_seq, leg_no) newest first, every
+// value a parameter), the cursor (leg_no 0 is a key, the asset filter binds it, another route's cursor is refused) and
+// the item.
+TEST(history_movements_statement_cursor_and_item)
+{
+    PageRequest r;
+    r.kind = Kind::MOVEMENTS;
+    r.userId = 987654321;
+    r.filter.assetId = 0; // USD: asset ids start at 0
+    r.after = Key{ 123456789, 0, 0 };
+    r.limit = 31;
+    Statement s = pageStatement(r);
+    CHECK_MSG(s.sql == "SELECT journal_seq, leg_no, log_position, kind, asset_id, delta, balance_after, at_ms, trade_id, "
+        "market_id FROM gateway_balance_movements_v1 WHERE user_id = $1::bigint AND asset_id = $2::integer AND "
+        "(journal_seq, leg_no) < ($3::bigint, $4::integer) ORDER BY journal_seq DESC, leg_no DESC LIMIT $5::bigint", s.sql);
+    CHECK(s.params == std::vector<std::string>({ "987654321", "0", "123456789", "0", "32" }));
+    PageRequest any;
+    any.kind = Kind::MOVEMENTS;
+    any.userId = 7;
+    any.limit = 100;
+    s = pageStatement(any);
+    CHECK_MSG(s.sql.find("asset_id =") == std::string::npos, s.sql);
+    CHECK(s.params == std::vector<std::string>({ "7", "101" }));
+
+    Filter usd;
+    usd.assetId = 0;
+    Filter btc;
+    btc.assetId = 1;
+    Filter all;
+    const std::string c = nextCursor(r, Key{ 500, 0, 0 }, 31);
+    Key out;
+    CHECK(CursorError::NONE == decodeCursor(c, Kind::MOVEMENTS, usd, out));
+    CHECK(500 == out.a && 0 == out.b);
+    CHECK(CursorError::OTHER_FILTER == decodeCursor(c, Kind::MOVEMENTS, btc, out));
+    CHECK(CursorError::OTHER_FILTER == decodeCursor(c, Kind::MOVEMENTS, all, out));
+    CHECK(CursorError::OTHER_ROUTE == decodeCursor(c, Kind::FILLS, usd, out));
+    CHECK(CursorError::OTHER_ROUTE == decodeCursor(encodeCursor(Kind::TRAIL, all, Key{ 5, 6, 0 }), Kind::MOVEMENTS, all,
+                                          out));
+    // a trail cursor with key part 0 stays malformed (only a movement's leg_no may be 0)
+    CHECK(CursorError::MALFORMED == decodeCursor(encodeCursor(Kind::TRAIL, all, Key{ 5, 0, 0 }), Kind::TRAIL, all, out));
+    CHECK(CursorError::MALFORMED == decodeCursor(encodeCursor(Kind::MOVEMENTS, all, Key{ 5, -1, 0 }), Kind::MOVEMENTS,
+                                        all, out));
+
+    const std::map<std::int32_t, std::string> codes = { { 0, "USD" }, { 1, "BTC" } };
+    std::string json;
+    std::string problem;
+    Key key;
+    const Row settle = { "4", "1", "400", "settle", "0", "-20000000000", "80000000000", "1200", "77", "1" };
+    CHECK_MSG(movementJson(settle, codes, json, key, problem), problem);
+    CHECK_MSG(json == R"({"journalSeq":4,"legNo":1,"logPosition":400,"kind":"settle","assetId":"0","asset":"USD",)"
+        R"("delta":"-200","balanceAfter":"800","at":1200,"tradeId":"77","marketId":"1"})", json);
+    CHECK(4 == key.a && 1 == key.b);
+    const Row opening = { "1", "0", "100", "opening", "9", "100000000000", "100000000000", std::nullopt, std::nullopt,
+        std::nullopt };
+    CHECK_MSG(movementJson(opening, codes, json, key, problem), problem);
+    CHECK_MSG(json == R"({"journalSeq":1,"legNo":0,"logPosition":100,"kind":"opening","assetId":"9","asset":null,)"
+        R"("delta":"1000","balanceAfter":"1000","at":null,"tradeId":null,"marketId":null})", json);
+    // no asset (a market the money database cannot name): not the contract's shape, never a guess
+    Row bad = settle;
+    bad[4] = std::nullopt;
+    CHECK_MSG(!movementJson(bad, codes, json, key, problem) &&
+            problem == "column asset_id is NULL (row journal_seq 4, leg_no 1)", problem);
+    problem.clear();
+    // no delta (a settle whose earlier leg age retention deleted): served as null, never as a guessed number
+    Row gone = settle;
+    gone[5] = std::nullopt;
+    CHECK_MSG(movementJson(gone, codes, json, key, problem), problem);
+    CHECK_MSG(std::string::npos != json.find(R"("delta":null,"balanceAfter":"800")"), json);
+}

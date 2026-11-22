@@ -361,6 +361,16 @@ TEST(auth_modes_and_the_keys_each_needs)
         { "GATEWAY_PG_URL", "postgresql://gw:pw@db:5432/gateway" } }));
     CHECK_MSG(demo.ok(), joined(demo.errors));
     onlyProblem(gw(with(gatewayEnv(), { { "GATEWAY_PG_URL", "mysql://x" } })), "GATEWAY_PG_URL");
+    onlyProblem(gw(with(gatewayEnv(), { { "GATEWAY_MONEY_PG_URL", "mysql://x" } })), "GATEWAY_MONEY_PG_URL");
+    {
+        // the money database is its own setting: never GATEWAY_PG_URL standing in for it, and secret in /health
+        const auto r = gw(with(gatewayEnv(), { { "GATEWAY_PG_URL", "postgresql://gw:pw@db:5432/gateway" } }));
+        CHECK(r.ok() && !r.settings.moneyPgUrl);
+        const auto m = gw(with(gatewayEnv(), { { "GATEWAY_MONEY_PG_URL", "postgresql://gw:pw@money:5432/core" } }));
+        CHECK(m.ok() && m.settings.moneyPgUrl && "postgresql://gw:pw@money:5432/core" == *m.settings.moneyPgUrl);
+        const SettingRecord *rec = recordOf(m, "GATEWAY_MONEY_PG_URL");
+        CHECK(nullptr != rec && std::string::npos == rec->value.find("pw@money"));
+    }
 }
 
 TEST(treasury_lane_needs_flag_credential_and_caps_together)
@@ -552,7 +562,8 @@ TEST(every_setting_is_recorded_with_its_source)
         "GATEWAY_HISTORY_BUSY_RETRY_AFTER_MS", "GATEWAY_HISTORY_LAG_RETRY_AFTER_MS", "GATEWAY_FAUCET_MAX_AMOUNT", "GATEWAY_FAUCET_RATE",
         "GATEWAY_DUTY_WATCHDOG_MS", "GATEWAY_STOP_TIMEOUT_MS", "GATEWAY_STATUS_INTERVAL_MS", "GATEWAY_EMBEDDED_RETRY_MS",
         "GATEWAY_RECONNECT_DELAY_MS", "GATEWAY_REGISTER_RESEND_MS", "GATEWAY_TOKEN_LOOKUP_RATE", "GATEWAY_TOKEN_LOOKUP_BURST",
-        "GATEWAY_TOKEN_LOOKUP_INFLIGHT", "GATEWAY_PG_RETRY_MS", "GATEWAY_SOURCE_IPV6_PREFIX" };
+        "GATEWAY_TOKEN_LOOKUP_INFLIGHT", "GATEWAY_PG_RETRY_MS", "GATEWAY_SOURCE_IPV6_PREFIX", "GATEWAY_MONEY_PG_URL",
+        "GATEWAY_PG_MONEY_POOL" };
     for (const std::string &key : gatewayKeys)
     {
         CHECK_MSG(nullptr != recordOf(r, key), key + " is not recorded");

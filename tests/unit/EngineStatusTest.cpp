@@ -5,6 +5,7 @@
 
 #include <dlfcn.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <map>
@@ -70,10 +71,11 @@ en::NodeSample answered(const std::string &healthBody, const std::string &metric
     return s;
 }
 
-en::NodeSample silent(const char *why = "connect: Connection refused")
+en::NodeSample silent(const char *why = "connect: Connection refused", const char *code = en::node_error::REFUSED)
 {
     en::NodeSample s;
     s.error = why;
+    s.failure = code;
     return s;
 }
 
@@ -226,7 +228,8 @@ TEST(engine_unreachable_node_from_its_own_poll)
     const en::NodeView &n = node(core, 2);
     CHECK_MSG("unreachable" == n.role.value_or(""), "follower health inferred from the leader: node 2 role " +
             n.role.value_or("null"));
-    CHECK(n.error && std::string::npos != n.error->find("refused"));
+    CHECK("refused" == n.error.value_or(""));
+    CHECK(n.errorDetail && std::string::npos != n.errorDetail->find("Connection refused"));
     CHECK(!n.commitPosition && !n.appliedPosition && !n.term && !n.live && !n.behindBytes);
     CHECK("follower" == node(core, 1).role.value_or(""));
     CHECK(0 == core.leaderId().value_or(-9)); // the leader is still the leader
@@ -247,19 +250,22 @@ TEST(engine_partial_or_foreign_answer_shows_no_values)
     en::NodeSample onlyHealth = answered(health("FOLLOWER", 3, 4096, 4096), "");
     onlyHealth.metricsAnswered = false;
     onlyHealth.error = "no answer within 500 ms";
+    onlyHealth.failure = en::node_error::TIMEOUT;
     core.ingest({ answered(health("LEADER", 3, 4096, 4096), coreMetrics(0)),
                     answered(health("FOLLOWER", 3, 4096, 4096), coreMetrics(7)), onlyHealth },
         1000);
-    CHECK(!node(core, 1).role && node(core, 1).error && std::string::npos != node(core, 1).error->find("member id 7"));
+    CHECK(!node(core, 1).role && "wrong_member" == node(core, 1).error.value_or(""));
+    CHECK(node(core, 1).errorDetail && std::string::npos != node(core, 1).errorDetail->find("member id 7"));
     CHECK(!node(core, 1).commitPosition);
-    CHECK(!node(core, 2).role && node(core, 2).error && std::string::npos != node(core, 2).error->find("/metrics"));
+    CHECK(!node(core, 2).role && "timeout" == node(core, 2).error.value_or(""));
+    CHECK(node(core, 2).errorDetail && std::string::npos != node(core, 2).errorDetail->find("/metrics"));
     CHECK(!node(core, 2).term);
     en::ClusterModel other(en::Flavor::CORE, three());
     other.ingest({ answered("ok\n", coreMetrics(0)), answered(health("FOLLOWER", 3, 1, 1), "nothing here\n"),
                      answered(health("LEADER", 3, 1, 1), coreMetrics(2), 200) },
         1000);
-    CHECK(!node(other, 0).role && node(other, 0).error);
-    CHECK(!node(other, 1).role && node(other, 1).error); // no member id: not confirmed
+    CHECK(!node(other, 0).role && "bad_answer" == node(other, 0).error.value_or(""));
+    CHECK(!node(other, 1).role && "bad_answer" == node(other, 1).error.value_or("")); // no member id: not confirmed
     CHECK("leader" == node(other, 2).role.value_or(""));
 }
 
@@ -421,6 +427,7 @@ TEST(engine_null_fields)
     for (const json::value &r : h.at("core").at("nodes").as_array())
     {
         CHECK(r.at("entriesBehind").is_null() && r.at("version").is_null() && r.at("buildCommit").is_null());
+        CHECK(r.at("error").is_null());
         CHECK(r.at("snapshot").at("stateHash").is_null() && r.at("snapshot").at("agreement").is_null());
         CHECK(8192 == r.at("snapshot").at("position").as_int64());
     }
@@ -713,7 +720,8 @@ TEST(engine_poller_reads_each_node_itself)
             CHECK(2048 == rows[0].at("snapshot").at("position").as_int64());
             CHECK("unreachable" == rows[1].at("role").as_string());
             CHECK("unreachable" == rows[2].at("role").as_string());
-            CHECK(std::string::npos != std::string(rows[2].at("error").as_string()).find("within 300 ms"));
+            CHECK("refused" == rows[1].at("error").as_string());
+            CHECK("timeout" == rows[2].at("error").as_string());
         }
         CHECK(static_cast<std::int64_t>(frame.size()) == stats.lastFrameBytes.load());
     }
@@ -727,6 +735,85 @@ TEST(engine_poller_reads_each_node_itself)
     }
     CHECK(0 == statusFrames);
     CHECK(2 == stats.unchanged.load());
+}
+
+// node.error is a code of the fixed set; no host name, address or resolver text reaches a frame (that text is kept in
+// errorDetail for the process log). Every failure kind over real sockets: a refusing port, a name that does not resolve,
+// a node that never answers, a body over the bound, and a node that reports another member id.
+TEST(engine_node_error_names_no_host)
+{
+    FakeNode mute("", "", true);
+    FakeNode big(health("FOLLOWER", 3, 1, 1), coreMetrics(4) + std::string(5000, '#') + "\n");
+    FakeNode foreign(health("FOLLOWER", 3, 1, 1), coreMetrics(7));
+    const std::string secret = "oe-core-secret-host.invalid";
+    st::EnginePollerSettings s;
+    s.coreNodes = { { 0, "127.0.0.1", closedPort() }, { 1, secret, 9701 }, { 2, "127.0.0.1", mute.port() },
+        { 3, "127.0.0.1", big.port() }, { 4, "127.0.0.1", foreign.port() } };
+    s.timeoutMs = 1500; // long enough for the resolver to fail rather than to time out
+    s.frameMinMs = 1;
+    s.maxBodyBytes = 1024;
+    st::EngineRing ring(st::ENGINE_RING_CELLS);
+    st::EngineStats stats;
+    st::EnginePoller poller(s, ring, stats);
+    poller.roundOnce(10'000, 10'000);
+    st::EngineOut out;
+    std::string frame;
+    while (ring.tryPop(out))
+    {
+        if (st::EngineOut::Kind::STATUS == out.kind)
+        {
+            frame = *out.text;
+        }
+    }
+    CHECK(!frame.empty());
+    if (frame.empty())
+    {
+        return;
+    }
+    for (const char *leak : { "secret-host", "127.0.0.1", "resolve", "Connection", "within", "member id", "/metrics",
+             "/health" })
+    {
+        CHECK_MSG(std::string::npos == frame.find(leak), std::string("the frame carries '") + leak + "': " + frame);
+    }
+    CHECK_MSG(std::string::npos == frame.find(secret), "a host name reached the frame: " + frame);
+    CHECK_MSG(std::string::npos == frame.find("127.0.0.1"), "an address reached the frame: " + frame);
+    const json::object f = parsed(frame);
+    const json::array &rows = f.at("core").at("nodes").as_array();
+    CHECK(5 == rows.size());
+    if (5 != rows.size())
+    {
+        return;
+    }
+    const std::vector<std::string> allowed = { "timeout", "refused", "unreachable", "bad_answer", "wrong_member" };
+    for (const json::value &r : rows)
+    {
+        CHECK(r.at("error").is_string());
+        if (r.at("error").is_string())
+        {
+            const std::string code(r.at("error").as_string());
+            CHECK_MSG(allowed.end() != std::find(allowed.begin(), allowed.end(), code), "error is not a code: " + code);
+        }
+    }
+    CHECK("refused" == rows[0].at("error").as_string() && "unreachable" == rows[0].at("role").as_string());
+    // the resolver may fail at once or not within the bound on a box without DNS: either code, never the name
+    CHECK("unreachable" == rows[1].at("error").as_string() || "timeout" == rows[1].at("error").as_string());
+    CHECK("timeout" == rows[2].at("error").as_string());
+    CHECK("bad_answer" == rows[3].at("error").as_string() && rows[3].at("role").is_null());
+    CHECK("wrong_member" == rows[4].at("error").as_string() && rows[4].at("role").is_null());
+}
+
+// The engine frame names the build of the oe-stream that sent it.
+TEST(engine_frame_names_the_stream_build)
+{
+    const en::ClusterModel none(en::Flavor::CORE, {});
+    const en::ClusterModel noneMe(en::Flavor::MATCHING_ENGINE, {});
+    const json::object f = parsed(en::engineFrame(none, noneMe, en::BuildIdentity{ "1.2.3", "abc123" }));
+    CHECK("1.2.3" == f.at("stream").at("version").as_string());
+    CHECK("abc123" == f.at("stream").at("buildCommit").as_string());
+    const json::object g = parsed(en::engineFrame(none, noneMe, en::BuildIdentity{}));
+    CHECK(g.at("stream").at("version").is_null() && g.at("stream").at("buildCommit").is_null());
+    const json::object h = parsed(en::engineFrame(none, noneMe));
+    CHECK(h.at("stream").at("version").is_string()); // GW_VERSION ("dev" unless the build names one)
 }
 
 // A body above STREAM_ENGINE_MAX_BODY_BYTES is no answer (the node is not trusted with a half-read body).

@@ -86,6 +86,21 @@ public:
         return answer;
     }
 
+    HistoryAnswer movements(int, const history::PageRequest &request, HistoryPage &out, std::int64_t deadlineNs) override
+    {
+        std::unique_lock<std::mutex> l(mutex);
+        wait(l);
+        calls++;
+        requests.push_back(request);
+        deadlines.push_back(deadlineNs);
+        if (HistoryStatus::OK != answer.status)
+        {
+            return answer;
+        }
+        out = canned;
+        return answer;
+    }
+
     std::string state() const override { return "stub"; }
 
 private:

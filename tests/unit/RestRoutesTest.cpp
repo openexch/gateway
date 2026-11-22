@@ -289,6 +289,8 @@ struct Rig
     int historyThreads = 2;
     std::size_t historyQueue = 64;
     std::unique_ptr<WorkPool> historyPool;
+    StubHistory *money = nullptr; // set before start(): balance movements through this store (the money database)
+    std::unique_ptr<WorkPool> moneyPool;
     std::unique_ptr<Authenticator> auth;
     std::unique_ptr<GatewayApi> api;
     std::unique_ptr<HttpServer> server;
@@ -344,6 +346,12 @@ struct Rig
             d.history = history;
             d.historyPool = historyPool.get();
         }
+        if (nullptr != money)
+        {
+            moneyPool = std::make_unique<WorkPool>("gw-pg-money", 1, 64);
+            d.money = money;
+            d.moneyPool = moneyPool.get();
+        }
         auto asker = [this](session::Command c, std::function<void(const session::Outcome &)> done) {
             if (ringFull.load())
             {
@@ -375,6 +383,10 @@ struct Rig
         {
             historyPool->start();
         }
+        if (moneyPool)
+        {
+            moneyPool->start();
+        }
         server->start();
         port = server->boundPort();
     }
@@ -388,9 +400,17 @@ struct Rig
                 history->hold(false);
             }
             server->stop(5000);
+            if (nullptr != money)
+            {
+                money->hold(false);
+            }
             if (historyPool)
             {
                 historyPool->stop(5000);
+            }
+            if (moneyPool)
+            {
+                moneyPool->stop(5000);
             }
             corePool->stop(5000);
             hashPool->stop(5000);
@@ -1453,4 +1473,67 @@ TEST(routes_history_never_blocks_the_core_completion)
     stub.hold(false);
     reader.join();
     CHECK_MSG(200 == held.status, what(held));
+}
+
+// GET /balances/movements: read from the money store only (a history store never stands in for it), the caller's
+// own rows (the user comes from the credential, never the request), the asset filter and cursor checked before any
+// read, the asset codes of the core config handed to the renderer.
+TEST(routes_balance_movements)
+{
+    {
+        // no money database: 503 MOVEMENTS_UNAVAILABLE, even with a history store at hand
+        StubHistory hist;
+        Rig rig;
+        rig.history = &hist;
+        rig.start();
+        HttpResult r = rig.call("GET", "/api/v2/balances/movements", "", as(7));
+        CHECK_MSG(503 == r.status && str(body(r), "code") == "MOVEMENTS_UNAVAILABLE" && !r.headers["retry-after"].empty(),
+            what(r));
+        CHECK_MSG(0 == hist.calls.load(), "the history store answered a movements read");
+    }
+    StubHistory money;
+    Rig rig;
+    rig.g.historyLimitMax = 50;
+    rig.money = &money;
+    rig.start();
+    history::Filter usd;
+    usd.assetId = 0;
+    const std::vector<std::pair<std::string, std::string>> bad = {
+        { "/api/v2/balances/movements?limit=0", "limit" },
+        { "/api/v2/balances/movements?limit=51", "limit" },
+        { "/api/v2/balances/movements?assetId=-1", "assetId" },
+        { "/api/v2/balances/movements?assetId=01", "assetId" },
+        { "/api/v2/balances/movements?assetId=x", "assetId" },
+        { "/api/v2/balances/movements?userId=8", "userId" },
+        { "/api/v2/balances/movements?marketId=1", "marketId" },
+        { "/api/v2/balances/movements?cursor=" + cursorFor(history::Kind::FILLS), "another route" },
+        { "/api/v2/balances/movements?assetId=1&cursor=" + cursorFor(history::Kind::MOVEMENTS, usd), "another filter" },
+    };
+    for (const auto &[target, why] : bad)
+    {
+        const HttpResult r = rig.call("GET", target, "", as(7));
+        CHECK_MSG(400 == r.status && str(body(r), "code") == "VALIDATION", target + " (" + why + "): " + what(r));
+    }
+    CHECK_MSG(0 == money.calls.load(), "a refused request reached the store");
+    CHECK(401 == rig.call("GET", "/api/v2/balances/movements").status);
+    CHECK(405 == rig.call("POST", "/api/v2/balances/movements", "{}", as(7)).status);
+
+    money.canned.items = { R"({"journalSeq":4,"legNo":1})", R"({"journalSeq":2,"legNo":0})" };
+    money.canned.nextCursor = "NEXT";
+    const HttpResult r = rig.call("GET", "/api/v2/balances/movements?assetId=0&limit=2&cursor=" +
+        cursorFor(history::Kind::MOVEMENTS, usd), "", as(7));
+    CHECK_MSG(200 == r.status, what(r));
+    const json::object b = body(r);
+    CHECK_MSG(b.at("items").as_array().size() == 2 && str(b, "nextCursor") == "NEXT" && !b.contains("asOf"), what(r));
+    CHECK(1 == money.requests.size());
+    if (1 == money.requests.size())
+    {
+        const history::PageRequest &q = money.requests[0];
+        CHECK(history::Kind::MOVEMENTS == q.kind && 7 == q.userId && 0 == q.filter.assetId && 2 == q.limit && q.after);
+        CHECK_MSG(!q.assetCodes.empty(), "the asset codes of the core config were not handed to the renderer");
+    }
+    // the database cannot answer: one 503 MOVEMENTS_UNAVAILABLE
+    money.answer = HistoryAnswer{ HistoryStatus::UNAVAILABLE, HistoryCause::UNREACHABLE };
+    const HttpResult down = rig.call("GET", "/api/v2/balances/movements", "", as(7));
+    CHECK_MSG(503 == down.status && str(body(down), "code") == "MOVEMENTS_UNAVAILABLE", what(down));
 }

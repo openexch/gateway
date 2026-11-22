@@ -130,7 +130,7 @@ The full client reference (every route, body, status code, error string, stream 
 - Public: `GET /markets` and `GET /status`.
 - Orders: `POST /orders` (`Idempotency-Key` required), `GET /orders?marketId=`, `GET|PUT|DELETE /orders/{orderId}`,
   `POST /orders/cancel` (`{orderIds}` or `{all:true}`, at most `GATEWAY_BULK_CANCEL_MAX` per request).
-- `GET /balances`.
+- `GET /balances`, and `GET /balances/movements?assetId=&limit=&cursor=` (see Balance movements below).
 - `POST /balances/deposit|withdraw`: only with the treasury lane, otherwise 404 FEATURE_DISABLED.
 - History: `GET /orders/history?limit=&cursor=&marketId=&status=` and `GET /fills?limit=&cursor=&marketId=&orderId=`,
   and `GET /orders/{orderId}` for an order that is no longer open (see History below).
@@ -153,6 +153,13 @@ has CREATEROLE; otherwise create it first (`CREATE ROLE oe_history_reader NOLOGI
 and names the role. They are read when `GATEWAY_PG_URL` is set, on `GATEWAY_PG_HISTORY_POOL` read-only connections of
 their own with their own queue (sized by `GATEWAY_PG_QUEUE`), so a history storm never takes a connection from login.
 No order-path request touches PostgreSQL.
+
+Balance movements. `GET /balances/movements` reads the core money database, never the history projection: the one
+view `gateway_balance_movements_v1` (reference copy `sql/money_read_contract_v1.sql`), which the core projector's
+migration V002 creates with the role `oe_money_reader` (SELECT on that view only). Make the gateway's login role for
+that database a member (`GRANT oe_money_reader TO <gateway role>`) and set `GATEWAY_MONEY_PG_URL`; it is read on
+`GATEWAY_PG_MONEY_POOL` (2) read-only connections with a queue of their own. Unset, the route answers 503
+MOVEMENTS_UNAVAILABLE; no other database stands in for it. Display only: nothing replays settlement from it.
 
 - Pages are `{items, nextCursor, asOf:{ageMs, stale, eventSeq}}`, newest first, keyset only: send `nextCursor` back unchanged with the
   same filters (a cursor from another route or filter is 400). `nextCursor: null` is the last page. `limit` defaults

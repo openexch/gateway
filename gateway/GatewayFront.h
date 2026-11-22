@@ -17,8 +17,9 @@
 
 // GatewayFront - oe-gateway's public side as the process shell runs it (FrontWork): the REST listener
 // (GATEWAY_HTTP_BIND, gw-io-<n>), the password hash pool (gw-hash-<n>, demo mode), the users store pool
-// (gw-pg-auth-<n>, demo mode), the history pool (gw-pg-hist-<n>, with GATEWAY_PG_URL; its own connections) and the
-// duty bridge's completion thread (gw-done). None of them is the duty thread, and
+// (gw-pg-auth-<n>, demo mode), the history pool (gw-pg-hist-<n>, with GATEWAY_PG_URL; its own connections), the money
+// pool (gw-pg-money-<n>, with GATEWAY_MONEY_PG_URL; its own connections to the core money database) and the duty
+// bridge's completion thread (gw-done). None of them is the duty thread, and
 // the duty thread waits on none of them.
 
 namespace openexchange { namespace gateway {
@@ -46,6 +47,8 @@ private:
     std::unique_ptr<WorkPool> m_hashPool;
     std::unique_ptr<PgHistoryStore> m_history;
     std::unique_ptr<WorkPool> m_historyPool;
+    std::unique_ptr<PgHistoryStore> m_money;
+    std::unique_ptr<WorkPool> m_moneyPool;
     std::unique_ptr<Authenticator> m_auth;
     std::unique_ptr<GatewayApi> m_api;
     std::unique_ptr<HttpServer> m_server;

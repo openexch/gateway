@@ -157,6 +157,8 @@ struct GatewaySettings
     std::vector<std::string> corsOrigins;
     std::int64_t pgHistoryPool = 4;
     std::int64_t pgAuthPool = 2;
+    std::optional<std::string> moneyPgUrl; // the core money database (balance movements); unset: those reads are 503
+    std::int64_t pgMoneyPool = 2;
     std::int64_t pgStatementTimeoutMs = 2000;
     std::int64_t pgQueue = 64;
     std::int64_t pgRetryMs = 1000;

@@ -31,7 +31,9 @@ on the admin bind lists every setting in force with its source. The values in th
 - **CORS.** Only origins listed in `GATEWAY_CORS_ORIGINS` (default: none) get `Access-Control-Allow-Origin`. A
   preflight (`OPTIONS`) from a listed origin answers 204 with `Access-Control-Allow-Methods: GET, POST, PUT, DELETE`,
   `Access-Control-Allow-Headers: Authorization, Content-Type, Idempotency-Key, X-API-Key` and
-  `Access-Control-Max-Age: 600`; from any other origin it answers 403 `FORBIDDEN` "origin not allowed".
+  `Access-Control-Max-Age: 600`; from any other origin it answers 403 `FORBIDDEN` "origin not allowed". Every answer
+  to a listed origin also carries `Access-Control-Expose-Headers: Retry-After`, so a browser can read the Retry-After
+  of a 429 or 503.
 - **Order of checks.** A request is validated (query, body, fields, order shape, `Idempotency-Key`) before its
   credential is checked. A malformed request therefore answers 400 even without a credential.
 
@@ -78,7 +80,8 @@ Every 429 and every 503 from `oe-gateway` carries `Retry-After` in whole seconds
 | 503 | `AUTH_BUSY` | The password hashing queue or the users store queue is full. |
 | 503 | `IDENTITY_STORE_INCONSISTENT` | Registration refused: the users store handed out a userId the core already knows. |
 | 503 | `HISTORY_UNAVAILABLE` | The history projection cannot answer, or an order is not projected yet. |
-| 503 | `HISTORY_BUSY` | Too many history reads at once. |
+| 503 | `HISTORY_BUSY` | Too many history reads at once (balance movements included). |
+| 503 | `MOVEMENTS_UNAVAILABLE` | Balance movements are not served: this gateway does not read the money database, or that database cannot answer now. |
 | 504 | `OUTCOME_UNKNOWN` | The command was offered to the core and no answer came before `GATEWAY_REQUEST_TIMEOUT_MS` (5000). It may have been applied. |
 
 ## 2. Authentication
@@ -557,8 +560,8 @@ not both`, `must be a non-empty array of order ids`, `must hold decimal strings`
 
 `GET /api/v2/orders/history`, `GET /api/v2/fills` , `GET /api/v2/orders/{orderId}/trail` and the not-open case of `GET /api/v2/orders/{orderId}` read the
 history projection, a PostgreSQL read model written by a separate projector. They are served when `GATEWAY_PG_URL` is
-set and the projection's relations exist; otherwise they answer 503 `HISTORY_UNAVAILABLE`. No order or balance route
-touches PostgreSQL.
+set and the projection's relations exist; otherwise they answer 503 `HISTORY_UNAVAILABLE`. No order route touches
+PostgreSQL; of the balance routes only `GET /api/v2/balances/movements` does, on a database of its own (4.7).
 
 | Route | Query parameters | Items, newest first |
 |---|---|---|
@@ -607,7 +610,7 @@ of another order or route is 400). Answer `{orderId, items, nextCursor, asOf}`; 
 | `eventSeq` | the core's event sequence (integer) |
 | `event`, `status` | the record's kind (`ACCEPTED`, `DISPATCHED`, `ACK_NEW`, `FILL`, `CANCELLED`, ...) and the order's status after it |
 | `coreLogPosition` | core log position of the entry that applied it (integer) |
-| `me` | `{epoch, logPosition, journalSeq}` of the matching-engine record that caused it (`epoch` a string, the others integers), or null |
+| `me` | `{epoch, egressSeq, journalSeq, at}` of the matching-engine record that caused it, or null: `epoch` (a string) the matching engine's genesis, `egressSeq` its egress sequence of that record, `journalSeq` its journal sequence, `at` its time in matching-engine cluster time (ms); the three are integers |
 | `liquidity` | `TAKER`, `MAKER` or null |
 | `tradeId`, `lastPrice`, `lastQty` | the trade, or null when the record has none |
 | `holdRemaining`, `at` | the hold left after the record; core cluster time (ms) |
@@ -635,6 +638,45 @@ Every asset in the core config, zero balances included, read from the core.
 ```
 
 Read cache as for `GET /orders`. Errors: 4.1, 4.2.
+
+#### GET /api/v2/balances/movements
+
+What the caller's balances did, newest first: one item per balance change the core journalled for the caller (a
+deposit, a withdrawal, each side of a trade's settlement, the opening balance). Read from the core money database
+through a read-only view, never from the core and never from the history projection. Display only: the balances of
+`GET /api/v2/balances` are the authority.
+
+Query: `assetId` (an asset id, `"0"` included; absent = every asset), `limit` (as 4.6), `cursor` (keyset, bound to
+`assetId`; a cursor of another route or another `assetId` is 400). Answer `{items, nextCursor}`; there is no `asOf`.
+
+```json
+{"items":[{"journalSeq":4,"legNo":1,"logPosition":51234816,"kind":"settle","assetId":"0","asset":"USD",
+           "delta":"-200","balanceAfter":"800","at":1763373601200,"tradeId":"500231","marketId":"1"},
+          {"journalSeq":2,"legNo":0,"logPosition":51200000,"kind":"deposit","assetId":"1","asset":"BTC",
+           "delta":"5","balanceAfter":"5","at":1763373500000,"tradeId":null,"marketId":null}],
+ "nextCursor":"bTF8..."}
+```
+
+| Field | Meaning |
+|---|---|
+| `journalSeq`, `legNo` | the core money journal's sequence of the movement and the leg within it (integers); together unique, the paging key |
+| `logPosition` | core log position of the entry that produced the movement (integer) |
+| `kind` | `opening`, `deposit`, `withdrawal` or `settle` |
+| `assetId`, `asset` | the asset (id as a string) and its code from the core config (null when the config does not name it) |
+| `delta` | the signed change of the asset's total (available + locked), a decimal string (`"-200"`, `"5"`) |
+| `balanceAfter` | the asset's total after the movement, a decimal string |
+| `at` | core cluster time of the movement (ms), null for `opening` |
+| `tradeId`, `marketId` | the trade and its market for `settle`, else null |
+
+`delta` of a deposit or withdrawal is the journalled amount; for an opening leg it is `balanceAfter` minus the previous
+`balanceAfter` of the same asset for the caller (0 before the first); for a settle leg it is `balanceAfter` minus the
+previous `balanceAfter` of the same asset, and null when no earlier leg is kept (age retention may have deleted it). A trade between two orders of the
+same user has two legs per asset, one per side.
+
+Errors: 400 `VALIDATION` (as 4.6); 503 `MOVEMENTS_UNAVAILABLE` when the gateway has no `GATEWAY_MONEY_PG_URL` (detail
+`this gateway does not read the money database`) or that database cannot answer (Retry-After
+`GATEWAY_HISTORY_RETRY_AFTER_MS`, 60000); 503 `HISTORY_BUSY` when the read queue is full. A read takes one token of
+the caller's bucket.
 
 ## 5. User stream: `/ws/v2`
 
@@ -698,7 +740,7 @@ Every server frame has `type`. Ids and money follow section 1; `eventSeq` is a J
 | `pong` | `{"type":"pong","eventSeq":88230}` | answer to `ping`; `eventSeq` is `null` while no event channel is live or a resume is pending |
 | `resync` | `{"type":"resync","reason":"EVENT_GAP"}` | the stream cannot continue the sequence (5.5) |
 | `error` | `{"type":"error","code":"VALIDATION","error":"unknown channel (orders, fills, balances)"}` | a refused client frame; codes `VALIDATION`, `OVERLOADED`, `FEATURE_DISABLED` |
-| `engine` | `{"type":"engine","core":{...},"matchingEngine":{...},"bridge":{...}}` | on connect and on change, at most once per `STREAM_ENGINE_FRAME_MIN_MS` (1000); display telemetry, not user data |
+| `engine` | `{"type":"engine","core":{...},"matchingEngine":{...},"bridge":{...},"stream":{...}}` | on connect and on change, at most once per `STREAM_ENGINE_FRAME_MIN_MS` (1000); display telemetry, not user data |
 | `election` | `{"type":"election","cluster":"core","phase":"start",...}` | a leader election seen by the engine poller (`phase` `start` or `end`) |
 
 Order rows in an `order` frame carry `hold.remaining` and no `displayQuantity`, `expiresAt` or `budget`. Rows in an
@@ -715,7 +757,22 @@ alone sends no snapshot; fills flow from the next event.
 `engine` frame fields: `core` and `matchingEngine` each hold `{configured, term, leaderId, nodes:[{id, role, live,
 recovery, term, commitPosition, appliedPosition, behindBytes, entriesBehind, snapshot:{position, atMs, stateHash,
 agreement}, version, buildCommit, error}], lastElection, snapshot:{position, atMs, agreement, divergedNodes}}`;
-`bridge` is `{consumedJournalSeq, meJournalSeq, entriesBehind}`. Fields with no source are `null`. `election` start
+`bridge` is `{consumedJournalSeq, meJournalSeq, entriesBehind}`; `stream` is `{version, buildCommit}`, the build of
+the oe-stream instance that sent the frame (the values its `--version` prints). Fields with no source are `null`.
+
+A node's `error` is `null` or one code of a fixed set; the frame never carries the text behind it (that names hosts and
+addresses and stays in the oe-stream process log, one line each time a node's reason changes):
+
+| `error` | Meaning |
+|---|---|
+| `timeout` | no answer within `STREAM_ENGINE_POLL_TIMEOUT_MS` (a name lookup still running included) |
+| `refused` | the node's address refused the connection (no process listening) |
+| `unreachable` | the name did not resolve, there is no route, or the connection broke |
+| `bad_answer` | an answer that is not a node probe: over `STREAM_ENGINE_MAX_BODY_BYTES` or unreadable, `/metrics` not 200, `/health` without a role or with an unknown one, no member id |
+| `wrong_member` | the endpoint reports another member id than the one configured for it |
+
+`role` is `unreachable` when neither `/health` nor `/metrics` answered; when only one answered, `role` is `null` and
+`error` is the code of the request that failed. `election` start
 frames carry `atMs, previousTerm, previousLeaderId, lastCommitPosition, candidates`; end frames carry `atMs,
 previousTerm, previousLeaderId, term, leaderId, firstEntryPosition, durationMs, observedGapMs, orderEntryReopened`.
 
@@ -783,7 +840,8 @@ connection is closed with code 4001 (`RESYNC`): nothing is dropped silently. Rec
 | `GATEWAY_MAX_CONNECTIONS` | 2000 | HTTP connections per instance; above, closed at accept |
 | `GATEWAY_HTTP_IDLE_TIMEOUT_MS` | 60000 | idle keep-alive connection closed |
 | `GATEWAY_HISTORY_LIMIT_DEFAULT`, `GATEWAY_HISTORY_LIMIT_MAX` | 100, 1000 | history page size |
-| `GATEWAY_PG_QUEUE`, `GATEWAY_PG_STATEMENT_TIMEOUT_MS` | 64, 2000 | history queue and deadline |
+| `GATEWAY_PG_QUEUE`, `GATEWAY_PG_STATEMENT_TIMEOUT_MS` | 64, 2000 | history queue and deadline (each pool's queue: history, money) |
+| `GATEWAY_MONEY_PG_URL`, `GATEWAY_PG_MONEY_POOL` | unset, 2 | the core money database for `GET /balances/movements`, and its connections; unset: 503 `MOVEMENTS_UNAVAILABLE` |
 | `GATEWAY_REGISTER_RATE`/`_BURST`, `GATEWAY_LOGIN_RATE`/`_BURST`, `GATEWAY_AUTH_SOURCE_RATE`/`_BURST` | 1/s 5, 10/s 20, 10/min 10 | register and login |
 | `GATEWAY_TOKEN_LOOKUP_RATE`/`_BURST` | 60/min, 20 | unknown bearer tokens per source |
 | `GATEWAY_FAUCET_RATE`, `GATEWAY_FAUCET_MAX_AMOUNT` | 1/s, per asset | treasury lane |
@@ -898,7 +956,7 @@ of `config`, `storage` and `treasuryLane`. Secrets in `settings` are redacted.
 
 Prometheus text, prefix `gateway_` or `stream_`. Among them: `requests_total{route,code}`, `principal_rate_limited_total`,
 `read_cache_hits_total`, `cancel_reoffered_not_open_total`, `outcome_unknown_total`, `reoffers_total`,
-`late_replies_total`, `history_reads_total{query,result,cause}` (query adds `trail`; causes add `epoch`, `stale`), `history_age_ms`, `user_id_conflict_total`, `inflight`, `ready`,
+`late_replies_total`, `history_reads_total{query,result,cause}` (query adds `trail` and `movements`; causes add `epoch`, `stale`), `history_age_ms`, `user_id_conflict_total`, `inflight`, `ready`,
 `ready_condition{name}`; for the stream `resync_total{reason}`, `ws_closed_total{code}`, `ws_closed_at_bound_total`,
 `ws_queue_high_water`, `watermark`, `window_first_seq`, `users_cached`.
 
@@ -930,3 +988,21 @@ Prometheus text, prefix `gateway_` or `stream_`. Among them: `requests_total{rou
 | `OMS_CORS_ORIGINS=*` allowed | explicit origins only | |
 | `/health`, `/ready`, `/metrics` on the public port | admin bind only; `/api/v2/status` is public | |
 | money accepted as a JSON number | strings only | |
+
+## 10. Market data trades (`oe-marketdata`)
+
+The public market data WebSocket of `oe-marketdata` sends trades in `TRADES_BATCH` frames: the recent tape on
+subscribe, then each flush of live trades. Every entry of `trades` has the same shape in both:
+
+```json
+{"tradeId":"105","journalSeq":210,"price":"15002","quantity":"0.05","tradeCount":1,"side":"BUY","timestamp":1700000140000}
+```
+
+| Field | Meaning |
+|---|---|
+| `tradeId` | the trade's id (a string) |
+| `journalSeq` | the matching engine's journal sequence of the trade record (a JSON integer); the same trade always carries the same value, on the tape and live |
+| `price`, `quantity` | decimal strings |
+| `tradeCount` | always 1 |
+| `side` | the taker's side, `BUY` or `SELL` |
+| `timestamp` | the trade's time in the matching engine's journal (ms) |
