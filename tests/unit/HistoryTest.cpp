@@ -273,13 +273,15 @@ TEST(history_movements_statement_cursor_and_item)
     CHECK_MSG(movementJson(opening, codes, json, key, problem), problem);
     CHECK_MSG(json == R"({"journalSeq":1,"legNo":0,"logPosition":100,"kind":"opening","assetId":"9","asset":null,)"
         R"("delta":"1000","balanceAfter":"1000","at":null,"tradeId":null,"marketId":null})", json);
-    // no asset (a market the money database cannot name) or no delta: not the contract's shape, never a guess
+    // no asset (a market the money database cannot name): not the contract's shape, never a guess
     Row bad = settle;
     bad[4] = std::nullopt;
     CHECK_MSG(!movementJson(bad, codes, json, key, problem) &&
             problem == "column asset_id is NULL (row journal_seq 4, leg_no 1)", problem);
     problem.clear();
-    bad = settle;
-    bad[5] = std::nullopt;
-    CHECK(!movementJson(bad, codes, json, key, problem) && std::string::npos != problem.find("delta is NULL"));
+    // no delta (a settle whose earlier leg age retention deleted): served as null, never as a guessed number
+    Row gone = settle;
+    gone[5] = std::nullopt;
+    CHECK_MSG(movementJson(gone, codes, json, key, problem), problem);
+    CHECK_MSG(std::string::npos != json.find(R"("delta":null,"balanceAfter":"800")"), json);
 }

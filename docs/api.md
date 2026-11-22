@@ -668,8 +668,9 @@ Query: `assetId` (an asset id, `"0"` included; absent = every asset), `limit` (a
 | `at` | core cluster time of the movement (ms), null for `opening` |
 | `tradeId`, `marketId` | the trade and its market for `settle`, else null |
 
-`delta` of a deposit or withdrawal is the journalled amount; for a settle or an opening leg it is `balanceAfter` minus
-the previous `balanceAfter` of the same asset for the caller (0 before the first). A trade between two orders of the
+`delta` of a deposit or withdrawal is the journalled amount; for an opening leg it is `balanceAfter` minus the previous
+`balanceAfter` of the same asset for the caller (0 before the first); for a settle leg it is `balanceAfter` minus the
+previous `balanceAfter` of the same asset, and null when no earlier leg is kept (age retention may have deleted it). A trade between two orders of the
 same user has two legs per asset, one per side.
 
 Errors: 400 `VALIDATION` (as 4.6); 503 `MOVEMENTS_UNAVAILABLE` when the gateway has no `GATEWAY_MONEY_PG_URL` (detail

@@ -497,7 +497,7 @@ bool movementJson(const Row &row, const std::map<std::int32_t, std::string> &ass
     const std::int64_t logPosition = r.number(2, "log_position");
     const std::string kind = r.text(3, "kind");
     const std::int64_t assetId = r.number(4, "asset_id");     // NULL: a settle of a market the database cannot name
-    const std::int64_t delta = r.number(5, "delta");
+    const auto delta = r.optNumber(5, "delta");     // NULL: a settle whose earlier leg is gone; never guessed
     const std::int64_t balanceAfter = r.number(6, "balance_after");
     const auto at = r.optNumber(7, "at_ms");
     const auto tradeId = r.optNumber(8, "trade_id");
@@ -518,7 +518,7 @@ bool movementJson(const Row &row, const std::map<std::int32_t, std::string> &ass
     json += ",\"kind\":" + api::quote(kind);
     json += ",\"assetId\":" + id(assetId);
     json += ",\"asset\":" + (code == assetCodes.end() ? std::string("null") : api::quote(code->second));
-    json += ",\"delta\":" + money(delta);
+    json += ",\"delta\":" + (delta ? money(*delta) : std::string("null"));
     json += ",\"balanceAfter\":" + money(balanceAfter);
     json += ",\"at\":" + (at ? std::to_string(*at) : std::string("null"));
     json += ",\"tradeId\":" + (tradeId ? id(*tradeId) : std::string("null"));

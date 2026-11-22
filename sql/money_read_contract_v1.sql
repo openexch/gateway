@@ -21,7 +21,7 @@ CREATE TABLE gateway_balance_movements_v1 (
     log_position    BIGINT      NOT NULL,                   -- the core log position of the entry that produced it
     kind            TEXT,                                   -- opening, deposit, withdrawal, settle
     asset_id        INTEGER,                                -- NULL only for a settle of a market the database lacks
-    delta           BIGINT,                                 -- signed change of available + locked; NULL with asset_id
+    delta           BIGINT,                                 -- signed change of available + locked; NULL with asset_id, or a settle with no earlier leg kept
     balance_after   BIGINT      NOT NULL,                   -- available + locked after the movement
     at_ms           BIGINT,                                 -- NULL for opening
     trade_id        BIGINT,                                 -- settle only
