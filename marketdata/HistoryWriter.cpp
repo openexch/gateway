@@ -72,9 +72,19 @@ bool HistoryWriter::open()
     m_ledger.connected.store(true, std::memory_order_release);
     if (!m_statePublished)
     {
+        // the live path's start, on the connection that holds the writer lock: nothing committed since md_state
+        MarketSeed seed;
+        const std::int64_t nowMs = arrivalClockMs ? arrivalClockMs() : 0;
+        if (!readSeed(m_conn, m_settings.pg.statementTimeoutMs, m_settings.markets, m_settings.recentTrades,
+                m_settings.candleHistory, nowMs, seed, error))
+        {
+            m_conn.close();
+            failed("reading the recent tape and candles: " + error);
+            return false;
+        }
         std::fprintf(stderr, "oe-marketdata: market history: %s; writer lock held; md_state: %s\n", detail.c_str(),
             stateText(state).c_str());
-        m_ledger.publishState(state);
+        m_ledger.publishState(state, std::move(seed));
         m_statePublished = true;
     }
     m_lastOpen = state;

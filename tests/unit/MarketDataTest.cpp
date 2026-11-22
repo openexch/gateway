@@ -24,6 +24,7 @@
 
 #include "BookCore.h"
 #include "MarketDataSettings.h"
+#include "MdLiveRig.h"
 
 // the engines' golden corpus of the verified cluster-tools tree (GoldenMatch.java)
 #include "golden_frames.inc"
@@ -343,7 +344,22 @@ std::vector<Captured> sampleFrames()
     rig.egress(JAVA_BOOK_SNAPSHOT_EMPTY);
     rig.core.ping(1);
     rig.core.badRequest(1, "unknown action 'x'");
-    return client->frames;
+    std::vector<Captured> out = client->frames;
+    // the trade side: the handshake TICKERS, the initial state, a flush and a TICKERS change
+    mdlive::LiveRig live;
+    live.egress(JAVA_CLUSTER_HEARTBEAT_V12);
+    live.egress(JAVA_BOOK_SNAPSHOT_20x20);
+    live.start(mdlive::seedTrades());
+    auto c = live.open(1);
+    live.core.subscribe(1, 3, live.now);
+    live.live(mdlive::trade(105, 3, 1'500'200'000'000, 5'000'000, true, mdlive::T0 + 100'000));
+    live.cycle(25);
+    live.cycle(1000);
+    for (const mdlive::Seen &f : c->frames)
+    {
+        out.push_back({ f.text, f.type });
+    }
+    return out;
 }
 
 }
@@ -805,6 +821,68 @@ TEST(md_frame_shapes)
         {
             CHECK(isNum(o, "timestamp"));
         }
+        else if ("TRADES_BATCH" == type)
+        {
+            CHECK(isNum(o, "marketId") && isNum(o, "timestamp") && o.contains("trades") && o.at("trades").is_array());
+            for (const json::value &t : o.at("trades").as_array())
+            {
+                const json::object &to = t.as_object();
+                CHECK_MSG(isDec(to, "price") && isDec(to, "quantity"), "price is not a decimal string");
+                CHECK(isDec(to, "tradeId") && isNum(to, "timestamp") && isNum(to, "tradeCount") &&
+                    1 == to.at("tradeCount").as_int64());
+                CHECK(to.contains("side") && ("BUY" == to.at("side").as_string() || "SELL" == to.at("side").as_string()));
+            }
+        }
+        else if ("TICKER_STATS" == type || "TICKERS" == type)
+        {
+            std::vector<json::object> entries;
+            if ("TICKER_STATS" == type)
+            {
+                entries.push_back(o);
+            }
+            else
+            {
+                CHECK(isNum(o, "timestamp") && o.contains("tickers") && o.at("tickers").is_array());
+                for (const json::value &e : o.at("tickers").as_array())
+                {
+                    entries.push_back(e.as_object());
+                    CHECK(!e.as_object().contains("type"));
+                }
+            }
+            for (const json::object &e : entries)
+            {
+                CHECK(isNum(e, "marketId") && isNum(e, "timestamp"));
+                for (const char *k : { "lastPrice", "priceChange", "priceChangePercent", "high24h", "low24h", "volume24h" })
+                {
+                    CHECK_MSG(isDec(e, k), std::string("price is not a decimal string: ") + k);
+                }
+            }
+        }
+        else if ("CANDLE_HISTORY" == type || "CANDLE_UPDATE" == type)
+        {
+            CHECK(isNum(o, "marketId") && o.contains("interval") && o.at("interval").is_string());
+            std::vector<json::object> candles;
+            if ("CANDLE_UPDATE" == type)
+            {
+                CHECK("1m" == o.at("interval").as_string() && o.contains("candle"));
+                candles.push_back(o.at("candle").as_object());
+            }
+            else
+            {
+                for (const json::value &cv : o.at("candles").as_array())
+                {
+                    candles.push_back(cv.as_object());
+                }
+            }
+            for (const json::object &cd : candles)
+            {
+                CHECK(isNum(cd, "time") && isNum(cd, "tradeCount"));
+                for (const char *k : { "open", "high", "low", "close", "volume" })
+                {
+                    CHECK_MSG(isDec(cd, k), std::string("price is not a decimal string: ") + k);
+                }
+            }
+        }
         else if ("ERROR" == type)
         {
             CHECK(o.contains("code") && o.at("code").is_string() && o.contains("message") && o.at("message").is_string());
@@ -818,5 +896,6 @@ TEST(md_frame_shapes)
             CHECK_MSG(false, "unexpected frame type " + type);
         }
     }
-    CHECK((types == std::set<std::string>{ "BOOK_SNAPSHOT", "BOOK_DELTA", "SUBSCRIPTION_CONFIRMED", "PONG", "ERROR" }));
+    CHECK((types == std::set<std::string>{ "BOOK_SNAPSHOT", "BOOK_DELTA", "SUBSCRIPTION_CONFIRMED", "PONG", "ERROR",
+        "TRADES_BATCH", "TICKER_STATS", "TICKERS", "CANDLE_HISTORY", "CANDLE_UPDATE" }));
 }

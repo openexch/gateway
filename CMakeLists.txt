@@ -212,7 +212,8 @@ target_compile_definitions(oe_projector_app PRIVATE GW_NO_ORDER_ENTRY ${GW_PROJE
 # the trade path's.
 set(GW_MARKETDATA_SOURCES marketdata/MarketDataApp.cpp marketdata/MarketDataSettings.cpp marketdata/BookCore.cpp
     marketdata/BookFrames.cpp marketdata/MdWsServer.cpp marketdata/Candles.cpp marketdata/TradePath.cpp
-    marketdata/MarketHistory.cpp marketdata/HistoryWriter.cpp marketdata/JournalFollow.cpp)
+    marketdata/MarketHistory.cpp marketdata/HistoryWriter.cpp marketdata/JournalFollow.cpp marketdata/TradeCore.cpp
+    marketdata/CandleRoute.cpp)
 add_library(oe_marketdata_app STATIC ${GW_MARKETDATA_SOURCES})
 target_include_directories(oe_marketdata_app PUBLIC marketdata)
 target_link_libraries(oe_marketdata_app PUBLIC gw_common cluster_tools::forwarder_codec cluster_tools::forwarder_domain

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <map>
 #include <sstream>
 
 namespace openexchange { namespace gateway { namespace marketdata {
@@ -487,6 +488,40 @@ bool readCandlesSince(PgConn &conn, std::int64_t timeoutMs, std::int32_t marketI
     for (int i = 0; i < PQntuples(r.get()); ++i)
     {
         out.push_back(candleOf(r.get(), i));
+    }
+    return true;
+}
+
+bool readSeed(PgConn &conn, std::int64_t timeoutMs, const std::vector<int> &markets, std::int64_t recentTrades,
+    std::int64_t candleHistory, std::int64_t nowMs, MarketSeed &out, std::string &error)
+{
+    out = MarketSeed{};
+    for (const int id : markets)
+    {
+        MarketSeed::Market m;
+        m.marketId = id;
+        std::vector<CandleRow> newest;
+        std::vector<CandleRow> window;
+        if (!readRecentTrades(conn, timeoutMs, id, recentTrades, m.tape, error) ||
+            !readCandles(conn, timeoutMs, id, 60, candleHistory, newest, error) ||
+            !readCandlesSince(conn, timeoutMs, id, 60, nowMs - TICKER_WINDOW_MS - 60'000, window, error))
+        {
+            return false;
+        }
+        std::map<std::int64_t, CandleRow> merged;
+        for (const CandleRow &c : newest)
+        {
+            merged[c.bucketStartMs] = c;
+        }
+        for (const CandleRow &c : window)
+        {
+            merged[c.bucketStartMs] = c;
+        }
+        for (auto &kv : merged)
+        {
+            m.candles1m.push_back(kv.second);
+        }
+        out.markets.push_back(std::move(m));
     }
     return true;
 }

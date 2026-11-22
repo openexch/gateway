@@ -24,6 +24,8 @@
 #include <boost/beast/websocket.hpp>
 #include <boost/json.hpp>
 
+#include "CandleRoute.h"
+
 namespace openexchange { namespace gateway { namespace marketdata {
 
 namespace beast = boost::beast;
@@ -159,12 +161,16 @@ private:
 
 struct MdWsServer::Impl
 {
-    Impl(MdWsSettings s, MdCommandRing &c) : settings(std::move(s)), commands(c), acceptor(net::make_strand(ioc)) {}
+    Impl(MdWsSettings s, MdCommandRing &c, CandleRoute *r) :
+        settings(std::move(s)), commands(c), candles(r), acceptor(net::make_strand(ioc))
+    {
+    }
 
     void accept();
 
     MdWsSettings settings;
     MdCommandRing &commands;
+    CandleRoute *candles;
     net::io_context ioc;
     tcp::acceptor acceptor;
     std::uint16_t port = 0;
@@ -209,6 +215,11 @@ private:
             return;
         }
         const auto &req = m_parser->get();
+        if (!websocket::is_upgrade(req) && nullptr != m_impl.candles && CandleRoute::owns(req.target()))
+        {
+            serveRest(req);
+            return;
+        }
         if (!websocket::is_upgrade(req) || "/ws" != req.target())
         {
             m_impl.counters.notFound.fetch_add(1, std::memory_order_relaxed);
@@ -232,6 +243,45 @@ private:
         m_ws.set_option(t);
         m_ws.read_message_max(static_cast<std::size_t>(m_impl.settings.maxFrame));
         m_ws.async_accept(req, beast::bind_front_handler(&WsSession::onAccept, shared_from_this()));
+    }
+
+    // GET /api/candles and its preflight: CandleRoute answers (after a read on md-rest), the answer is written on this
+    // connection's strand, and the connection closes.
+    void serveRest(const http::request<http::empty_body> &req)
+    {
+        std::optional<std::string> origin;
+        if (const auto it = req.find(http::field::origin); req.end() != it)
+        {
+            origin = std::string(it->value());
+        }
+        const unsigned version = req.version();
+        m_impl.candles->handle(std::string(req.method_string()), std::string(req.target()), origin,
+            [self = shared_from_this(), version](RestAnswer answer) {
+                auto shared = std::make_shared<RestAnswer>(std::move(answer));
+                net::post(self->m_ws.get_executor(), [self, version, shared] { self->writeRest(version, *shared); });
+            });
+    }
+
+    void writeRest(unsigned version, const RestAnswer &answer)
+    {
+        auto res = std::make_shared<http::response<http::string_body>>(static_cast<http::status>(answer.status), version);
+        if (!answer.body.empty())
+        {
+            res->set(http::field::content_type, "application/json");
+        }
+        res->set(http::field::cache_control, "no-store");
+        for (const auto &h : answer.headers)
+        {
+            res->set(h.first, h.second);
+        }
+        res->keep_alive(false);
+        res->body() = answer.body;
+        res->prepare_payload();
+        beast::get_lowest_layer(m_ws).expires_after(std::chrono::milliseconds(m_impl.settings.idleMs));
+        http::async_write(beast::get_lowest_layer(m_ws), *res, [self = shared_from_this(), res](beast::error_code, std::size_t) {
+            beast::error_code ignored;
+            beast::get_lowest_layer(self->m_ws).socket().shutdown(tcp::socket::shutdown_both, ignored);
+        });
     }
 
     void onAccept(beast::error_code ec)
@@ -471,8 +521,8 @@ void MdWsServer::Impl::accept()
     });
 }
 
-MdWsServer::MdWsServer(MdWsSettings settings, MdCommandRing &commands) :
-    m_impl(std::make_unique<Impl>(std::move(settings), commands))
+MdWsServer::MdWsServer(MdWsSettings settings, MdCommandRing &commands, CandleRoute *candles) :
+    m_impl(std::make_unique<Impl>(std::move(settings), commands, candles))
 {
 }
 

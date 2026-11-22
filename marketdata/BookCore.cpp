@@ -5,6 +5,8 @@
 
 #include "cluster_tools/adapters/sbe/ForwarderCodec.h"
 
+#include "TradeCore.h"
+
 namespace openexchange { namespace gateway { namespace marketdata {
 
 namespace fwd = cluster_tools::domain::forwarder;
@@ -38,6 +40,11 @@ const char *nameOf(FrameType type) noexcept
         case FrameType::BOOK_DELTA: return "BOOK_DELTA";
         case FrameType::SUBSCRIPTION_CONFIRMED: return "SUBSCRIPTION_CONFIRMED";
         case FrameType::PONG: return "PONG";
+        case FrameType::TRADES_BATCH: return "TRADES_BATCH";
+        case FrameType::TICKER_STATS: return "TICKER_STATS";
+        case FrameType::TICKERS: return "TICKERS";
+        case FrameType::CANDLE_HISTORY: return "CANDLE_HISTORY";
+        case FrameType::CANDLE_UPDATE: return "CANDLE_UPDATE";
         case FrameType::ERROR: break;
         case FrameType::COUNT: break;
     }
@@ -314,21 +321,84 @@ int BookCore::doWork(std::int64_t nowNs)
         }
     }
     m_stats.booksStale.store(stale, std::memory_order_relaxed);
+    return work + tradeWork(nowNs);
+}
+
+int BookCore::tradeWork(std::int64_t nowNs)
+{
+    if (nullptr == m_trades)
+    {
+        return 0;
+    }
+    int work = 0;
+    if (m_trades->takeStart())
+    {
+        // the trade path started: every connection gets a fresh initial state, TICKERS included
+        m_tradesLive = true;
+        for (auto &kv : m_conns)
+        {
+            if (0 != kv.second.market)
+            {
+                initialState(kv.first, kv.second, nowNs);
+            }
+            else
+            {
+                send(kv.second, m_trades->tickers());
+            }
+        }
+        work++;
+    }
+    if (!m_tradesLive)
+    {
+        return work;
+    }
+    for (const auto &out : m_trades->flushDue(nowNs))
+    {
+        emit(out.first, out.second);
+        work++;
+    }
+    if (const std::optional<Frame> tickers = m_trades->tickersDue(nowNs))
+    {
+        for (auto &kv : m_conns)
+        {
+            send(kv.second, *tickers);
+        }
+        work++;
+    }
     return work;
 }
 
 void BookCore::open(std::uint64_t connId, std::shared_ptr<Outlet> outlet)
 {
-    m_conns[connId] = Conn{ std::move(outlet), 0 };
+    Conn &conn = m_conns[connId] = Conn{ std::move(outlet), 0 };
+    if (tradesLive())
+    {
+        send(conn, m_trades->tickers()); // the handshake TICKERS, before any subscribe
+    }
 }
 
 void BookCore::initialState(std::uint64_t, Conn &conn, std::int64_t nowNs)
 {
+    if (!tradesLive())
+    {
+        send(conn, snapshotFrame(conn.market, nowNs, nullptr));
+#ifdef MD_NC_EMPTY_SERIES
+        // control build only (never published): empty series in place of the history the service does not have
+        send(conn, make(renderTradesBatch(conn.market, {}, m_wallClockMs()), FrameType::TRADES_BATCH));
+        send(conn, make(renderCandleHistory(conn.market, "1m", {}), FrameType::CANDLE_HISTORY));
+        return;
+#endif
+        // the trade path has not started (the market history was down at the start): the tape, the candles and the
+        // ticker do not exist, and an empty series is never sent as if it were whole
+        send(conn, make(renderError("HISTORY_UNAVAILABLE", "the market history is not available: no tape, candles or "
+            "ticker", HISTORY_PARTS), FrameType::ERROR));
+        return;
+    }
+    send(conn, m_trades->tickerStats(conn.market));
+    send(conn, m_trades->tickers());
     send(conn, snapshotFrame(conn.market, nowNs, nullptr));
-    // No trade path in this build: the tape, the candles and the ticker do not exist, and an empty series is never sent
-    // as if it were whole.
-    send(conn, make(renderError("HISTORY_UNAVAILABLE", "the market history is not available: no tape, candles or ticker",
-        HISTORY_PARTS), FrameType::ERROR));
+    send(conn, m_trades->tape(conn.market));
+    send(conn, m_trades->candleHistory(conn.market));
 }
 
 void BookCore::subscribe(std::uint64_t connId, std::int64_t marketId, std::int64_t nowNs)
@@ -405,6 +475,10 @@ void BookCore::resync(std::uint64_t connId, std::int64_t nowNs)
     if (0 != it->second.market)
     {
         initialState(connId, it->second, nowNs);
+    }
+    else if (tradesLive())
+    {
+        send(it->second, m_trades->tickers());
     }
 }
 
