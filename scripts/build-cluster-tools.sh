@@ -26,9 +26,11 @@ BUILD="$CACHE/build-$REF"
     -DWITH_BRIDGE=ON -DBUILD_TESTING=OFF "${CT_ARGS[@]}"
 # The package's targets only (cmake/Package.cmake in the pinned tree; ct_sbe_generate makes the codec headers of the
 # interface target ct_sbe_codecs; archive_aeron and aeron_archive_client, the archive follow library's Aeron side, with
-# WITH_BRIDGE): the binaries and tests are not installed.
+# WITH_BRIDGE; forwarder_domain, forwarder_codec and journal_codec, the book ladder, the book egress decode and the ME
+# journal trade decode oe-marketdata uses): the binaries and tests are not installed.
 "$CMAKE" --build "$BUILD" -j"$JOBS" --target ct_client_core ct_runtime ct_archive_core ct_sbe_generate ct_client_aeron ct_runtime_aeron \
-    aeron_static aeron_driver_static ct_aeron_archive_client ct_archive_aeron
+    aeron_static aeron_driver_static ct_aeron_archive_client ct_archive_aeron ct_forwarder_domain ct_forwarder_codec \
+    ct_journal_codec
 "$CMAKE" --install "$BUILD" --prefix "$PREFIX"
 CONFIG="$PREFIX/lib/cmake/cluster_tools/cluster_toolsConfig.cmake"
 [ -f "$CONFIG" ] || CONFIG=$(find "$PREFIX" -name cluster_toolsConfig.cmake -print -quit)

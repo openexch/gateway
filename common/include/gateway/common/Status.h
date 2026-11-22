@@ -13,6 +13,19 @@
 namespace openexchange { namespace gateway {
 
 inline constexpr std::size_t WIRE_IGNORED_SLOTS = 4; // at least wire::IGNORED_TEMPLATES.size() (CoreSession asserts it)
+// oe-marketdata: one slot per book ladder of the cluster-tools library (markets 1..5, its TICK_MARKETS; the marketdata
+// sources static_assert the two agree)
+inline constexpr std::size_t MD_MARKET_SLOTS = 5;
+
+// oe-marketdata: what readiness needs of one market's book (Readiness.h judges it against the clock and the bounds)
+struct MdMarketStatus
+{
+    bool expected = false;              // in MD_EXPECTED_MARKETS
+    bool snapshot = false;              // a BookSnapshot was applied in the current ME session
+    bool ladderOk = false;              // the ladder is OK (not EMPTY, not BROKEN)
+    bool empty = true;                  // no level on either side
+    std::int64_t lastBookFrameNs = -1;  // monotonic ns of the last book frame the ladder applied; -1 = none this session
+};
 
 struct Status
 {
@@ -50,6 +63,17 @@ struct Status
     bool leaseHeld = false;                // this copy holds the writer lease (a standby does not)
     bool halted = false;                   // a halt is set (none is a latch: re-evaluated continuously)
     std::int64_t lastBeatNs = -1;          // monotonic ns of the last beat this copy committed; -1 = never
+
+    // oe-marketdata: the ME session and the books (the duty thread), the WebSocket side (the admin thread copies it in)
+    bool mdSessionUp = false;              // an ME leader session is open
+    std::int64_t mdLastHeartbeatNs = -1;   // monotonic ns of the last ClusterHeartbeat of this session; -1 = none
+    std::int64_t mdMeEpoch = 0;            // the meEpoch of the last heartbeat (0 = none yet)
+    std::array<MdMarketStatus, MD_MARKET_SLOTS> mdMarkets{};
+    bool mdClientsServed = true;           // no frame waits for a client longer than MD_SEND_STALL_MS
+    bool mdJournalAttached = false;        // the trade path: false until the journal follower exists in this build
+    bool mdJournalFresh = false;
+    bool mdHistoryWritable = false;
+    bool mdHalted = false;
 
     // process
     bool driverConnected = false;          // the Aeron client is connected and the process counter registered; set by

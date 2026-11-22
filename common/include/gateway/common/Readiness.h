@@ -37,6 +37,16 @@
 //   head_probe_fresh    a head probe answered no longer ago than HISTORY_PROJECTOR_HEAD_FRESH_MS
 //   not_halted          no halt is set
 //   beat_fresh          the last beat this copy committed is younger than HISTORY_PROJECTOR_READY_LAG_MS
+// oe-marketdata /ready, all of:
+//   driver_connected    as above
+//   me_session          an ME leader session is open and a ClusterHeartbeat arrived within MD_EGRESS_STALE_MS
+//   book_fresh          every market of MD_EXPECTED_MARKETS (never "the markets seen so far") has a snapshot of this ME
+//                       session, an OK ladder, and either a book frame younger than MD_BOOK_STALE_MS or no level on
+//                       either side with a fresh heartbeat (an emptied book does not turn stale by being quiet)
+//   journal_attached, journal_fresh, history_writable   the trade path (false while this build has no journal follower)
+//   no_halt             no halt of the trade path is set
+//   clients_served      no frame waits for a connected client longer than MD_SEND_STALL_MS
+// oe-marketdata /ready/book: me_session, book_fresh, clients_served. /ready/session: me_session.
 
 namespace openexchange { namespace gateway {
 
@@ -56,6 +66,13 @@ inline constexpr const char *WS_LISTENER = "ws_listener";
 inline constexpr const char *LEASE_HELD = "lease_held";
 inline constexpr const char *NOT_HALTED = "not_halted";
 inline constexpr const char *BEAT_FRESH = "beat_fresh";
+inline constexpr const char *ME_SESSION = "me_session";
+inline constexpr const char *BOOK_FRESH = "book_fresh";
+inline constexpr const char *JOURNAL_ATTACHED = "journal_attached";
+inline constexpr const char *JOURNAL_FRESH = "journal_fresh";
+inline constexpr const char *HISTORY_WRITABLE = "history_writable";
+inline constexpr const char *NO_HALT = "no_halt";
+inline constexpr const char *CLIENTS_SERVED = "clients_served";
 }
 
 struct GatewayReadyBounds
@@ -75,6 +92,26 @@ struct ProjectorReadyBounds
     std::int64_t readyLagMs = 5000;
 };
 
+struct MarketDataReadyBounds
+{
+    std::int64_t egressStaleMs = 10'000; // MD_EGRESS_STALE_MS
+    std::int64_t bookStaleMs = 15'000;   // MD_BOOK_STALE_MS
+};
+
+// The state of one market's book as readiness and the stale flag of the book frames see it (one rule for both).
+enum class MdBookState : std::uint8_t
+{
+    NOT_EXPECTED,
+    FRESH,
+    NO_SNAPSHOT, // no snapshot in this ME session
+    BROKEN,      // the ladder is not OK (a chain break, or emptied by an unversioned snapshot)
+    STALE        // OK, but no book frame within MD_BOOK_STALE_MS while it has levels (or no fresh heartbeat while empty)
+};
+const char *nameOf(MdBookState state) noexcept;
+bool mdHeartbeatFresh(std::int64_t lastHeartbeatNs, std::int64_t nowNs, const MarketDataReadyBounds &bounds) noexcept;
+MdBookState mdBookState(const MdMarketStatus &market, std::int64_t lastHeartbeatNs, std::int64_t nowNs,
+    const MarketDataReadyBounds &bounds) noexcept;
+
 struct Condition
 {
     const char *name;
@@ -86,6 +123,9 @@ std::vector<Condition> gatewayReadyConditions(const Status &s, std::int64_t nowN
 std::vector<Condition> gatewaySessionConditions(const Status &s);
 std::vector<Condition> streamReadyConditions(const Status &s, std::int64_t nowNs, const StreamReadyBounds &bounds);
 std::vector<Condition> projectorReadyConditions(const Status &s, std::int64_t nowNs, const ProjectorReadyBounds &bounds);
+std::vector<Condition> marketDataReadyConditions(const Status &s, std::int64_t nowNs, const MarketDataReadyBounds &bounds);
+std::vector<Condition> marketDataBookConditions(const Status &s, std::int64_t nowNs, const MarketDataReadyBounds &bounds);
+std::vector<Condition> marketDataSessionConditions(const Status &s, std::int64_t nowNs, const MarketDataReadyBounds &bounds);
 
 // The names of the failing ones (empty = ready).
 std::vector<std::string> failing(const std::vector<Condition> &conditions);
