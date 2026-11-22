@@ -28,7 +28,7 @@ REQUIRED = ["MD_DRIVER_MODE", "MD_INSTANCE_ID", "MD_ME_CLUSTER_ADDRESSES", "MD_M
             "MD_JOURNAL_STREAM", "MD_JOURNAL_CHANNEL", "MD_REPLAY_STREAM", "MD_JOURNAL_MTU", "MD_LOCAL_HOST",
             "MD_PUBLIC_BIND", "MD_ADMIN_BIND", "MD_PG_URL", "MD_PG_USER", "MD_PG_PASSWORD_FILE", "MD_CORS_ORIGINS",
             "MD_EXPECTED_MARKETS"]
-# no ME behind it: no session, so no book; the trade path does not exist in this build
+# no ME behind it: no session, so no book; no archive and no market history database: the trade path waits for both
 NOT_READY = ["me_session", "book_fresh", "journal_attached", "journal_fresh", "history_writable"]
 
 
@@ -84,6 +84,7 @@ class Ctx:
             "MD_CORS_ORIGINS": "none",
             "MD_EXPECTED_MARKETS": "1,2,3",
             "MD_DUTY_WATCHDOG_MS": "2000",
+            "MD_ARCHIVE_TIMEOUT_MS": "1000",
         })
         if mode == "embedded":
             env["MD_DRIVER_DIR"] = driver_dir

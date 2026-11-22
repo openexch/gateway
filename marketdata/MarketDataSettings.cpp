@@ -474,6 +474,11 @@ ParseResult<MarketDataSettings> parseMarketDataSettings(const Environment &env, 
     s.wsUnwritableCloseMs = positive(r, "MD_WS_UNWRITABLE_CLOSE_MS", s.wsUnwritableCloseMs);
     s.wsIdleMs = positive(r, "MD_WS_IDLE_MS", s.wsIdleMs);
     s.wsMaxFrame = positive(r, "MD_WS_MAX_FRAME", s.wsMaxFrame);
+    s.archiveTimeoutMs = positive(r, "MD_ARCHIVE_TIMEOUT_MS", s.archiveTimeoutMs);
+    s.sourceBackoffMs = positive(r, "MD_SOURCE_BACKOFF_MS", s.sourceBackoffMs);
+    s.gapRescanMs = positive(r, "MD_GAP_RESCAN_MS", s.gapRescanMs);
+    s.pgStatementTimeoutMs = positive(r, "MD_PG_STATEMENT_TIMEOUT_MS", s.pgStatementTimeoutMs);
+    s.pgRetryMs = positive(r, "MD_PG_RETRY_MS", s.pgRetryMs);
 
     // the process shell
     c.ioThreads = positive(r, "MD_IO_THREADS", c.ioThreads);
@@ -493,6 +498,13 @@ ParseResult<MarketDataSettings> parseMarketDataSettings(const Environment &env, 
         {
             c.embeddedRetryMs = positive(r, key, c.embeddedRetryMs);
         }
+    }
+
+    if (c.dutyWatchdogMs <= s.archiveTimeoutMs)
+    {
+        r.problem(INVALID + std::string("MD_ARCHIVE_TIMEOUT_MS: ") + std::to_string(s.archiveTimeoutMs) +
+            " is not below MD_DUTY_WATCHDOG_MS (" + std::to_string(c.dutyWatchdogMs) + "): an archive control call that "
+            "waits out its timeout would trip the duty watchdog");
     }
 
     r.refuseUnknown({ "MD_" });
