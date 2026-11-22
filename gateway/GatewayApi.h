@@ -59,7 +59,8 @@
 // stop on their own. Nobody gets an old account either way, but the counter is the signal that the runbook step
 // (set demo_user_seq above the highest userId the core knows) was skipped: alert on any rise.
 //
-// CORS: an Origin listed in GATEWAY_CORS_ORIGINS gets Access-Control-Allow-Origin on every answer; a preflight
+// CORS: an Origin listed in GATEWAY_CORS_ORIGINS gets Access-Control-Allow-Origin and Access-Control-Expose-Headers:
+// Retry-After on every answer; a preflight
 // (OPTIONS) from a listed origin is 204 with the allowed methods and headers, from any other origin 403.
 //
 // Test-only controls (never in a published build): GW_NC_HASH_ON_IO runs PBKDF2 on the I/O strand of the request,
@@ -76,6 +77,10 @@ struct ApiDeps
     WorkPool *hashPool = nullptr;   // null without demo mode
     HistoryStore *history = nullptr; // null without GATEWAY_PG_URL: every history read is 503 HISTORY_UNAVAILABLE
     WorkPool *historyPool = nullptr; // gw-pg-hist: GATEWAY_PG_HISTORY_POOL workers over its own GATEWAY_PG_QUEUE
+    // The core money database (GATEWAY_MONEY_PG_URL): balance movements only. Null when unset: that route is 503
+    // MOVEMENTS_UNAVAILABLE, never answered from another database.
+    HistoryStore *money = nullptr;
+    WorkPool *moneyPool = nullptr;   // gw-pg-money: GATEWAY_PG_MONEY_POOL workers over its own GATEWAY_PG_QUEUE
     // Offers one command to the GATEWAY session; false when the command ring is full (nothing queued, `done` never runs).
     std::function<bool(session::Command, std::function<void(const session::Outcome &)>)> askCore;
     // The same for the TREASURY session (Deposit, Withdraw); empty when the treasury lane is off.
@@ -193,6 +198,7 @@ private:
     void cancelOrder(const Ex &ex, std::int64_t orderId);
     void bulkCancel(const Ex &ex);
     void balances(const Ex &ex);
+    void balanceMovements(const Ex &ex);
     void deposit(const Ex &ex);
     void withdraw(const Ex &ex);
     void moneyCommand(const Ex &ex, bool deposit);
@@ -205,8 +211,11 @@ private:
     // Runs `job` on the history pool with the read's one deadline (steady clock ns, stamped now:
     // GATEWAY_PG_STATEMENT_TIMEOUT_MS); false (and 503 HISTORY_BUSY answered) when its queue is full. A job that
     // starts after its deadline is not run: 503 HISTORY_BUSY (its client has waited out the read's time in the queue).
-    bool runHistory(const Ex &ex, const char *route, const char *query, std::function<void(int, std::int64_t)> job);
+    // `pool` null: the history pool; the movements route passes the money pool.
+    bool runHistory(const Ex &ex, const char *route, const char *query, std::function<void(int, std::int64_t)> job,
+        WorkPool *pool = nullptr);
     ApiResponse historyUnavailable(HistoryCause cause, const char *query);
+    ApiResponse movementsUnavailable(HistoryCause cause);
     HistoryExpect historyExpect() const;
     std::string asOfJson(std::int64_t ageMs, std::int64_t eventSeq) const;
     void countHistory(const char *query, const char *result);

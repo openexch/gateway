@@ -51,12 +51,12 @@ HistoryAnswer PgHistoryStore::unavailable(HistoryCause cause, const char *what, 
     {
         if (0 == held)
         {
-            frontLog(FrontLevel::WARN, "history: %s: %s: %s", nameOf(cause), what, detail.c_str());
+            frontLog(FrontLevel::WARN, "%s: %s: %s: %s", m_settings.label.c_str(), nameOf(cause), what, detail.c_str());
         }
         else
         {
-            frontLog(FrontLevel::WARN, "history: %s: %s: %s (%llu similar lines held back)", nameOf(cause), what,
-                detail.c_str(), static_cast<unsigned long long>(held));
+            frontLog(FrontLevel::WARN, "%s: %s: %s: %s (%llu similar lines held back)", m_settings.label.c_str(),
+                nameOf(cause), what, detail.c_str(), static_cast<unsigned long long>(held));
         }
     }
     return HistoryAnswer{ HistoryStatus::UNAVAILABLE, cause };
@@ -335,6 +335,60 @@ HistoryAnswer PgHistoryStore::pageOn(PgConn &c, const history::PageRequest &requ
                                                                                : HistoryStatus::NOT_FOUND,
                 request.filter.orderId > asOf.appliedOrderId ? HistoryCause::LAGGING : HistoryCause::NONE };
         }
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_stateMutex);
+        m_state = "ready";
+    }
+    return HistoryAnswer{ HistoryStatus::OK, HistoryCause::NONE };
+}
+
+HistoryAnswer PgHistoryStore::movements(int worker, const history::PageRequest &request, HistoryPage &out,
+    std::int64_t deadlineNs)
+{
+    return attempt(worker, deadlineNs, [&](PgConn &c) { return movementsOn(c, request, out, deadlineNs); });
+}
+
+HistoryAnswer PgHistoryStore::movementsOn(PgConn &c, const history::PageRequest &request, HistoryPage &out,
+    std::int64_t deadlineNs)
+{
+    HistoryAnswer why;
+    std::int64_t ms = 0;
+    if (history::Kind::MOVEMENTS != request.kind)
+    {
+        return unavailable(HistoryCause::ERROR, "movements page", "asked with another kind of page");
+    }
+    if (!left(deadlineNs, "movements page", ms, why))
+    {
+        return why;
+    }
+    const history::Statement s = history::pageStatement(request);
+    Result r;
+    std::string error;
+    if (Exec::OK != c.exec(s.sql, s.params, ms, r, error))
+    {
+        return failed(c, "movements page", error);
+    }
+    out.ageMs = 0;
+    out.eventSeq = 0;
+    const int rows = PQntuples(r.get());
+    const std::size_t limit = static_cast<std::size_t>(request.limit);
+    history::Key last;
+    out.items.clear();
+    for (int i = 0; i < rows && out.items.size() < limit; ++i)
+    {
+        std::string json;
+        std::string problem;
+        if (!history::movementJson(rowOf(r.get(), i), request.assetCodes, json, last, problem))
+        {
+            return unavailable(HistoryCause::BAD_ROW, "movements page", problem);
+        }
+        out.items.push_back(std::move(json));
+    }
+    out.nextCursor.reset();
+    if (static_cast<std::size_t>(rows) > limit)
+    {
+        out.nextCursor = history::nextCursor(request, last, out.items.size());
     }
     {
         std::lock_guard<std::mutex> lock(m_stateMutex);

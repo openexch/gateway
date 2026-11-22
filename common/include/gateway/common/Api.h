@@ -46,6 +46,7 @@ inline constexpr const char *REJECTED = "REJECTED";
 inline constexpr const char *ADMISSION_CLOSED = "ADMISSION_CLOSED";
 inline constexpr const char *HISTORY_UNAVAILABLE = "HISTORY_UNAVAILABLE";
 inline constexpr const char *HISTORY_BUSY = "HISTORY_BUSY";
+inline constexpr const char *MOVEMENTS_UNAVAILABLE = "MOVEMENTS_UNAVAILABLE";
 }
 
 struct ErrorSpec

@@ -56,10 +56,17 @@
 //   bridge.meJournalSeq         the matching-engine leader's match_engine_next_journal_seq minus one (0 = unbound -> null)
 //   bridge.entriesBehind        meJournalSeq - consumedJournalSeq, sampled from two processes in one round, not at one
 //                               instant (not clamped: it can read negative)
+//   stream.version/buildCommit  this oe-stream's own build (its --version line), the same in every frame it sends. The
+//                               other processes around the core (oe-gateway, oe-marketdata, oe-projector, the bridge)
+//                               report theirs on their own /health; oe-stream does not poll them, so it carries none
 //
 // Node answers. A node whose /health and /metrics both answer, and whose <p>member_id is its configured id, is shown; a
 // node neither of which answers is `unreachable`; anything between (one answer, an unreadable body, another member id)
 // is shown with role null and the reason in `error`, never with values that might be another node's.
+//
+// node.error is one code of a fixed set (node_error below), never free text: the reason a request failed names hosts,
+// addresses and resolver messages, which belong to the operator, not to every subscriber. The full text is kept in
+// NodeView::errorDetail, which is never rendered; EnginePoller writes it to the process log when it changes.
 //
 // Elections. The model remembers the leader and term of the last round that had one. A round in which no node reports
 // itself leader and some node reports itself in an election (role candidate, or recovery=election) is the `start` (the
@@ -76,6 +83,19 @@ namespace openexchange { namespace gateway { namespace stream { namespace engine
 
 // The configured endpoint of one node (STREAM_CORE_NODE_ENDPOINTS, STREAM_ME_NODE_ENDPOINTS; Settings.h).
 using NodeEndpointSpec = gateway::NodeEndpoint;
+
+// The codes node.error carries (the frame never carries the text behind them).
+namespace node_error {
+inline constexpr const char *TIMEOUT = "timeout";           // no answer within STREAM_ENGINE_POLL_TIMEOUT_MS (a name
+                                                            // lookup still running included)
+inline constexpr const char *REFUSED = "refused";           // the address answered the connect with a refusal
+inline constexpr const char *UNREACHABLE = "unreachable";   // the name did not resolve, no route, the connection broke
+inline constexpr const char *BAD_ANSWER = "bad_answer";     // an answer that is not a node probe: a body over the
+                                                            // bound or unreadable, /metrics not 200, /health without a
+                                                            // role, an unknown role, no member id
+inline constexpr const char *WRONG_MEMBER = "wrong_member"; // the endpoint reports another member id than configured
+// One of /health and /metrics answered and the other did not: the code of the request that failed.
+}
 
 struct HealthBody
 {
@@ -107,7 +127,8 @@ struct NodeSample
     bool metricsAnswered = false;
     int metricsStatus = 0;
     std::string metricsBody;
-    std::string error; // why the node was not reached (connect refused, timeout, ...)
+    std::string error;   // why the node was not reached (connect refused, timeout, ...), for the process log only
+    std::string failure; // the node_error code of that reason (empty: none given)
 };
 
 enum class Flavor : std::uint8_t
@@ -137,7 +158,8 @@ struct NodeView
     SnapshotView snapshot;
     std::optional<std::string> version;     // /health version=
     std::optional<std::string> buildCommit; // /health build=
-    std::optional<std::string> error;
+    std::optional<std::string> error;       // a node_error code
+    std::optional<std::string> errorDetail; // the full reason behind `error`: the process log only, never rendered
     // the series the bridge line reads (not rendered per node)
     std::optional<std::int64_t> feedCursor;
     std::optional<std::int64_t> nextJournalSeq;
@@ -205,8 +227,19 @@ private:
 std::optional<std::string> snapshotAgreement(const std::vector<NodeView> &nodes, std::int64_t position,
     std::vector<std::int64_t> &diverged);
 
-// The whole frame: {"type":"engine","core":{...},"matchingEngine":{...},"bridge":{...}}.
-std::string engineFrame(const ClusterModel &core, const ClusterModel &me);
+// What a component says about its own build: its release version and the commit it was built from.
+struct BuildIdentity
+{
+    std::string version;
+    std::string buildCommit;
+};
+
+// This oe-stream's own build (GW_VERSION, GW_SOURCE_SHA: the values its --version and /health report).
+BuildIdentity streamBuild();
+
+// The whole frame: {"type":"engine","core":{...},"matchingEngine":{...},"bridge":{...},"stream":{...}}. `stream` is the
+// build of the oe-stream that sent the frame (empty text renders null).
+std::string engineFrame(const ClusterModel &core, const ClusterModel &me, const BuildIdentity &stream = streamBuild());
 std::string electionFrame(const char *clusterKey, const Election &e);
 
 // The rate cap with change detection: a frame identical to the last one sent is never sent again; a changed frame is

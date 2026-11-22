@@ -28,7 +28,7 @@
 //   PONG           {"type","timestamp"}
 //   ERROR          {"type","code","message"[,"parts":[...]]}
 //   TRADES_BATCH   {"type","marketId","trades":[trade],"timestamp"}
-//   trade          {"tradeId"(dec),"price","quantity","tradeCount":1,"side":"BUY"|"SELL","timestamp"}
+//   trade          {"tradeId"(dec),"journalSeq","price","quantity","tradeCount":1,"side":"BUY"|"SELL","timestamp"}
 //   TICKER_STATS   {"type","marketId","lastPrice","priceChange","priceChangePercent","high24h","low24h","volume24h",
 //                  "timestamp"}
 //   TICKERS        {"type","tickers":[the TICKER_STATS fields without "type"],"timestamp"}
@@ -38,8 +38,9 @@
 //   GET /api/candles body {"marketId","interval","candles":[candle]}
 // Scales: a price, a quantity and a base volume are 10^-8 units (formatMoney); the quote volume (price x quantity) is
 // 10^-16 units and priceChangePercent 10^-8 percent; every one is cut to at most 8 fraction digits toward zero.
-// tradeId is a decimal string (the v2 API's rule for ids); the trade's and the ticker's timestamp are the journal's
-// (ms), the envelope timestamp is the time of sending (ms).
+// tradeId is a decimal string (the v2 API's rule for ids); journalSeq is the matching engine's journal sequence of the
+// trade record (a JSON integer, like every sequence); the trade's and the ticker's timestamp are the journal's (ms), the
+// envelope timestamp is the time of sending (ms).
 
 namespace openexchange { namespace gateway { namespace marketdata {
 

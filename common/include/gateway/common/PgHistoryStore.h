@@ -33,6 +33,9 @@
 // cursor in the same transaction as the rows it covers). The heartbeat is checked (History.h) before any row is read.
 // A trail page with no row of the caller is NOT_FOUND or LAGGING by applied_order_id, read in that same heartbeat.
 //
+// The money database (GATEWAY_MONEY_PG_URL) is read by a second instance of its own (label "money", pool
+// GATEWAY_PG_MONEY_POOL): movements() only, the same connection, deadline, retry and WARN rules, no heartbeat.
+//
 // Test-only controls (never in a published build): GW_NC_NO_EPOCH_CHECK skips the epoch check (history of another
 // genesis is served); GW_NC_ROWS_BEFORE_HEARTBEAT reads the rows first and the heartbeat after them.
 
@@ -44,6 +47,7 @@ struct PgHistorySettings
     int workers = 4;
     std::int64_t statementTimeoutMs = 2000;
     std::int64_t retryMs = 1000;
+    std::string label = "history"; // the word that starts this store's log lines (history, money)
 };
 
 class PgHistoryStore final : public HistoryStore
@@ -57,6 +61,8 @@ public:
     HistoryAnswer order(int worker, std::int64_t userId, std::int64_t orderId, std::string &json,
         HistoryAsOf &asOf, std::int64_t deadlineNs, const HistoryExpect &expect) override;
     HistoryAnswer probe(int worker, HistoryAsOf &out, std::int64_t deadlineNs, const HistoryExpect &expect) override;
+    HistoryAnswer movements(int worker, const history::PageRequest &request, HistoryPage &out,
+        std::int64_t deadlineNs) override;
     std::string state() const override;
 
     int connected() const noexcept { return m_connected.load(std::memory_order_relaxed); }
@@ -74,6 +80,7 @@ private:
         HistoryAnswer &why);
     HistoryAnswer pageOn(PgConn &c, const history::PageRequest &request, HistoryPage &out, std::int64_t deadlineNs,
         const HistoryExpect &expect);
+    HistoryAnswer movementsOn(PgConn &c, const history::PageRequest &request, HistoryPage &out, std::int64_t deadlineNs);
     HistoryAnswer orderOn(PgConn &c, std::int64_t userId, std::int64_t orderId, std::string &json,
         HistoryAsOf &asOf, std::int64_t deadlineNs, const HistoryExpect &expect);
 

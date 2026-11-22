@@ -29,6 +29,9 @@
 // the poller, so an abandoned lookup outlives nothing it uses; at most one lookup per node runs at a time. The address
 // is kept and looked up again after a request to that node gets no answer (the node may have moved).
 //
+// Failure reasons. A frame carries a node's failure only as a code (engine::node_error); the text behind it names hosts
+// and addresses and goes to the process log, one line when a node's reason changes (and one when it recovers).
+//
 // Cost per stream instance: 2 x (core nodes + matching-engine nodes) HTTP requests per STREAM_ENGINE_POLL_MS (12 per
 // second for 3 + 3 nodes at the default), a new TCP connection each; no cluster session, no log entry. What it read and
 // sent is counted in EngineStats (stream_engine_* on /metrics).
@@ -86,7 +89,8 @@ struct HttpAnswer
     int status = 0;
     std::string body;
     std::size_t bytes = 0;
-    std::string error;
+    std::string error; // the full reason, for the process log only (it can name the host)
+    std::string code;  // its engine::node_error code (empty when answered)
 };
 
 class EnginePoller
@@ -112,6 +116,7 @@ private:
     void hand(EngineOut out);
     void flush();
     void releaseHeld(std::int64_t nowSteadyMs);
+    void logReasons(); // a node's failure text, written to the process log when it changes
 
     EnginePollerSettings m_settings;
     EngineRing &m_out;
@@ -121,6 +126,7 @@ private:
     engine::FrameGate m_gate;
     std::deque<EngineOut> m_pending; // frames the ring could not take yet (an engine frame is replaced by a newer one)
     std::vector<std::unique_ptr<NodeAddress>> m_addresses; // core nodes, then matching-engine nodes
+    std::vector<std::string> m_loggedDetail; // per node (same order): the reason last written to the process log
     std::mutex m_mutex;
     std::condition_variable m_cv;
     bool m_stop = false;

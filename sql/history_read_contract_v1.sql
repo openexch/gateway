@@ -126,14 +126,15 @@ CREATE TABLE gateway_order_trail_v1 (
     status              TEXT        NOT NULL,                   -- the order's OrderStatus after the record
     core_log_position   BIGINT      NOT NULL,                   -- the core log position of the applying entry
     me_epoch            BIGINT      NOT NULL,                   -- 0: no matching-engine cause
-    me_log_position     BIGINT      NOT NULL,
+    me_log_position     BIGINT      NOT NULL,                   -- the ME egress sequence of the causing record
     me_journal_seq      BIGINT      NOT NULL,
     liquidity           TEXT        NOT NULL CHECK (liquidity IN ('NONE', 'TAKER', 'MAKER')),
     trade_id            BIGINT      NOT NULL,                   -- 0: no trade
     last_price          BIGINT      NOT NULL,
     last_qty            BIGINT      NOT NULL,
     hold_remaining      BIGINT      NOT NULL,
-    at_ms               BIGINT      NOT NULL                    -- the record's updatedAtMs (core cluster time)
+    at_ms               BIGINT      NOT NULL,                   -- the record's updatedAtMs (core cluster time)
+    me_timestamp_ms     BIGINT      NOT NULL                    -- the causing ME record's time (ME cluster time)
 );
 
 CREATE INDEX gateway_order_trail_v1_order_key

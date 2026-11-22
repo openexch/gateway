@@ -15,6 +15,11 @@
 //   POST   /api/v2/orders/cancel           {orderIds:[...]} or {all:true, marketId?}: unkeyed cancels, at most
 //                                          GATEWAY_BULK_CANCEL_MAX per request (truncated, remaining)
 //   GET    /api/v2/balances                RequestUserBalances joined with the config's asset list (zero included)
+//   GET    /api/v2/balances/movements?assetId&limit&cursor   the caller's own balance movements, newest first, from the
+//                                          core money database (GATEWAY_MONEY_PG_URL, its own pool gw-pg-money): 200
+//                                          {items, nextCursor}; keyset pages and limits as history below; unset URL or
+//                                          a database that cannot answer: 503 MOVEMENTS_UNAVAILABLE (never another
+//                                          database in its place); a full queue 503 HISTORY_BUSY. Display only
 //   POST   /api/v2/balances/deposit, /withdraw   the treasury lane: 404 FEATURE_DISABLED when it is off
 //   GET    /api/v2/orders/history?limit&cursor&marketId&status   the caller's orders in history, newest first
 //   GET    /api/v2/fills?limit&cursor&marketId&orderId           the caller's fills in history, newest first
@@ -1277,8 +1282,9 @@ std::string GatewayApi::asOfJson(std::int64_t ageMs, std::int64_t eventSeq) cons
 }
 
 bool GatewayApi::runHistory(const Ex &ex, const char *route, const char *query,
-    std::function<void(int, std::int64_t)> job)
+    std::function<void(int, std::int64_t)> job, WorkPool *pool)
 {
+    WorkPool *const queue = nullptr != pool ? pool : m_deps.historyPool;
     const auto now = [] {
         return std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -1296,7 +1302,7 @@ bool GatewayApi::runHistory(const Ex &ex, const char *route, const char *query,
         }
         job(worker, deadlineNs);
     };
-    if (nullptr != m_deps.historyPool && m_deps.historyPool->trySubmit(std::move(run)))
+    if (nullptr != queue && queue->trySubmit(std::move(run)))
     {
         return true;
     }
@@ -1436,6 +1442,116 @@ void GatewayApi::historyPage(const Ex &ex, history::Kind kind, std::int64_t orde
             finish(ex, route, api::jsonBody(200, std::move(out)));
         });
     });
+}
+
+// GET /balances/movements: the caller's own movements from the core money database, newest first. The owner filter is
+// in the statement (user_id = the principal); nothing in the request can name a user. Display only.
+void GatewayApi::balanceMovements(const Ex &ex)
+{
+    static const char *route = "balances_movements";
+    static const char *query = "movements";
+    ApiResponse bad;
+    if (!api::readQuery(*ex, { "assetId", "limit", "cursor" }, bad))
+    {
+        finish(ex, route, std::move(bad));
+        return;
+    }
+    const auto values = api::queryValues(*ex);
+    if (!values)
+    {
+        finish(ex, route, validation("malformed query string", "a parameter value has a bad %-escape"));
+        return;
+    }
+    auto value = [&values](const char *name) -> const std::string * {
+        const auto it = values->find(name);
+        return it == values->end() ? nullptr : &it->second;
+    };
+    history::PageRequest request;
+    request.kind = history::Kind::MOVEMENTS;
+    request.limit = m_s.historyLimitDefault;
+    json::object none;
+    Fields f(none);
+    if (const std::string *v = value("limit"))
+    {
+        request.limit = f.idOf("limit", *v, m_s.historyLimitMax);
+    }
+    if (const std::string *v = value("assetId"))
+    {
+        request.filter.assetId = static_cast<std::int32_t>(f.idOf("assetId", *v, INT32_MAX, 0)); // ids start at 0
+    }
+    if (!f.ok())
+    {
+        finish(ex, route, f.bad());
+        return;
+    }
+    if (const std::string *v = value("cursor"))
+    {
+        history::Key key;
+        switch (history::decodeCursor(*v, history::Kind::MOVEMENTS, request.filter, key))
+        {
+            case history::CursorError::NONE:
+                request.after = key;
+                break;
+            case history::CursorError::MALFORMED:
+                finish(ex, route, validation("invalid cursor", "send the nextCursor of the previous page unchanged"));
+                return;
+            case history::CursorError::OTHER_ROUTE:
+                finish(ex, route, validation("invalid cursor", "the cursor belongs to another route"));
+                return;
+            case history::CursorError::OTHER_FILTER:
+                finish(ex, route, validation("invalid cursor",
+                    "the cursor was issued for another filter: keep assetId as on the first page"));
+                return;
+        }
+    }
+    withPrincipal(ex, route, [this, ex, request](const Principal &p) mutable {
+        if (nullptr == m_deps.money)
+        {
+            finish(ex, route, movementsUnavailable(HistoryCause::UNCONFIGURED));
+            return;
+        }
+        if (!takePrincipal(ex, route, p.userId, 1))
+        {
+            return;
+        }
+        request.userId = p.userId; // always the principal's: nothing in the request can name a user
+        if (const auto config = m_deps.config ? m_deps.config() : nullptr)
+        {
+            for (const wire::AssetConfig &a : config->assets)
+            {
+                request.assetCodes[a.assetId] = rest::fixedText(a.code.data(), a.code.size());
+            }
+        }
+        runHistory(ex, route, query, [this, ex, request](int worker, std::int64_t deadlineNs) {
+            HistoryPage page;
+            const HistoryAnswer a = m_deps.money->movements(worker, request, page, deadlineNs);
+            if (HistoryStatus::OK != a.status)
+            {
+                finish(ex, route, movementsUnavailable(HistoryStatus::NOT_FOUND == a.status ? HistoryCause::ERROR
+                                                                                            : a.cause));
+                return;
+            }
+            countHistory(query, "ok");
+            std::string out = "{\"items\":[";
+            for (std::size_t i = 0; i < page.items.size(); ++i)
+            {
+                out += (0 == i ? "" : ",") + page.items[i];
+            }
+            out += "],\"nextCursor\":" + (page.nextCursor ? api::quote(*page.nextCursor) : std::string("null")) + "}";
+            finish(ex, route, api::jsonBody(200, std::move(out)));
+        }, m_deps.moneyPool);
+    });
+}
+
+ApiResponse GatewayApi::movementsUnavailable(HistoryCause cause)
+{
+    countHistory("movements", (std::string("unavailable|") + nameOf(cause)).c_str());
+    // one public answer whatever the cause (the cause is in the store's WARN line and the metrics); unconfigured says
+    // so, since no retry will change it
+    return unavailable503(api::code::MOVEMENTS_UNAVAILABLE, "balance movements are not available",
+        HistoryCause::UNCONFIGURED == cause ? "this gateway does not read the money database"
+                                            : "balance movements are read from the money database, which cannot answer now",
+        m_s.historyRetryAfterMs);
 }
 
 // GET /orders/{orderId} of an order the core does not hold open: the caller's row in history, or 404 (unknown and

@@ -195,7 +195,8 @@ std::string renderTradesBatch(int marketId, const std::vector<TradeRow> &trades,
     for (std::size_t i = 0; i < trades.size(); ++i)
     {
         const TradeRow &t = trades[i];
-        out += (0 == i ? "" : ",") + std::string("{\"tradeId\":\"") + std::to_string(t.tradeId) + "\",\"price\":" +
+        out += (0 == i ? "" : ",") + std::string("{\"tradeId\":\"") + std::to_string(t.tradeId) + "\",\"journalSeq\":" +
+            std::to_string(t.journalSeq) + ",\"price\":" +
             dec(t.price) + ",\"quantity\":" + dec(t.quantity) + ",\"tradeCount\":1,\"side\":\"" +
             (t.takerIsBuy ? "BUY" : "SELL") + "\",\"timestamp\":" + std::to_string(t.executedAtMs) +
 #ifdef MD_NC_TAKER_IN_TRADE

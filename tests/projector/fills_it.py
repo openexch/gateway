@@ -161,6 +161,7 @@ def check_trail(port, order, others):
     fills = [i for i in items if i["event"] == "FILL"]
     check(seqs == sorted(seqs) and len(set(seqs)) == len(seqs) and items[0]["event"] == "ACCEPTED" and
           [f["tradeId"] for f in fills] == ["1", "2", "3", "4"] and all(f["coreLogPosition"] for f in fills) and
+          all(f["me"] and f["me"]["egressSeq"] > 0 and f["me"]["at"] > 0 for f in fills) and
           "eventSeq" in seen["body"]["asOf"] and seen["body"]["orderId"] == str(order),
           f"trail of order {order}: {[i['event'] for i in items]} at eventSeq {seqs}, fills "
           f"{[(f['tradeId'], f['coreLogPosition'], f['me']) for f in fills]}", f"{seen['body']}")

@@ -21,14 +21,16 @@ const char *ORDER_COLUMNS = "order_id, client_order_id::text, market_id, side, t
     "hold_remaining, created_at_ms, updated_at_ms";
 const char *FILL_COLUMNS = "trade_id, order_id, market_id, side, price, quantity, maker, executed_at_ms";
 const char *TRAIL_COLUMNS = "order_id, event_seq, event, status, core_log_position, me_epoch, me_log_position, "
-    "me_journal_seq, liquidity, trade_id, last_price, last_qty, hold_remaining, at_ms";
+    "me_journal_seq, liquidity, trade_id, last_price, last_qty, hold_remaining, at_ms, me_timestamp_ms";
+const char *MOVEMENT_COLUMNS = "journal_seq, leg_no, log_position, kind, asset_id, delta, balance_after, at_ms, "
+    "trade_id, market_id";
 
 const std::array<const char *, 10> STATUSES = { "NEW", "PARTIALLY_FILLED", "FILLED", "CANCELLED", "REJECTED", "EXPIRED",
     "PENDING_NEW", "PENDING_TRIGGER", "PENDING_CANCEL", "PENDING_REPLACE" };
 
 const char *tagOf(Kind kind)
 {
-    return Kind::ORDERS == kind ? "o1" : Kind::FILLS == kind ? "f1" : "t1";
+    return Kind::ORDERS == kind ? "o1" : Kind::FILLS == kind ? "f1" : Kind::TRAIL == kind ? "t1" : "m1";
 }
 
 std::string param(std::vector<std::string> &params, std::string value);
@@ -47,8 +49,12 @@ std::string trailOwner(std::vector<std::string> &params, std::int64_t userId)
 
 std::string binding(Kind kind, const Filter &f)
 {
-    const std::string text = std::string(tagOf(kind)) + "|" + std::to_string(f.marketId) + "|" + f.status + "|" +
+    std::string text = std::string(tagOf(kind)) + "|" + std::to_string(f.marketId) + "|" + f.status + "|" +
         std::to_string(f.orderId);
+    if (Kind::MOVEMENTS == kind)
+    {
+        text += "|" + std::to_string(f.assetId); // the other kinds keep the binding they always had
+    }
     const crypto::Digest d = crypto::sha256(text);
     return crypto::hex(crypto::view(d).substr(0, 8));
 }
@@ -219,11 +225,46 @@ Statement trailExistsStatement(std::int64_t userId, std::int64_t orderId)
     return s;
 }
 
+namespace {
+
+// A movements page: the caller's legs, newest first by (journal_seq, leg_no), optionally of one asset.
+Statement movementsStatement(const PageRequest &r)
+{
+    Statement s;
+    s.sql = std::string("SELECT ") + MOVEMENT_COLUMNS + " FROM gateway_balance_movements_v1 WHERE ";
+#ifdef GW_NC_MOVEMENTS_NO_OWNER
+    s.sql += "TRUE"; // test build only: no owner filter
+#else
+    s.sql += "user_id = ";
+    s.sql += param(s.params, std::to_string(r.userId)) + "::bigint";
+#endif
+    if (r.filter.assetId >= 0)
+    {
+        s.sql += " AND asset_id = ";
+        s.sql += param(s.params, std::to_string(r.filter.assetId)) + "::integer";
+    }
+    if (r.after)
+    {
+        s.sql += " AND (journal_seq, leg_no) < (";
+        s.sql += param(s.params, std::to_string(r.after->a)) + "::bigint, ";
+        s.sql += param(s.params, std::to_string(r.after->b)) + "::integer)";
+    }
+    s.sql += " ORDER BY journal_seq DESC, leg_no DESC LIMIT ";
+    s.sql += param(s.params, std::to_string(r.limit < INT64_MAX ? r.limit + 1 : r.limit)) + "::bigint";
+    return s;
+}
+
+}
+
 Statement pageStatement(const PageRequest &r)
 {
     if (Kind::TRAIL == r.kind)
     {
         return trailStatement(r);
+    }
+    if (Kind::MOVEMENTS == r.kind)
+    {
+        return movementsStatement(r);
     }
     Statement s;
     const bool orders = Kind::ORDERS == r.kind;
@@ -319,17 +360,18 @@ CursorError decodeCursor(std::string_view text, Kind kind, const Filter &filter,
     }
     const std::vector<std::string_view> parts = split(*raw, '|');
     const std::string_view tag = parts.front();
-    if (tag != "o1" && tag != "f1" && tag != "t1")
+    if (tag != "o1" && tag != "f1" && tag != "t1" && tag != "m1")
     {
         return CursorError::MALFORMED;
     }
-    const Kind of = "o1" == tag ? Kind::ORDERS : "f1" == tag ? Kind::FILLS : Kind::TRAIL;
+    const Kind of = "o1" == tag ? Kind::ORDERS : "f1" == tag ? Kind::FILLS : "t1" == tag ? Kind::TRAIL : Kind::MOVEMENTS;
     if (parts.size() != (Kind::FILLS == of ? 5u : 4u) || 16 != parts[1].size())
     {
         return CursorError::MALFORMED;
     }
     Key k;
-    if (!integer(parts[2], k.a) || !integer(parts[3], k.b) || k.b < 1 ||
+    // a movement's leg_no starts at 0; every other key's second part is an id (1 or above)
+    if (!integer(parts[2], k.a) || !integer(parts[3], k.b) || k.b < (Kind::MOVEMENTS == of ? 0 : 1) ||
         (Kind::FILLS == of && (!integer(parts[4], k.c) || k.c < 1)))
     {
         return CursorError::MALFORMED;
@@ -446,6 +488,46 @@ bool fillJson(const Row &row, std::string &json, Key &key, std::string &problem)
     return true;
 }
 
+bool movementJson(const Row &row, const std::map<std::int32_t, std::string> &assetCodes, std::string &json, Key &key,
+    std::string &problem)
+{
+    Reader r{ row, problem };
+    const std::int64_t journalSeq = r.number(0, "journal_seq");
+    const std::int64_t legNo = r.number(1, "leg_no");
+    const std::int64_t logPosition = r.number(2, "log_position");
+    const std::string kind = r.text(3, "kind");
+    const std::int64_t assetId = r.number(4, "asset_id");     // NULL: a settle of a market the database cannot name
+    const std::int64_t delta = r.number(5, "delta");
+    const std::int64_t balanceAfter = r.number(6, "balance_after");
+    const auto at = r.optNumber(7, "at_ms");
+    const auto tradeId = r.optNumber(8, "trade_id");
+    const auto marketId = r.optNumber(9, "market_id");
+    if (problem.empty() && (assetId < INT32_MIN || assetId > INT32_MAX))
+    {
+        r.fail("asset_id", "is out of range");
+    }
+    if (!problem.empty())
+    {
+        problem += " (row journal_seq " + r.raw(0) + ", leg_no " + r.raw(1) + ")";
+        return false;
+    }
+    const auto code = assetCodes.find(static_cast<std::int32_t>(assetId));
+    json = "{\"journalSeq\":" + std::to_string(journalSeq);
+    json += ",\"legNo\":" + std::to_string(legNo);
+    json += ",\"logPosition\":" + std::to_string(logPosition);
+    json += ",\"kind\":" + api::quote(kind);
+    json += ",\"assetId\":" + id(assetId);
+    json += ",\"asset\":" + (code == assetCodes.end() ? std::string("null") : api::quote(code->second));
+    json += ",\"delta\":" + money(delta);
+    json += ",\"balanceAfter\":" + money(balanceAfter);
+    json += ",\"at\":" + (at ? std::to_string(*at) : std::string("null"));
+    json += ",\"tradeId\":" + (tradeId ? id(*tradeId) : std::string("null"));
+    json += ",\"marketId\":" + (marketId ? id(*marketId) : std::string("null"));
+    json += "}";
+    key = Key{ journalSeq, legNo, 0 };
+    return true;
+}
+
 bool trailJson(const Row &row, std::string &json, Key &key, std::string &problem)
 {
     Reader r{ row, problem };
@@ -455,7 +537,7 @@ bool trailJson(const Row &row, std::string &json, Key &key, std::string &problem
     const std::string status = r.text(3, "status");
     const std::int64_t coreLogPosition = r.number(4, "core_log_position");
     const std::int64_t meEpoch = r.number(5, "me_epoch");
-    const std::int64_t meLogPosition = r.number(6, "me_log_position");
+    const std::int64_t meEgressSeq = r.number(6, "me_log_position");
     const std::int64_t meJournalSeq = r.number(7, "me_journal_seq");
     const std::string liquidity = r.text(8, "liquidity");
     const std::int64_t tradeId = r.number(9, "trade_id");
@@ -463,6 +545,7 @@ bool trailJson(const Row &row, std::string &json, Key &key, std::string &problem
     const std::int64_t lastQty = r.number(11, "last_qty");
     const std::int64_t holdRemaining = r.number(12, "hold_remaining");
     const std::int64_t at = r.number(13, "at_ms");
+    const std::int64_t meAt = r.number(14, "me_timestamp_ms");
     if (!problem.empty())
     {
         problem += " (row order_id " + r.raw(0) + ", event_seq " + r.raw(1) + ")";
@@ -473,8 +556,9 @@ bool trailJson(const Row &row, std::string &json, Key &key, std::string &problem
     json += ",\"status\":" + api::quote(status);
     json += ",\"coreLogPosition\":" + std::to_string(coreLogPosition);
     json += ",\"me\":" + (0 == meEpoch ? std::string("null")
-                                         : "{\"epoch\":" + id(meEpoch) + ",\"logPosition\":" + std::to_string(meLogPosition) +
-                                             ",\"journalSeq\":" + std::to_string(meJournalSeq) + "}");
+                                         : "{\"epoch\":" + id(meEpoch) + ",\"egressSeq\":" + std::to_string(meEgressSeq) +
+                                             ",\"journalSeq\":" + std::to_string(meJournalSeq) + ",\"at\":" +
+                                             std::to_string(meAt) + "}");
     json += ",\"liquidity\":" + ("NONE" == liquidity ? std::string("null") : api::quote(liquidity));
     const bool trade = 0 != tradeId;
     json += ",\"tradeId\":" + (trade ? id(tradeId) : std::string("null"));

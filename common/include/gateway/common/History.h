@@ -2,6 +2,7 @@
 #define GATEWAY_COMMON_HISTORY_H
 
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -28,6 +29,15 @@
 //                             every order from its creation on, so an order id above applied_order_id without a row may
 //                             exist and not be projected yet: GET /orders/{orderId} answers 503 (LAGGING), never 404
 //
+// Balance movements (GET /api/v2/balances/movements) are read from another database, the core money database, through
+// one relation of its own (the core projector's migration V002; sql/money_read_contract_v1.sql is the gateway's
+// reference copy):
+//   gateway_balance_movements_v1  one row per balance-after leg of the money journal (user_id, journal_seq, leg_no,
+//                             log_position, kind, asset_id, delta, balance_after, at_ms, trade_id, market_id); key
+//                             (journal_seq, leg_no), newest first. Display only: nothing replays settlement from it
+// That database has no heartbeat relation, so a movements page carries no asOf and none of the heartbeat checks below
+// apply to it; the owner filter (user_id = the principal) is in its statement as in every other.
+//
 // The checks of a history read, in this order (the first that fails answers 503 HISTORY_UNAVAILABLE): PostgreSQL
 // reachable and answering (cause pg); a heartbeat row (cause heartbeat); its epoch equal to the genesisId of the
 // gateway's last CoreConfigReport (cause epoch; a gateway that never read a report cannot know, the same 503); its age
@@ -43,9 +53,9 @@
 // served by that walk at all (skipped, not met again); a walk that starts over from the top serves it. This follows
 // from the contract's key and is the documented behaviour of the orders route.
 //
-// Cursor: base64url (unpadded) of "<tag>|<binding>|<key...>": tag o1 (orders), f1 (fills) or t1 (an order's trail: key
-// event_seq, then the order id), binding the first 8 bytes of SHA-256 over the tag and the filter (marketId, status,
-// orderId) as hex. A cursor of another route or another
+// Cursor: base64url (unpadded) of "<tag>|<binding>|<key...>": tag o1 (orders), f1 (fills), t1 (an order's trail: key
+// event_seq, then the order id) or m1 (balance movements: key journal_seq, then leg_no), binding the first 8 bytes of
+// SHA-256 over the tag and the filter (marketId, status, orderId; assetId for movements) as hex. A cursor of another route or another
 // filter, or one that does not decode, is refused (the route answers 400 VALIDATION). The cursor carries no user: the
 // user is always the principal's, so a cursor only ever positions a walk inside the caller's own rows.
 //
@@ -68,7 +78,8 @@ enum class Kind : std::uint8_t
 {
     ORDERS,
     FILLS,
-    TRAIL
+    TRAIL,
+    MOVEMENTS
 };
 
 struct Filter
@@ -76,10 +87,11 @@ struct Filter
     std::int32_t marketId = 0;  // 0: any
     std::string status;         // "": any (orders only)
     std::int64_t orderId = 0;   // 0: any (fills); the order of a trail (always set)
+    std::int32_t assetId = -1;  // -1: any (movements; asset ids start at 0)
 };
 
 // orders: a = updated_at_ms, b = order_id; fills: a = executed_at_ms, b = trade_id, c = order_id; trail: a = event_seq,
-// b = order_id
+// b = order_id; movements: a = journal_seq, b = leg_no
 struct Key
 {
     std::int64_t a = 0;
@@ -94,6 +106,7 @@ struct PageRequest
     Filter filter;
     std::optional<Key> after; // the decoded cursor
     std::int64_t limit = 0;
+    std::map<std::int32_t, std::string> assetCodes{}; // movements: assetId -> code from the core config (rendering only)
 };
 
 struct Statement
@@ -134,10 +147,16 @@ using Row = std::vector<std::optional<std::string>>;
 // and the row's key as stored (order_id, or trade_id and order_id), so an operator can find the row.
 bool orderJson(const Row &row, std::string &json, Key &key, std::string &problem);
 bool fillJson(const Row &row, std::string &json, Key &key, std::string &problem);
-// One trail row: eventSeq, event, status, coreLogPosition, me {epoch, logPosition, journalSeq} (null when the record
-// has no matching-engine cause, me_epoch 0), liquidity (null for NONE), tradeId, lastPrice, lastQty (all three null
+// One trail row: eventSeq, event, status, coreLogPosition, me {epoch, egressSeq, journalSeq, at} (null when the record
+// has no matching-engine cause, me_epoch 0; egressSeq is the ME egress sequence the journal stores as me_log_position,
+// at its me_timestamp_ms), liquidity (null for NONE), tradeId, lastPrice, lastQty (all three null
 // when trade_id is 0), holdRemaining, at.
 bool trailJson(const Row &row, std::string &json, Key &key, std::string &problem);
+// One balance movement: journalSeq, legNo, logPosition, kind, assetId, asset (the code from `assetCodes`, null when the
+// config names none), delta (signed), balanceAfter, at (null for opening), tradeId and marketId (null unless settle).
+// A row without an asset, a kind or a delta is not the contract's shape (false).
+bool movementJson(const Row &row, const std::map<std::int32_t, std::string> &assetCodes, std::string &json, Key &key,
+    std::string &problem);
 
 }
 
@@ -220,6 +239,17 @@ public:
         HistoryAsOf &asOf, std::int64_t deadlineNs, const HistoryExpect &expect) = 0;
     // The heartbeat alone, through the same checks as a read (the /health probe)
     virtual HistoryAnswer probe(int worker, HistoryAsOf &out, std::int64_t deadlineNs, const HistoryExpect &expect) = 0;
+    // A balance movements page (Kind::MOVEMENTS) from the money database: no heartbeat, no asOf (ageMs and eventSeq of
+    // `out` stay 0). A store that does not read that database answers UNAVAILABLE, UNCONFIGURED.
+    virtual HistoryAnswer movements(int worker, const history::PageRequest &request, HistoryPage &out,
+        std::int64_t deadlineNs)
+    {
+        (void)worker;
+        (void)request;
+        (void)out;
+        (void)deadlineNs;
+        return HistoryAnswer{ HistoryStatus::UNAVAILABLE, HistoryCause::UNCONFIGURED };
+    }
     virtual std::string state() const = 0;
 };
 

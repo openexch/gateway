@@ -12,7 +12,10 @@
 //   - over the projection's own schema (sql/history_projection_v1.sql) read as a member of its reader role: an order's
 //     trail (own order, another user's, unknown, lagging, five fills, an order filled inside a 64-trade batch; control:
 //     GW_NC_TRAIL_NO_OWNER must fail with "trail of another user's order"), and the reader role can SELECT exactly the
-//     four read relations and nothing else.
+//     four read relations and nothing else;
+//   - balance movements over the money read contract (sql/money_read_contract_v1.sql): the caller's rows only, newest
+//     first, each once across pages, the asset filter, a row without an asset refused, an absent relation (control:
+//     GW_NC_MOVEMENTS_NO_OWNER must fail with "movement of another user").
 #include <atomic>
 #include <functional>
 #include <chrono>
@@ -1248,15 +1251,18 @@ TEST(history_order_trail)
         CHECK_MSG(items[0].at("me").is_null() && items[0].at("tradeId").is_null() && items[0].at("liquidity").is_null(),
             json::serialize(items[0]));
         CHECK_MSG(items[2].at("me").as_object().at("epoch").as_string() == "5" &&
-            items[2].at("me").as_object().at("logPosition").as_int64() == 70000 &&
-            items[2].at("me").as_object().at("journalSeq").is_int64(), json::serialize(items[2]));
+            items[2].at("me").as_object().at("egressSeq").as_int64() == 70000 &&
+            !items[2].at("me").as_object().contains("logPosition") &&
+            items[2].at("me").as_object().at("journalSeq").is_int64() &&
+            items[2].at("me").as_object().at("at").as_int64() == T0 + seqOf(items[2]), json::serialize(items[2]));
         for (int k = 0; k < 5; ++k)
         {
             const json::object &f = items[3 + static_cast<std::size_t>(k)];
             CHECK_MSG(f.at("tradeId").as_string() == std::to_string(11 + k) && f.at("lastQty").as_string() == "0.2" &&
                 f.at("lastPrice").as_string() == "100" && f.at("coreLogPosition").as_int64() == 1300 + k &&
                 f.at("me").as_object().at("epoch").as_string() == "5" &&
-                f.at("me").as_object().at("logPosition").as_int64() == 70100 + 10 * k &&
+                f.at("me").as_object().at("egressSeq").as_int64() == 70100 + 10 * k &&
+                f.at("me").as_object().at("at").as_int64() == T0 + seqOf(f) &&
                 f.at("liquidity").as_string() == (0 == k % 2 ? "TAKER" : "MAKER"), json::serialize(f));
         }
         CHECK(items[7].at("status").as_string() == "FILLED");
@@ -1393,4 +1399,131 @@ TEST(history_reader_grant)
         CHECK_MSG("42501" == got, std::string(statement) + ": " + got);
     }
     PQfinish(c);
+}
+
+// ---- balance movements, over the money read contract (sql/money_read_contract_v1.sql)
+
+namespace {
+
+std::string moneyContractDdl()
+{
+    std::ifstream in(GW_MONEY_CONTRACT_SQL);
+    std::stringstream s;
+    s << in.rdbuf();
+    if (s.str().empty())
+    {
+        gwtest::fail(__FILE__, __LINE__, std::string("cannot read ") + GW_MONEY_CONTRACT_SQL);
+    }
+    return s.str();
+}
+
+PgHistorySettings moneySettings(const std::string &url)
+{
+    PgHistorySettings s = historySettings(url);
+    s.label = "money";
+    return s;
+}
+
+// Every page of the user's movements (limit per page), as "journalSeq/legNo:assetId"; false when a page is not OK.
+bool walkMovements(PgHistoryStore &store, std::int64_t userId, std::int32_t assetId, std::int64_t limit,
+    std::vector<std::string> &out, std::set<std::int64_t> &seqs)
+{
+    history::PageRequest request;
+    request.kind = history::Kind::MOVEMENTS;
+    request.userId = userId;
+    request.filter.assetId = assetId;
+    request.limit = limit;
+    request.assetCodes = { { 0, "USD" }, { 1, "BTC" } };
+    for (int pages = 0; pages < 1000; ++pages)
+    {
+        HistoryPage page;
+        const HistoryAnswer a = store.movements(0, request, page, pg::nowNs() + 10'000'000'000LL);
+        if (HistoryStatus::OK != a.status)
+        {
+            CHECK_MSG(false, std::string("movements page: ") + nameOf(a.cause));
+            return false;
+        }
+        CHECK(page.items.size() <= static_cast<std::size_t>(limit));
+        for (const std::string &item : page.items)
+        {
+            const json::object o = json::parse(item).as_object();
+            const std::int64_t seq = o.at("journalSeq").as_int64();
+            seqs.insert(seq);
+            out.push_back(std::to_string(seq) + "/" + std::to_string(o.at("legNo").as_int64()) + ":" +
+                std::string(o.at("assetId").as_string()));
+        }
+        if (!page.nextCursor)
+        {
+            return true;
+        }
+        history::Key key;
+        CHECK(history::CursorError::NONE ==
+            history::decodeCursor(*page.nextCursor, history::Kind::MOVEMENTS, request.filter, key));
+        request.after = key;
+    }
+    CHECK_MSG(false, "movements walk did not end");
+    return false;
+}
+
+}
+
+// The caller's own movements only, newest first by (journal_seq, leg_no), every row once across pages, the asset
+// filter in the statement, a row without an asset refused (503, never a guess), an absent relation 503. Control:
+// GW_NC_MOVEMENTS_NO_OWNER must fail with "movement of another user".
+TEST(money_movements_over_postgres)
+{
+    const std::string url = freshDatabase("gw_money_mv");
+    sql(url, moneyContractDdl());
+    // user 7: journal seqs 1..60, two legs each (asset 0 and 1, the second leg's leg_no 1 or, on every third seq, 0
+    // and 3 as a settle's buyer and seller legs); user 8 interleaved at seqs 1000.. with legs of the same seqs too
+    sql(url, "INSERT INTO gateway_balance_movements_v1 SELECT 7, g, 0, g * 64, 'deposit', 0, 100, g * 100, "
+        "1800000000000 + g, NULL, NULL FROM generate_series(1, 60) g");
+    sql(url, "INSERT INTO gateway_balance_movements_v1 SELECT 7, g, CASE WHEN g % 3 = 0 THEN 3 ELSE 1 END, g * 64, "
+        "'settle', 1, -5, g * 7, 1800000000000 + g, g, 1 FROM generate_series(1, 60) g");
+    sql(url, "INSERT INTO gateway_balance_movements_v1 SELECT 8, g, 2, g * 64, 'settle', 0, 9, 9, 1800000000000 + g, "
+        "g, 1 FROM generate_series(1, 60) g");
+    sql(url, "INSERT INTO gateway_balance_movements_v1 SELECT 8, 1000 + g, 0, 0, 'withdrawal', 0, -1, 1, "
+        "1800000000000 + g, NULL, NULL FROM generate_series(1, 30) g");
+    PgHistoryStore store(moneySettings(url));
+
+    std::vector<std::string> all;
+    std::set<std::int64_t> seqs;
+    CHECK(walkMovements(store, 7, -1, 7, all, seqs));
+    std::vector<std::string> want;
+    for (std::int64_t g = 60; g >= 1; --g)
+    {
+        const std::int64_t settleLeg = 0 == g % 3 ? 3 : 1;
+        want.push_back(std::to_string(g) + "/" + std::to_string(settleLeg) + ":1");
+        want.push_back(std::to_string(g) + "/0:0");
+    }
+    for (const std::int64_t s : seqs)
+    {
+        CHECK_MSG(s <= 60, "movement of another user: journal seq " + std::to_string(s));
+    }
+    CHECK_MSG(all == want, "the walk is not the user's legs newest first, each once (" + std::to_string(all.size()) +
+            " rows)");
+
+    std::vector<std::string> usd;
+    std::set<std::int64_t> usdSeqs;
+    CHECK(walkMovements(store, 7, 0, 11, usd, usdSeqs));
+    CHECK_MSG(60 == usd.size(), std::to_string(usd.size()) + " USD rows");
+    for (const std::string &r : usd)
+    {
+        CHECK_MSG(r.size() > 2 && ":0" == r.substr(r.size() - 2), "a row of another asset under assetId=0: " + r);
+    }
+
+    // one row of the page without an asset: the page is refused, never rendered with a guess
+    sql(url, "INSERT INTO gateway_balance_movements_v1 VALUES (7, 61, 0, 1, 'settle', NULL, NULL, 5, 1, 1, 99)");
+    history::PageRequest request;
+    request.kind = history::Kind::MOVEMENTS;
+    request.userId = 7;
+    request.limit = 5;
+    HistoryPage page;
+    HistoryAnswer a = store.movements(0, request, page, pg::nowNs() + 10'000'000'000LL);
+    CHECK_MSG(HistoryStatus::UNAVAILABLE == a.status && HistoryCause::BAD_ROW == a.cause, nameOf(a.cause));
+
+    // a database without the relation: ABSENT
+    PgHistoryStore bare(moneySettings(freshDatabase("gw_money_bare")));
+    a = bare.movements(0, request, page, pg::nowNs() + 10'000'000'000LL);
+    CHECK_MSG(HistoryStatus::UNAVAILABLE == a.status && HistoryCause::ABSENT == a.cause, nameOf(a.cause));
 }

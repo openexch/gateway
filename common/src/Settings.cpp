@@ -42,6 +42,10 @@
 //   History is read when GATEWAY_PG_URL is set, on its own pool (GATEWAY_PG_HISTORY_POOL connections over a queue of
 //   its own, sized GATEWAY_PG_QUEUE like the auth pool's), never the auth pool's connections;
 //   GATEWAY_PG_STATEMENT_TIMEOUT_MS is also one history read's whole deadline, queue wait included,
+//   GATEWAY_MONEY_PG_URL unset (the core money database, read-only, for GET /api/v2/balances/movements only; unset,
+//   that route answers 503 MOVEMENTS_UNAVAILABLE and no other database stands in for it), GATEWAY_PG_MONEY_POOL 2
+//   (its connections, over a queue of its own sized GATEWAY_PG_QUEUE; the statement timeout and retry spacing are the
+//   GATEWAY_PG_* ones),
 //   GATEWAY_FAUCET_MAX_AMOUNT none (assetId:amount,...; each amount a money decimal of at most 92233720368.54775807),
 //   GATEWAY_FAUCET_RATE 1/s.
 // oe-stream only:
@@ -839,6 +843,12 @@ ParseResult<GatewaySettings> parseGatewaySettings(const Environment &env, const 
     }
     g.pgHistoryPool = r.positive("GATEWAY_PG_HISTORY_POOL", g.pgHistoryPool);
     g.pgAuthPool = r.positive("GATEWAY_PG_AUTH_POOL", g.pgAuthPool);
+    g.moneyPgUrl = r.optionalString("GATEWAY_MONEY_PG_URL", "postgresql://...", true);
+    if (g.moneyPgUrl && 0 != g.moneyPgUrl->rfind("postgresql://", 0) && 0 != g.moneyPgUrl->rfind("postgres://", 0))
+    {
+        r.problem("GATEWAY_MONEY_PG_URL must be a postgresql:// or postgres:// URL");
+    }
+    g.pgMoneyPool = r.positive("GATEWAY_PG_MONEY_POOL", g.pgMoneyPool);
     g.pgStatementTimeoutMs = r.positive("GATEWAY_PG_STATEMENT_TIMEOUT_MS", g.pgStatementTimeoutMs);
     g.pgQueue = r.positive("GATEWAY_PG_QUEUE", g.pgQueue);
     g.pgRetryMs = r.positive("GATEWAY_PG_RETRY_MS", g.pgRetryMs);

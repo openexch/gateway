@@ -801,6 +801,9 @@ def case_live(ctx):
                                                f"{[t for t in want if t not in trade_ids(sub.frames)]}")
         ids = trade_ids(sub.frames)
         check(ids[-len(want):] == want, f"round {round_no}: live trades out of journal order")
+        wrong = [t for f in fresh + sub.frames if f.get("type") == "TRADES_BATCH" for t in f["trades"]
+                 if str(j.trades.get(t.get("journalSeq"), (None, None))[1]) != t["tradeId"]]
+        check(not wrong, f"round {round_no}: tape entries whose journalSeq is not their trade's record: {wrong[:3]}")
         kinds = {f["type"] for f in sub.frames[8:]}
         check({"TRADES_BATCH", "TICKER_STATS", "CANDLE_UPDATE"} <= kinds, f"round {round_no}: live frames {kinds}")
         status, body, headers = http_full(md.public, "/api/candles?marketId=1&interval=5m&limit=500",

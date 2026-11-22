@@ -44,6 +44,25 @@ GatewayFront::GatewayFront(const GatewaySettings &g, AuthMaterial material, Duty
         frontLog(FrontLevel::INFO, "history reads off: GATEWAY_PG_URL is unset (history routes answer 503 "
             "HISTORY_UNAVAILABLE)");
     }
+    if (g.moneyPgUrl)
+    {
+        // balance movements: the core money database, read-only, on connections and a queue of their own. Never
+        // GATEWAY_PG_URL in its place: without this URL the route answers 503 MOVEMENTS_UNAVAILABLE
+        PgHistorySettings ms;
+        ms.url = *g.moneyPgUrl;
+        ms.workers = static_cast<int>(g.pgMoneyPool);
+        ms.statementTimeoutMs = g.pgStatementTimeoutMs;
+        ms.retryMs = g.pgRetryMs;
+        ms.label = "money";
+        m_money = std::make_unique<PgHistoryStore>(ms);
+        m_moneyPool = std::make_unique<WorkPool>("gw-pg-money", static_cast<int>(g.pgMoneyPool),
+            static_cast<std::size_t>(g.pgQueue));
+    }
+    else
+    {
+        frontLog(FrontLevel::INFO, "balance movements off: GATEWAY_MONEY_PG_URL is unset (GET /api/v2/balances/movements "
+            "answers 503 MOVEMENTS_UNAVAILABLE)");
+    }
     AuthenticatorSettings as;
     as.modes = c.authModes;
     as.tokenCacheTtlMs = c.tokenCacheTtlMs;
@@ -58,6 +77,8 @@ GatewayFront::GatewayFront(const GatewaySettings &g, AuthMaterial material, Duty
     deps.hashPool = m_hashPool.get();
     deps.history = m_history.get();
     deps.historyPool = m_historyPool.get();
+    deps.money = m_money.get();
+    deps.moneyPool = m_moneyPool.get();
     deps.askCore = [this](session::Command command, std::function<void(const session::Outcome &)> done) {
         return m_bridge.submit(std::move(command), std::move(done));
     };
@@ -107,6 +128,10 @@ void GatewayFront::start()
     {
         m_historyPool->start();
     }
+    if (m_moneyPool)
+    {
+        m_moneyPool->start();
+    }
     m_bridge.startCompletions();
     m_api->startHistoryProbe();
     m_server->start();
@@ -127,6 +152,10 @@ bool GatewayFront::stop(std::int64_t boundMs)
     if (m_historyPool)
     {
         ok = m_historyPool->stop(boundMs) && ok;
+    }
+    if (m_moneyPool)
+    {
+        ok = m_moneyPool->stop(boundMs) && ok;
     }
     ok = m_bridge.stopCompletions(boundMs) && ok;
     return ok;

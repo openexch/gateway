@@ -609,6 +609,7 @@ TEST(api_http_bounds_routes_and_cors)
     CHECK_MSG(403 == r.status && !r.headers.count("access-control-allow-origin"), what(r));
     r = rig.get("/api/v2/auth/me", { { "X-API-Key", API_KEY }, { "Origin", "https://app.example.test" } });
     CHECK(200 == r.status && r.headers["access-control-allow-origin"] == "https://app.example.test");
+    CHECK(r.headers["access-control-expose-headers"] == "Retry-After");
     CHECK(r.headers["cache-control"] == "no-store");
     r = rig.get("/api/v2/auth/me", { { "X-API-Key", API_KEY }, { "Origin", "https://evil.example.test" } });
     CHECK(200 == r.status && !r.headers.count("access-control-allow-origin"));

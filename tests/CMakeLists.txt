@@ -245,9 +245,11 @@ endforeach()
 # binary) and the case that guards it; the case must fail with the named text.
 #   GW_NC_ENGINE_INFER_FROM_LEADER  a node that did not answer is shown as the leader's follower
 #   GW_NC_ENGINE_NO_RATE_CAP        every changed engine frame goes out at once
+#   GW_NC_ENGINE_ERROR_TEXT         a node's failure text (host names, addresses) goes into the frame instead of its code
 set(GW_ENGINE_CONTROLS
     "GW_NC_ENGINE_INFER_FROM_LEADER|engine_unreachable_node_from_its_own_poll|follower health inferred from the leader"
-    "GW_NC_ENGINE_NO_RATE_CAP|engine_rate_cap|engine frame rate above the cap")
+    "GW_NC_ENGINE_NO_RATE_CAP|engine_rate_cap|engine frame rate above the cap"
+    "GW_NC_ENGINE_ERROR_TEXT|engine_node_error_names_no_host|a host name reached the frame")
 foreach(control IN LISTS GW_ENGINE_CONTROLS)
     string(REPLACE "|" ";" parts "${control}")
     list(GET parts 0 define)
@@ -331,7 +333,8 @@ target_compile_options(gw_pg_tests PRIVATE ${GW_WARNINGS})
 # (sql/history_read_contract_v1.sql): the keyset walk under concurrent inserts, the routes over the real users and
 # history stores, pool exhaustion while login answers, and the causes of 503 HISTORY_UNAVAILABLE.
 set(GW_HISTORY_CONTRACT_DEFINITION GW_HISTORY_CONTRACT_SQL="${PROJECT_SOURCE_DIR}/sql/history_read_contract_v1.sql"
-    GW_HISTORY_PROJECTION_SQL="${PROJECT_SOURCE_DIR}/sql/history_projection_v1.sql")
+    GW_HISTORY_PROJECTION_SQL="${PROJECT_SOURCE_DIR}/sql/history_projection_v1.sql"
+    GW_MONEY_CONTRACT_SQL="${PROJECT_SOURCE_DIR}/sql/money_read_contract_v1.sql")
 add_executable(gw_pg_history_tests unit/TestMain.cpp pg/HistoryPgTest.cpp)
 target_include_directories(gw_pg_history_tests PRIVATE unit pg)
 target_compile_definitions(gw_pg_history_tests PRIVATE ${GW_HISTORY_CONTRACT_DEFINITION})
@@ -352,12 +355,14 @@ target_compile_options(gw_pg_nc_offset_paging PRIVATE ${GW_WARNINGS})
 #   GW_NC_NO_HISTORY_PROBE        no probe: /health shows what the last successful read found
 #   GW_NC_ROWS_BEFORE_HEARTBEAT   a page reads its rows first and the heartbeat after them
 #   GW_NC_TRAIL_NO_OWNER          the trail statements have no owner filter (user_id)
+#   GW_NC_MOVEMENTS_NO_OWNER      the balance movements statement has no owner filter (user_id)
 set(GW_HISTORY_PG_CONTROLS
     "GW_NC_NO_STALE_LABEL|gateway/GatewayRoutes.cpp|history_stale_label|stale label missing"
     "GW_NC_NO_EPOCH_CHECK|common/src/PgHistoryStore.cpp|history_epoch_check|history of another genesis served"
     "GW_NC_NO_HISTORY_PROBE|gateway/GatewayRoutes.cpp|history_health_probe|health shows fresh history without a probe"
     "GW_NC_ROWS_BEFORE_HEARTBEAT|common/src/PgHistoryStore.cpp|history_read_order_under_concurrent_apply|asOf.eventSeq claims rows the page lacks"
-    "GW_NC_TRAIL_NO_OWNER|common/src/History.cpp|history_order_trail|trail of another user's order")
+    "GW_NC_TRAIL_NO_OWNER|common/src/History.cpp|history_order_trail|trail of another user's order"
+    "GW_NC_MOVEMENTS_NO_OWNER|common/src/History.cpp|money_movements_over_postgres|movement of another user")
 set(GW_HISTORY_PG_CONTROL_TESTS "")
 foreach(entry IN LISTS GW_HISTORY_PG_CONTROLS)
     string(REPLACE "|" ";" parts "${entry}")
