@@ -283,12 +283,17 @@ TEST(md_live_ticker_window_and_scales)
 {
     LiveRig rig;
     rig.start(seedTrades());
-    // market 1's only trade is 36 h old: no price in the window, absent from TICKERS; its TICKER_STATS is all zero
+    // market 1's only trade is 36 h old: a quiet market keeps its newest trade's price, every 24 h value is 0, and it
+    // stays in TICKERS; market 2 never traded: all zero and absent from TICKERS
     const std::string all = rig.trades.tickers().text->c_str();
-    CHECK(std::string::npos == all.find("\"marketId\":1,"));
+    const std::string quiet1 = "\"marketId\":1,\"lastPrice\":\"20\",\"priceChange\":\"0\",\"priceChangePercent\":\"0\","
+        "\"high24h\":\"0\",\"low24h\":\"0\",\"volume24h\":\"0\",\"timestamp\":1699870440000";
+    CHECK_MSG(std::string::npos != all.find("{" + quiet1 + "}"), "quiet market missing from TICKERS: " + all);
+    CHECK(std::string::npos == all.find("\"marketId\":2,"));
     CHECK(std::string::npos != all.find("\"marketId\":3,"));
-    CHECK(*rig.trades.tickerStats(1).text ==
-        "{\"type\":\"TICKER_STATS\",\"marketId\":1,\"lastPrice\":\"0\",\"priceChange\":\"0\",\"priceChangePercent\":\"0\","
+    CHECK(*rig.trades.tickerStats(1).text == "{\"type\":\"TICKER_STATS\"," + quiet1 + "}");
+    CHECK(*rig.trades.tickerStats(2).text ==
+        "{\"type\":\"TICKER_STATS\",\"marketId\":2,\"lastPrice\":\"0\",\"priceChange\":\"0\",\"priceChangePercent\":\"0\","
         "\"high24h\":\"0\",\"low24h\":\"0\",\"volume24h\":\"0\",\"timestamp\":0}");
     // the exact scales: a quote volume of 10^-16 units and a percent of 10^-8 percent, cut to 8 digits toward zero
     CHECK("15000.00000001" == formatScaled(static_cast<Int128>(1'500'000'000'001LL) * 100'000'000LL, 16));
@@ -300,15 +305,24 @@ TEST(md_live_ticker_window_and_scales)
     Int128 big = 0;
     parseDecimal("500000000000000000000000000000000", big); // 5e32 units of 10^-16
     CHECK("50000000000000000" == formatScaled(big, 16));
-    // a day later the window is empty: market 3 leaves TICKERS (a change), and only once
+    // a day later market 3's window is empty: it turns quiet (its newest price, the 24 h values 0) and stays in TICKERS;
+    // the change is sent once
     auto c = rig.open(1);
     rig.cycle(1);
     const std::size_t before = c->frames.size();
     rig.wallMs += 25 * 3'600'000LL;
     rig.cycle(1000);
-    CHECK(c->frames.size() == before + 1 && std::string::npos != c->frames.back().text.find("\"tickers\":[]"));
+    const std::string quiet3 = "{\"marketId\":3,\"lastPrice\":\"15000.5\",\"priceChange\":\"0\",\"priceChangePercent\":"
+        "\"0\",\"high24h\":\"0\",\"low24h\":\"0\",\"volume24h\":\"0\",\"timestamp\":1700000130000}";
+    CHECK_MSG(c->frames.size() == before + 1 &&
+            std::string::npos != c->frames.back().text.find("\"tickers\":[{" + quiet1 + "}," + quiet3 + "]"),
+        "quiet markets in TICKERS: " + (c->frames.empty() ? std::string() : c->frames.back().text));
     rig.cycle(1000);
     CHECK(c->frames.size() == before + 1);
+    // a live trade makes the market active again
+    rig.live(trade(105, 3, 1'501'000'000'000, 10'000'000, true, rig.wallMs));
+    rig.cycle(25);
+    CHECK(std::string::npos != rig.trades.tickerStats(3).text->find("\"volume24h\":\"1501\""));
 }
 
 // ---------------------------------------------------------------- no party field on the public surface

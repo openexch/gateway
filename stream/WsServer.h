@@ -92,6 +92,7 @@ struct WsCounters
     std::atomic<std::uint64_t> httpRefused{ 0 };    // answered over HTTP without an upgrade
     std::atomic<std::uint64_t> authFailed{ 0 };
     std::atomic<std::uint64_t> opsRefused{ 0 };     // client ops refused because the command ring was full
+    std::atomic<std::uint64_t> framesSent{ 0 };     // frames written to clients (stream_ws_frames_sent_total)
     std::array<std::atomic<std::uint64_t>, COUNTED_CLOSE_CODES.size() + 1> closed{}; // by COUNTED_CLOSE_CODES, then other
 };
 

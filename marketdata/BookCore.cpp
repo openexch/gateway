@@ -141,7 +141,12 @@ void BookCore::onEgress(const std::uint8_t *payload, std::size_t length, std::in
         m_stats.dropped[MdStats::DROPPED_TEMPLATES.size()].fetch_add(1, std::memory_order_relaxed);
         return;
     }
+#ifdef MD_NC_DECODE_TRADE_EGRESS
+    // control build only (never published): a 26 TradeExecutionBatch is taken into the book decode
+    const bool book = codec::T_BOOK_SNAPSHOT == h.templateId || codec::T_BOOK_DELTA == h.templateId || 26 == h.templateId;
+#else
     const bool book = codec::T_BOOK_SNAPSHOT == h.templateId || codec::T_BOOK_DELTA == h.templateId;
+#endif
     if (!book && codec::T_CLUSTER_HEARTBEAT != h.templateId)
     {
         // counted and dropped before any field is read: 24 and 26 carry user and order ids
@@ -207,6 +212,7 @@ void BookCore::onBookFrame(const fwd::BookFrame &f, const std::uint8_t *payload,
         return;
     }
     (f.snapshot ? m_stats.snapshots : m_stats.deltas).fetch_add(1, std::memory_order_relaxed);
+    noteInput(id, nowNs);
     Market &m = market(id);
     refreshLadderFacts(id);
 #ifdef MD_NC_NO_CHAIN_CHECK
@@ -292,6 +298,16 @@ void BookCore::emit(int id, const Frame &frame)
     }
 }
 
+void BookCore::noteInput(int id, std::int64_t nowNs)
+{
+    if (market(id).subscribers.empty())
+    {
+        return; // nothing is owed to anyone
+    }
+    std::int64_t none = -1;
+    m_stats.inputMarkNs.compare_exchange_strong(none, nowNs, std::memory_order_acq_rel);
+}
+
 void BookCore::send(Conn &conn, const Frame &frame)
 {
     if (conn.outlet && conn.outlet->offer(frame))
@@ -354,6 +370,7 @@ int BookCore::tradeWork(std::int64_t nowNs)
     }
     for (const auto &out : m_trades->flushDue(nowNs))
     {
+        noteInput(out.first, nowNs);
         emit(out.first, out.second);
         work++;
     }
@@ -463,6 +480,15 @@ void BookCore::badRequest(std::uint64_t connId, const std::string &message)
     }
 }
 
+void BookCore::rateLimited(std::uint64_t connId, const std::string &message)
+{
+    const auto it = m_conns.find(connId);
+    if (m_conns.end() != it)
+    {
+        send(it->second, make(renderError("RATE_LIMITED", message), FrameType::ERROR));
+    }
+}
+
 void BookCore::resync(std::uint64_t connId, std::int64_t nowNs)
 {
     const auto it = m_conns.find(connId);
@@ -495,6 +521,15 @@ void BookCore::gone(std::uint64_t connId)
         subs.erase(std::remove(subs.begin(), subs.end(), connId), subs.end());
     }
     m_conns.erase(it);
+    bool anySubscriber = false;
+    for (const Market &m : m_markets)
+    {
+        anySubscriber = anySubscriber || !m.subscribers.empty();
+    }
+    if (!anySubscriber)
+    {
+        m_stats.inputMarkNs.store(-1, std::memory_order_release); // what was owed left with its subscribers
+    }
 }
 
 void BookCore::fillStatus(Status &s) const

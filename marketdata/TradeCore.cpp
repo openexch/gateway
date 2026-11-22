@@ -112,12 +112,35 @@ std::int64_t TradeCore::asOf() const
 std::optional<Ticker> TradeCore::tickerOf(int marketId, std::int64_t asOfMs) const
 {
     const Market *m = market(marketId);
-    if (nullptr == m || m->candles.empty())
+    if (nullptr == m)
     {
         return std::nullopt;
     }
-    const std::vector<CandleRow> candles(m->candles.begin(), m->candles.end());
-    return marketdata::tickerOf(marketId, candles, asOfMs);
+    if (!m->candles.empty())
+    {
+        const std::vector<CandleRow> candles(m->candles.begin(), m->candles.end());
+        if (std::optional<Ticker> t = marketdata::tickerOf(marketId, candles, asOfMs))
+        {
+            return t;
+        }
+    }
+    // a quiet market (trades, none in the 24 h window): the newest trade's price, every 24 h value 0, and it stays in
+    // TICKERS (the old service's rule); a market that never traded has no price and no entry
+    Ticker quiet;
+    quiet.marketId = marketId;
+    if (!m->tape.empty())
+    {
+        quiet.lastPrice = m->tape.back().price; // the tape is in journal order: the newest trade last
+    }
+    else if (!m->candles.empty())
+    {
+        quiet.lastPrice = m->candles.back().close;
+    }
+    else
+    {
+        return std::nullopt;
+    }
+    return quiet;
 }
 
 std::string TradeCore::tickerEntries(std::int64_t asOfMs) const

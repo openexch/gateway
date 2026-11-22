@@ -67,7 +67,7 @@ std::string renderError(const std::string &code, const std::string &message,
 std::string formatScaled(Int128 units, int scaleDigits);
 
 std::string renderTradesBatch(int marketId, const std::vector<TradeRow> &trades, std::int64_t timestampMs);
-// `ticker` empty: a market with no price in the window (every value 0, timestamp 0). `lastTradeMs`: the newest
+// `ticker` empty: a market that never traded (every value 0, timestamp 0). `lastTradeMs`: the newest
 // trade's journal timestamp.
 std::string renderTickerStats(int marketId, const std::optional<Ticker> &ticker, std::int64_t lastTradeMs);
 // The entries of TICKERS (the TICKER_STATS fields without "type"), one per market with a price, by market id.

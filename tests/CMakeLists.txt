@@ -507,10 +507,16 @@ set(GW_MD_TEST_SOURCES "${PROJECT_SOURCE_DIR}/marketdata/MarketDataSettings.cpp"
     "${PROJECT_SOURCE_DIR}/marketdata/BookCore.cpp" "${PROJECT_SOURCE_DIR}/marketdata/BookFrames.cpp"
     "${PROJECT_SOURCE_DIR}/marketdata/Candles.cpp" "${PROJECT_SOURCE_DIR}/marketdata/TradePath.cpp"
     "${PROJECT_SOURCE_DIR}/marketdata/TradeCore.cpp" "${PROJECT_SOURCE_DIR}/marketdata/CandleRoute.cpp"
-    "${PROJECT_SOURCE_DIR}/marketdata/MarketHistory.cpp")
+    "${PROJECT_SOURCE_DIR}/marketdata/MarketHistory.cpp" "${PROJECT_SOURCE_DIR}/marketdata/MdWsServer.cpp")
+# gw_md_test(target [defines...]): a define of the readiness rules (MD_NC_READY_LIVENESS, MD_NC_SEEN_MARKETS) also
+# compiles common/src/Readiness.cpp into the target, ahead of gw_common's copy.
 function(gw_md_test target)
+    set(extra "")
+    if("${ARGN}" MATCHES "MD_NC_READY_LIVENESS|MD_NC_SEEN_MARKETS")
+        set(extra "${PROJECT_SOURCE_DIR}/common/src/Readiness.cpp")
+    endif()
     add_executable(${target} unit/TestMain.cpp unit/MarketDataTest.cpp unit/MarketDataTradeTest.cpp
-        unit/MarketDataLiveTest.cpp ${GW_MD_TEST_SOURCES})
+        unit/MarketDataLiveTest.cpp unit/MdWsServerTest.cpp ${GW_MD_TEST_SOURCES} ${extra})
     target_include_directories(${target} PRIVATE unit "${GW_CT_GOLDEN_DIR}" "${PROJECT_SOURCE_DIR}/marketdata")
     target_compile_definitions(${target} PRIVATE GW_NO_ORDER_ENTRY
         GW_MD_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/golden/marketdata" ${ARGN})
@@ -520,6 +526,9 @@ function(gw_md_test target)
 endfunction()
 gw_md_test(gw_md_tests)
 add_test(NAME marketdata COMMAND gw_md_tests)
+# the build whose WebSocket sender drops every frame: clients_served must clear and the sent counter stay flat
+gw_md_test(gw_md_tc_send_drops MD_TC_SEND_DROPS)
+add_test(NAME marketdata.gw_md_tc_send_drops COMMAND gw_md_tc_send_drops md_ws_clients_served)
 # Controls for the market data rows: each build compiles the marketdata sources with one rule switched off (test-only
 # defines, never in a binary) and runs the case that guards it; the case must fail with the named text.
 #   MD_NC_NO_CHAIN_CHECK         every decoded delta is sent, whatever the ladder made of it
@@ -539,7 +548,21 @@ add_test(NAME marketdata COMMAND gw_md_tests)
 # and of the live side:
 #   MD_NC_EMPTY_SERIES           empty tape and candle series sent while the market history was down at the start
 #   MD_NC_REST_FROM_MEMORY       GET /api/candles answers a failed history read with 200 and the candles in hand
+# and of the public surface, the clients and readiness:
+#   MD_NC_TAKER_IN_TRADE         the trade entry carries the taker's user id
+#   MD_NC_DECODE_TRADE_EGRESS    a 26 egress frame is taken into the book decode
+#   MD_NC_NO_QUEUE_BOUND         a client queue without its MD_WS_QUEUE_BYTES bound
+#   MD_NC_READY_LIVENESS         /ready and /ready/book report process liveness
+#   MD_NC_SEEN_MARKETS           book_fresh judged on the markets seen so far
+#   MD_TC_SEND_DROPS+MD_NC_NO_CLIENTS_SERVED   a sender that drops its frames, with clients_served not judged
+# Defines joined by '+' go into one build.
 set(GW_MD_CONTROLS
+    "MD_NC_TAKER_IN_TRADE|md_live_no_party_fields|user field on the public surface: takerUserId"
+    "MD_NC_DECODE_TRADE_EGRESS|md_egress_templates_dropped_unread|non-market template was decoded: 26"
+    "MD_NC_NO_QUEUE_BOUND|md_ws_slow_client|client queue grew past its setting"
+    "MD_NC_READY_LIVENESS|md_readiness_egress_paused|ready without a fresh book"
+    "MD_NC_SEEN_MARKETS|md_readiness_expected_set|ready with no market snapshot"
+    "MD_TC_SEND_DROPS+MD_NC_NO_CLIENTS_SERVED|md_ws_clients_served|ready while no frame reaches a client"
     "MD_NC_EMPTY_SERIES|md_live_history_down_at_start|empty series sent without the history"
     "MD_NC_REST_FROM_MEMORY|md_candles_route_history_down|REST candles answered without the history"
     "MD_NC_WALLCLOCK_BUCKET|md_candles_function_of_trade_set|candle bucket depends on arrival time"
@@ -561,7 +584,9 @@ foreach(control IN LISTS GW_MD_CONTROLS)
     list(GET parts 1 case)
     list(GET parts 2 text)
     string(TOLOWER "${define}" target)
-    string(REPLACE "md_nc_" "gw_md_nc_" target "${target}")
+    string(REPLACE "+" "_" target "${target}")
+    string(REGEX REPLACE "^md_" "gw_md_" target "${target}")
+    string(REPLACE "+" ";" define "${define}")
     gw_md_test(${target} ${define})
     add_test(NAME marketdata.${target} COMMAND ${target} ${case})
     set_tests_properties(marketdata.${target} PROPERTIES PASS_REGULAR_EXPRESSION "${text}")

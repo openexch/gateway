@@ -247,6 +247,11 @@ void parseDriverSettings(SettingsReader &r, const std::string &prefix, const clu
 void checkSessionChannel(SettingsReader &r, const std::string &name, const std::string &uri, bool response);
 // host:port (IPv6 as [addr]:port); `ipv4Only` for an admin bind. nullopt with `why` (the expected form).
 std::optional<Bind> parseBindText(const std::string &text, bool ipv4Only, std::string &why);
+// <key>: trusted proxies, IP addresses or CIDR blocks (unset: none), appended to `out`. The gateway's
+// GATEWAY_TRUSTED_PROXIES rule under another key.
+void parseTrustedProxies(SettingsReader &r, const std::string &key, std::vector<std::string> &out);
+// <key>: the client-IP header read behind a trusted proxy (an HTTP header name); unset keeps `out` (the default).
+void parseClientIpHeader(SettingsReader &r, const std::string &key, std::string &out);
 
 // The cluster session settings these values make (the client's defaults otherwise).
 cluster_tools::client::ClientSettings sessionClientSettings(const CommonSettings &settings, const char *processName);

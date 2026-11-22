@@ -109,6 +109,9 @@ struct MdStats
     std::atomic<std::int64_t> booksStale{ 0 };          // md_books_stale (expected markets not fresh)
     std::atomic<std::uint64_t> sessionsEnded{ 0 };
     std::atomic<std::uint64_t> resyncs{ 0 };            // md_ws_resyncs_total
+    // clients_served: the monotonic time of the oldest source input (a book frame or a trade flush of a market with a
+    // subscriber) that no finished write has followed yet; -1 none. Set here, cleared by the I/O side (MdWsServer).
+    std::atomic<std::int64_t> inputMarkNs{ -1 };
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FrameType::COUNT)> queued{};
 };
 
@@ -139,6 +142,7 @@ public:
     void refresh(std::uint64_t connId, std::int64_t marketId, std::int64_t nowNs);
     void ping(std::uint64_t connId);
     void badRequest(std::uint64_t connId, const std::string &message);
+    void rateLimited(std::uint64_t connId, const std::string &message); // ERROR RATE_LIMITED
     void resync(std::uint64_t connId, std::int64_t nowNs); // the connection drained after its queue bound
     void gone(std::uint64_t connId);
 
@@ -175,6 +179,7 @@ private:
     void onBookFrame(const cluster_tools::domain::forwarder::BookFrame &frame, const std::uint8_t *payload,
         std::size_t length, std::int64_t nowNs);
     void emit(int marketId, const Frame &frame);
+    void noteInput(int marketId, std::int64_t nowNs); // a source input for a market with a subscriber
     void emitStale(int marketId, std::int64_t nowNs);
     Frame snapshotFrame(int marketId, std::int64_t nowNs, Sent *kind) const;
     void initialState(std::uint64_t connId, Conn &conn, std::int64_t nowNs);

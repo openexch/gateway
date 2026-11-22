@@ -80,10 +80,20 @@ Taken takeRecord(const std::uint8_t *frame, std::size_t length, std::uint16_t te
         return Taken::ADVANCE; // records 2..5: only the sequence advances, no field of them is read
     }
     jc::TradeRecord t;
+#ifdef MD_NC_TAKER_IN_TRADE
+    // control build only (never published): the parties are read and the taker's user id rides along
+    jc::TradeParties parties;
+    if (!jc::decodeTrade(frame, length, t, &parties))
+    {
+        return Taken::BAD_RECORD;
+    }
+    out.takerUserId = parties.takerUserId;
+#else
     if (!jc::decodeTrade(frame, length, t)) // no parties: the order and user ids are never read
     {
         return Taken::BAD_RECORD;
     }
+#endif
     if (t.takerIsBuyRaw > 1)
     {
         return Taken::BAD_RECORD;

@@ -526,7 +526,8 @@ void parseCommon(SettingsReader &r, Role role, const rt::DirProbe &probe, Common
     }
 }
 
-void checkProxies(SettingsReader &r, const std::optional<std::string> &value, std::vector<std::string> &out)
+void checkProxies(SettingsReader &r, const std::string &key, const std::optional<std::string> &value,
+    std::vector<std::string> &out)
 {
     if (!value)
     {
@@ -535,7 +536,7 @@ void checkProxies(SettingsReader &r, const std::optional<std::string> &value, st
     const auto items = splitList(*value);
     if (!items)
     {
-        r.problem("GATEWAY_TRUSTED_PROXIES must be a comma-separated list with no empty item");
+        r.problem(key + " must be a comma-separated list with no empty item");
         return;
     }
     for (const std::string &item : *items)
@@ -555,7 +556,7 @@ void checkProxies(SettingsReader &r, const std::optional<std::string> &value, st
         }
         if (!ok)
         {
-            r.problem("GATEWAY_TRUSTED_PROXIES: '" + item + "' is not an IP address or CIDR block");
+            r.problem(key + ": '" + item + "' is not an IP address or CIDR block");
         }
         else
         {
@@ -660,6 +661,29 @@ void checkSessionChannel(SettingsReader &r, const std::string &name, const std::
 std::optional<Bind> parseBindText(const std::string &text, bool ipv4Only, std::string &why)
 {
     return parseBind(text, ipv4Only, why);
+}
+
+void parseTrustedProxies(SettingsReader &r, const std::string &key, std::vector<std::string> &out)
+{
+    checkProxies(r, key, r.optionalString(key, "a list of IP addresses or CIDR blocks"), out);
+}
+
+void parseClientIpHeader(SettingsReader &r, const std::string &key, std::string &out)
+{
+    const std::optional<std::string> header = r.raw(key);
+    if (!header)
+    {
+        r.record(key, out, "default");
+    }
+    else if (!isHeaderToken(*header))
+    {
+        r.problem(key + " must be an HTTP header name (letters, digits, '-'), got '" + *header + "'");
+    }
+    else
+    {
+        out = *header;
+        r.record(key, *header, "set");
+    }
 }
 
 const char *driverModeName(DriverMode mode) noexcept
@@ -785,24 +809,8 @@ ParseResult<GatewaySettings> parseGatewaySettings(const Environment &env, const 
             std::to_string(g.maxHeaderBytes));
     }
     g.httpIdleTimeoutMs = r.positive("GATEWAY_HTTP_IDLE_TIMEOUT_MS", g.httpIdleTimeoutMs);
-    checkProxies(r, r.optionalString("GATEWAY_TRUSTED_PROXIES", "a list of IP addresses or CIDR blocks"),
-        g.trustedProxies);
-    {
-        const std::optional<std::string> header = r.raw("GATEWAY_CLIENT_IP_HEADER");
-        if (!header)
-        {
-            r.record("GATEWAY_CLIENT_IP_HEADER", g.clientIpHeader, "default");
-        }
-        else if (!isHeaderToken(*header))
-        {
-            r.problem("GATEWAY_CLIENT_IP_HEADER must be an HTTP header name (letters, digits, '-'), got '" + *header + "'");
-        }
-        else
-        {
-            g.clientIpHeader = *header;
-            r.record("GATEWAY_CLIENT_IP_HEADER", *header, "set");
-        }
-    }
+    parseTrustedProxies(r, "GATEWAY_TRUSTED_PROXIES", g.trustedProxies);
+    parseClientIpHeader(r, "GATEWAY_CLIENT_IP_HEADER", g.clientIpHeader);
     if (const auto cors = r.optionalString("GATEWAY_CORS_ORIGINS", "a list of http(s)://host[:port] origins"))
     {
         const auto items = splitList(*cors);

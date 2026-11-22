@@ -117,6 +117,7 @@ public:
                 case MdCommand::Kind::BAD: m_core.badRequest(c.connId, c.text); break;
                 case MdCommand::Kind::RESYNC: m_core.resync(c.connId, now); break;
                 case MdCommand::Kind::GONE: m_core.gone(c.connId); break;
+                case MdCommand::Kind::LIMITED: m_core.rateLimited(c.connId, c.text); break;
                 case MdCommand::Kind::NONE: break;
             }
             c = MdCommand{};
@@ -264,7 +265,7 @@ private:
 class MarketDataFront final : public FrontWork
 {
 public:
-    MarketDataFront(const MarketDataSettings &s, MdCommandRing &commands, const MdStats &stats, TradeShared &trades,
+    MarketDataFront(const MarketDataSettings &s, MdCommandRing &commands, MdStats &stats, TradeShared &trades,
         HistoryWriter &writer) :
         m_settings(s), m_stats(stats), m_trades(trades), m_writer(writer)
     {
@@ -288,7 +289,14 @@ public:
         ws.idleMs = s.wsIdleMs;
         ws.maxFrame = s.wsMaxFrame;
         ws.sendStallMs = s.sendStallMs;
-        m_server = std::make_unique<MdWsServer>(ws, commands, m_candles.get());
+        ws.connectRate = s.connectRate;
+        ws.connectBurst = s.connectBurst;
+        ws.messageRate = s.messageRate;
+        ws.messageBurst = s.messageBurst;
+        ws.trustedProxies = s.trustedProxies;
+        ws.clientIpHeader = s.clientIpHeader;
+        ws.sourceV6PrefixBits = static_cast<int>(s.sourceV6PrefixBits);
+        m_server = std::make_unique<MdWsServer>(ws, commands, m_candles.get(), &stats.inputMarkNs);
     }
     ~MarketDataFront() override { stop(m_settings.common.stopTimeoutMs); }
 
@@ -411,6 +419,12 @@ public:
         line("counter", "ws_resyncs_total", "Fresh initial states sent after a queue bound.", std::to_string(s.resyncs.load()));
         line("counter", "ws_queue_drops_total", "Client queues dropped at MD_WS_QUEUE_BYTES.",
             std::to_string(w.queueDrops.load()));
+        line("gauge", "ws_queue_high_water_bytes", "The most bytes one connection held queued (bounded by "
+            "MD_WS_QUEUE_BYTES).", std::to_string(w.queueHighWater.load()));
+        out += "# HELP " + p + "rate_limited_total Public requests and client frames refused by a source budget, by "
+            "budget.\n# TYPE " + p + "rate_limited_total counter\n" + p + "rate_limited_total{budget=\"connect\"} " +
+            std::to_string(w.limitedConnects.load()) + "\n" + p + "rate_limited_total{budget=\"message\"} " +
+            std::to_string(w.limitedMessages.load()) + "\n";
         line("counter", "ws_closed_slow_total", "Connections closed after MD_WS_UNWRITABLE_CLOSE_MS without a finished "
             "write.", std::to_string(w.closedSlow.load()));
         // the trade path. journal_seq is the committed cursor md_state.last_journal_seq and nothing else (the console's
