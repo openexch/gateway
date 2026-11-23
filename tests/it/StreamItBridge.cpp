@@ -200,6 +200,9 @@ int main(int argc, char **argv)
                         int market, buy;
                         in >> tradeId >> market >> takerOrder >> takerUser >> makerOrder >> makerUser >> price >> qty >> buy;
                         std::vector<std::uint8_t> b(256, 0);
+                        // the ME's own clock (epoch ms), as the matching engine stamps a trade; never 0
+                        const std::int64_t meNowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count();
                         money::MeJournalTrade t;
                         t.wrapAndApplyHeader(reinterpret_cast<char *>(b.data()), 0, b.size())
                             .egressSeq(tradeId)
@@ -212,7 +215,7 @@ int main(int argc, char **argv)
                             .price(price)
                             .quantity(qty)
                             .takerIsBuy(buy ? money::BoolFlag::TRUE : money::BoolFlag::FALSE)
-                            .meTimestamp(0)
+                            .meTimestamp(meNowMs)
                             .takerOmsOrderId(takerOrder)
                             .makerOmsOrderId(makerOrder)
                             .meEpoch(1)
