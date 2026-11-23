@@ -219,9 +219,14 @@ def run(args, cluster, procs):
           "connect: the bridge line has the core's cursor and no matching-engine head (null)", json.dumps(f["bridge"]))
     nodes = f["core"]["nodes"]
     check(len(nodes) == 3 and sorted(n["id"] for n in nodes) == [0, 1, 2], "connect: a row per configured node")
-    check(all(n["snapshot"]["stateHash"] is None and n["version"] is None and n["buildCommit"] is None and
-              n["entriesBehind"] is None for n in nodes),
-          "connect: snapshot state hash, version, build commit and entries behind are null (no source)")
+    # the core's /health ends with version= and build= (cluster-kit BuildInfo, core #158): a dev jar without
+    # Implementation-Version says version=unknown; build= is the jar's Build-Sha. stateHash is null until a snapshot.
+    check(all(isinstance(n["version"], str) and n["version"] and isinstance(n["buildCommit"], str) and n["buildCommit"]
+              for n in nodes),
+          "connect: version and build commit come from each node's /health", json.dumps(nodes))
+    check(all(n["entriesBehind"] is None and (n["snapshot"]["stateHash"] is None or n["snapshot"]["stateHash"].isdigit())
+              for n in nodes),
+          "connect: entries behind null (no source), snapshot state hash null or decimal", json.dumps(nodes))
 
     # ---- roles against each member's own /metrics
     ok = wait_until(lambda: latest(ws)["core"]["leaderId"] == leader, 10)
