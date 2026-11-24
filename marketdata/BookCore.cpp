@@ -96,7 +96,7 @@ MdBookState BookCore::bookState(int marketId, std::int64_t nowNs) const noexcept
 #ifdef MD_NC_NO_EXPECTED_SET_CHECK
     s.expected = true;
 #endif
-    return mdBookState(s, m_lastHeartbeatNs, nowNs, m_settings.bounds);
+    return mdBookState(s, m_lastMeFrameNs, nowNs, m_settings.bounds);
 }
 
 void BookCore::refreshLadderFacts(int marketId)
@@ -117,6 +117,7 @@ void BookCore::onSessionEnd(std::int64_t nowNs)
     m_stats.sessionsEnded.fetch_add(1, std::memory_order_relaxed);
     m_sessionUp = false;
     m_lastHeartbeatNs = -1;
+    m_lastMeFrameNs = -1;
     m_stitcher.onMeSessionEnd(nowNs);
     for (int id = 1; id <= fwd::TICK_MARKETS; ++id)
     {
@@ -141,6 +142,12 @@ void BookCore::onEgress(const std::uint8_t *payload, std::size_t length, std::in
         m_stats.dropped[MdStats::DROPPED_TEMPLATES.size()].fetch_add(1, std::memory_order_relaxed);
         return;
     }
+#ifndef MD_NC_HEARTBEAT_ONLY_LIVENESS
+    if (codec::MATCH_VERSION == h.version && frameTerm >= sessionTerm)
+    {
+        m_lastMeFrameNs = nowNs; // any frame of this session's term is the ME alive (heartbeats stop under traffic)
+    }
+#endif
 #ifdef MD_NC_DECODE_TRADE_EGRESS
     // control build only (never published): a 26 TradeExecutionBatch is taken into the book decode
     const bool book = codec::T_BOOK_SNAPSHOT == h.templateId || codec::T_BOOK_DELTA == h.templateId || 26 == h.templateId;
@@ -170,6 +177,7 @@ void BookCore::onEgress(const std::uint8_t *payload, std::size_t length, std::in
         {
             m_stats.heartbeats.fetch_add(1, std::memory_order_relaxed);
             m_lastHeartbeatNs = nowNs;
+            m_lastMeFrameNs = nowNs; // a heartbeat of any term, as before
             m_meEpoch = epoch;
         }
         return;
@@ -536,6 +544,7 @@ void BookCore::fillStatus(Status &s) const
 {
     s.mdSessionUp = m_sessionUp;
     s.mdLastHeartbeatNs = m_lastHeartbeatNs;
+    s.mdLastMeFrameNs = m_lastMeFrameNs;
     s.mdMeEpoch = m_meEpoch;
     for (std::size_t i = 0; i < m_markets.size(); ++i)
     {

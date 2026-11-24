@@ -213,6 +213,8 @@ set_tests_properties(stream PROPERTIES ENVIRONMENT "LD_PRELOAD=$<TARGET_FILE:gw_
 #   GW_NC_COALESCE_FILLS        fill frames of one order coalesce like order frames
 #   GW_NC_ROUTE_BY_FRAME_USER   a userId in a client frame rebinds the connection instead of closing it 4003
 #   GW_NC_FILL_ZERO_TRADE       a FILL with tradeId 0 goes out as a fill frame
+#   GW_NC_ANON_USER_BOUND       an anonymous connection is held to the signed-in outbound bound, not its own
+#   GW_NC_CLOSE_WAITS_FOR_READ  a close the server starts releases the connection only through the read loop
 set(GW_STREAM_CONTROLS
     "GW_NC_STITCH_INCLUSIVE|stream_stitch_across_pages|duplicate event [0-9]+"
     "GW_NC_SINGLE_PAGE_ASOF|stream_stitch_across_pages|client state differs from oracle"
@@ -223,7 +225,9 @@ set(GW_STREAM_CONTROLS
     "GW_NC_UNBOUNDED_QUEUE|stream_slow_client_bound|queue exceeded bound"
     "GW_NC_COALESCE_FILLS|stream_fills_never_coalesce|fill [0-9]+ missing"
     "GW_NC_ROUTE_BY_FRAME_USER|ws_no_foreign_event|foreign event delivered"
-    "GW_NC_FILL_ZERO_TRADE|stream_no_fill_frame_without_a_trade|fill frame with tradeId 0")
+    "GW_NC_FILL_ZERO_TRADE|stream_no_fill_frame_without_a_trade|fill frame with tradeId 0"
+    "GW_NC_ANON_USER_BOUND|stream_anonymous_slow_client_bound|a slow anonymous client is closed 4001 at its bound"
+    "GW_NC_CLOSE_WAITS_FOR_READ|ws_server_close_frees_the_slot|a server close held its connection")
 foreach(control IN LISTS GW_STREAM_CONTROLS)
     string(REPLACE "|" ";" parts "${control}")
     list(GET parts 0 define)
@@ -559,6 +563,7 @@ add_test(NAME marketdata.gw_md_tc_send_drops COMMAND gw_md_tc_send_drops md_ws_c
 #   MD_NC_NO_QUEUE_BOUND         a client queue without its MD_WS_QUEUE_BYTES bound
 #   MD_NC_READY_LIVENESS         /ready and /ready/book report process liveness
 #   MD_NC_SEEN_MARKETS           book_fresh judged on the markets seen so far
+#   MD_NC_HEARTBEAT_ONLY_LIVENESS  me_session judged on ClusterHeartbeats only (they stop under traffic)
 #   MD_TC_SEND_DROPS+MD_NC_NO_CLIENTS_SERVED   a sender that drops its frames, with clients_served not judged
 # Defines joined by '+' go into one build.
 set(GW_MD_CONTROLS
@@ -567,6 +572,7 @@ set(GW_MD_CONTROLS
     "MD_NC_NO_QUEUE_BOUND|md_ws_slow_client|client queue grew past its setting"
     "MD_NC_READY_LIVENESS|md_readiness_egress_paused|ready without a fresh book"
     "MD_NC_SEEN_MARKETS|md_readiness_expected_set|ready with no market snapshot"
+    "MD_NC_HEARTBEAT_ONLY_LIVENESS|md_readiness_book_frames_are_liveness|me_session lost under traffic with no heartbeat"
     "MD_TC_SEND_DROPS+MD_NC_NO_CLIENTS_SERVED|md_ws_clients_served|ready while no frame reaches a client"
     "MD_NC_EMPTY_SERIES|md_live_history_down_at_start|empty series sent without the history"
     "MD_NC_REST_FROM_MEMORY|md_candles_route_history_down|REST candles answered without the history"

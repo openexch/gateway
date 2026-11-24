@@ -77,6 +77,8 @@ st::StreamCoreSettings coreSettings(const StreamSettings &s)
     c.heartbeatMs = s.heartbeatMs;
     c.wsQueueMessages = s.wsQueueMessages;
     c.wsQueueBytes = s.wsQueueBytes;
+    c.anonQueueMessages = s.anonQueueMessages;
+    c.anonQueueBytes = s.anonQueueBytes;
     c.balanceStream = s.balanceStream;
     return c;
 }
@@ -132,7 +134,14 @@ public:
             switch (c.kind)
             {
                 case st::StreamCommand::Kind::OPEN:
-                    m_core.open(c.connId, c.userId, std::move(c.outlet), now);
+                    if (c.anonymous)
+                    {
+                        m_core.openAnonymous(c.connId, std::move(c.outlet), now);
+                    }
+                    else
+                    {
+                        m_core.open(c.connId, c.userId, std::move(c.outlet), now);
+                    }
                     break;
                 case st::StreamCommand::Kind::SUBSCRIBE:
                     m_core.subscribe(c.connId, c.channels,
@@ -240,6 +249,7 @@ public:
         ws.port = c.publicBind.port;
         ws.ioThreads = static_cast<int>(c.ioThreads);
         ws.maxConnections = c.maxConnections;
+        ws.anonMaxConnections = s.anonMaxConnections;
         ws.authTimeoutMs = s.wsAuthTimeoutMs;
         ws.pingMs = s.wsPingMs;
         ws.idleMs = s.wsIdleMs;
@@ -276,7 +286,8 @@ public:
     {
         const st::WsCounters &w = m_server->counters();
         return ",\"ws\":{\"accepting\":" + std::string(m_server->accepting() ? "true" : "false") + ",\"connections\":" +
-            std::to_string(w.connections.load()) + ",\"refusedConnections\":" + std::to_string(w.refused.load()) +
+            std::to_string(w.connections.load()) + ",\"anonConnections\":" + std::to_string(w.anonConnections.load()) +
+            ",\"refusedConnections\":" + std::to_string(w.refused.load()) +
             "},\"window\":{\"firstSeq\":" + std::to_string(m_stats.windowFirstSeq.load()) + ",\"watermark\":" +
             std::to_string(m_stats.watermark.load()) + "},\"users\":{\"known\":" + std::to_string(m_stats.users.load()) +
             ",\"cached\":" + std::to_string(m_stats.usersCached.load()) + "},\"engine\":{\"coreNodes\":" +
@@ -311,6 +322,13 @@ public:
             std::to_string(w.refused.load()));
         line("counter", "ws_auth_failed_total", "Connections whose credential was refused or missing.",
             std::to_string(w.authFailed.load()));
+        line("gauge", "ws_anon_connections", "Anonymous (signed-out, engine status only) WebSocket connections held.",
+            std::to_string(w.anonConnections.load()));
+        out += "# HELP " + p + "ws_anon_refused_total Anonymous refusals: first frames closed 1013 above "
+            "STREAM_ANON_MAX_CONNECTIONS (capacity), ops refused on an anonymous connection (op).\n# TYPE " + p +
+            "ws_anon_refused_total counter\n" + p + "ws_anon_refused_total{reason=\"capacity\"} " +
+            std::to_string(w.anonRefusedCapacity.load()) + "\n" + p + "ws_anon_refused_total{reason=\"op\"} " +
+            std::to_string(w.anonRefusedOps.load()) + "\n";
         line("counter", "ws_ops_refused_total", "Client ops refused because the command ring was full.",
             std::to_string(w.opsRefused.load()));
         line("counter", "ws_frames_sent_total", "Frames written to clients (a finished WebSocket write).",

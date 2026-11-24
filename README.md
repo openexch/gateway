@@ -198,10 +198,14 @@ Credential, exactly one of:
 - `Authorization` or `X-API-Key`
 - a first frame `{"op":"auth","token":"..."}` within `STREAM_WS_AUTH_TIMEOUT_MS`
 
-A query string is refused with 400. Any `userId` in a client frame closes the connection with 4003. Other
-close codes: 1008 auth failure or timeout, 1013 users store unavailable or ring full, 1001 idle.
+Or none, for the engine status only: a first frame `{"op":"subscribe","channels":["engine"]}` opens an
+anonymous connection that gets `engine` and `election` frames and nothing of any user, at most
+`STREAM_ANON_MAX_CONNECTIONS` (500, below `STREAM_MAX_CONNECTIONS`) per instance (docs/api.md 5.8).
 
-Client frames: `subscribe` `{channels: orders|fills|balances, resume:{eventSeq}?}`, `unsubscribe`, `ping`.
+A query string is refused with 400. Any `userId` in a client frame closes the connection with 4003. Other
+close codes: 1008 auth failure or timeout, 1013 users store unavailable, ring full or the anonymous cap, 1001 idle.
+
+Client frames: `subscribe` `{channels: orders|fills|balances|engine, resume:{eventSeq}?}`, `unsubscribe`, `ping`.
 Server frames: `subscribed`, `snapshot`, `order`, `fill`, `balance`, `admission`, `heartbeat` `{eventSeq}`,
 `pong`, `resync` `{reason}`, `error`, `engine`, `election`.
 

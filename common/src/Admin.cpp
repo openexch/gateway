@@ -157,7 +157,8 @@ std::string renderHealth(const AdminView &v, int &status)
     else if (Role::MARKETDATA == v.role)
     {
         out += ",\"me\":{\"sessionUp\":" + std::string(b(s.mdSessionUp)) + ",\"heartbeatAgeMs\":" +
-            ageMs(s.mdLastHeartbeatNs, v.nowNs) + ",\"meEpoch\":" + std::to_string(s.mdMeEpoch) + "}";
+            ageMs(s.mdLastHeartbeatNs, v.nowNs) + ",\"lastFrameAgeMs\":" + ageMs(s.mdLastMeFrameNs, v.nowNs) +
+            ",\"meEpoch\":" + std::to_string(s.mdMeEpoch) + "}";
         out += ",\"books\":{";
         bool first = true;
         for (std::size_t i = 0; i < s.mdMarkets.size(); ++i)
@@ -168,7 +169,7 @@ std::string renderHealth(const AdminView &v, int &status)
                 continue;
             }
             out += (first ? "\"" : ",\"") + std::to_string(i + 1) + "\":{\"state\":" +
-                q(nameOf(mdBookState(m, s.mdLastHeartbeatNs, v.nowNs, v.marketDataBounds))) + ",\"empty\":" +
+                q(nameOf(mdBookState(m, s.mdLastMeFrameNs, v.nowNs, v.marketDataBounds))) + ",\"empty\":" +
                 b(m.empty) + ",\"lastFrameAgeMs\":" + ageMs(m.lastBookFrameNs, v.nowNs) + "}";
             first = false;
         }

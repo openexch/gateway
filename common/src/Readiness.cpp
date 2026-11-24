@@ -71,12 +71,12 @@ const char *nameOf(MdBookState state) noexcept
     return "stale";
 }
 
-bool mdHeartbeatFresh(std::int64_t lastHeartbeatNs, std::int64_t nowNs, const MarketDataReadyBounds &bounds) noexcept
+bool mdEgressFresh(std::int64_t lastMeFrameNs, std::int64_t nowNs, const MarketDataReadyBounds &bounds) noexcept
 {
-    return lastHeartbeatNs >= 0 && nowNs - lastHeartbeatNs < bounds.egressStaleMs * 1'000'000LL;
+    return lastMeFrameNs >= 0 && nowNs - lastMeFrameNs < bounds.egressStaleMs * 1'000'000LL;
 }
 
-MdBookState mdBookState(const MdMarketStatus &m, std::int64_t lastHeartbeatNs, std::int64_t nowNs,
+MdBookState mdBookState(const MdMarketStatus &m, std::int64_t lastMeFrameNs, std::int64_t nowNs,
     const MarketDataReadyBounds &bounds) noexcept
 {
     if (!m.expected)
@@ -92,7 +92,7 @@ MdBookState mdBookState(const MdMarketStatus &m, std::int64_t lastHeartbeatNs, s
         return MdBookState::BROKEN;
     }
     const bool recentFrame = m.lastBookFrameNs >= 0 && nowNs - m.lastBookFrameNs < bounds.bookStaleMs * 1'000'000LL;
-    if (recentFrame || (m.empty && mdHeartbeatFresh(lastHeartbeatNs, nowNs, bounds)))
+    if (recentFrame || (m.empty && mdEgressFresh(lastMeFrameNs, nowNs, bounds)))
     {
         return MdBookState::FRESH;
     }
@@ -103,7 +103,7 @@ namespace {
 
 bool mdSession(const Status &s, std::int64_t nowNs, const MarketDataReadyBounds &bounds)
 {
-    return s.mdSessionUp && mdHeartbeatFresh(s.mdLastHeartbeatNs, nowNs, bounds);
+    return s.mdSessionUp && mdEgressFresh(s.mdLastMeFrameNs, nowNs, bounds);
 }
 
 bool mdBooksFresh(const Status &s, std::int64_t nowNs, const MarketDataReadyBounds &bounds)
@@ -124,7 +124,7 @@ bool mdBooksFresh(const Status &s, std::int64_t nowNs, const MarketDataReadyBoun
             continue;
         }
         any = true;
-        if (MdBookState::FRESH != mdBookState(m, s.mdLastHeartbeatNs, nowNs, bounds))
+        if (MdBookState::FRESH != mdBookState(m, s.mdLastMeFrameNs, nowNs, bounds))
         {
             return false;
         }

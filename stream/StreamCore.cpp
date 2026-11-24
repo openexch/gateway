@@ -22,7 +22,7 @@ std::string channelsJson(unsigned channels)
     std::string out = "[";
     bool first = true;
     for (const auto &[bit, name] : { std::pair{ channel::ORDERS, "orders" }, std::pair{ channel::FILLS, "fills" },
-             std::pair{ channel::BALANCES, "balances" } })
+             std::pair{ channel::BALANCES, "balances" }, std::pair{ channel::ENGINE, "engine" } })
     {
         if (0 != (channels & bit))
         {
@@ -237,8 +237,17 @@ void StreamCore::onAdmission(const wire::AdmissionState &a)
         ",\"circuitBreaker\":" + (a.circuitBreaker ? "true" : "false") + "}");
     for (auto &[id, c] : m_conns)
     {
-        enqueue(c, frame);
+        if (!c.anonymous) // the admission gate goes to signed-in connections only
+        {
+            enqueue(c, frame);
+        }
     }
+}
+
+// an anonymous connection gets engine and election frames while it holds the engine channel; a signed-in one always
+static bool wantsEngine(bool anonymous, unsigned subscribed) noexcept
+{
+    return !anonymous || 0 != (subscribed & channel::ENGINE);
 }
 
 void StreamCore::onEngineStatus(Text frame)
@@ -246,7 +255,10 @@ void StreamCore::onEngineStatus(Text frame)
     m_engineStatus = std::move(frame);
     for (auto &[id, c] : m_conns)
     {
-        enqueue(c, m_engineStatus, ENGINE_FRAME_KEY);
+        if (wantsEngine(c.anonymous, c.subscribed))
+        {
+            enqueue(c, m_engineStatus, ENGINE_FRAME_KEY);
+        }
     }
 }
 
@@ -254,7 +266,10 @@ void StreamCore::onEngineEvent(const Text &frame)
 {
     for (auto &[id, c] : m_conns)
     {
-        enqueue(c, frame);
+        if (wantsEngine(c.anonymous, c.subscribed))
+        {
+            enqueue(c, frame);
+        }
     }
 }
 
@@ -629,7 +644,7 @@ void StreamCore::overrun(std::int64_t newWatermark, ResyncReason reason)
     // re-snapshots in the order of the oldest connection (the scheduler paces them through the budget)
     for (Conn *c : order)
     {
-        if (!c->closing)
+        if (!c->closing && !c->anonymous)
         {
             ensureSnapshots(*c, m_users.at(c->userId));
         }
@@ -975,12 +990,41 @@ void StreamCore::open(std::uint64_t connId, std::int64_t userId, std::shared_ptr
     }
 }
 
+void StreamCore::openAnonymous(std::uint64_t connId, std::shared_ptr<Outlet> outlet, std::int64_t)
+{
+    Conn &c = m_conns[connId];
+    c.id = connId;
+    c.userId = 0;
+    c.anonymous = true;
+    c.openOrder = ++m_nextOpenOrder;
+    c.out = std::move(outlet);
+    c.subscribed = channel::ENGINE;
+    m_stats.connections.store(static_cast<std::int64_t>(m_conns.size()), std::memory_order_relaxed);
+    enqueue(c, text("{\"type\":\"subscribed\",\"channels\":" + channelsJson(c.subscribed) + "}"));
+    if (m_engineStatus)
+    {
+        enqueue(c, m_engineStatus, ENGINE_FRAME_KEY);
+    }
+}
+
 void StreamCore::subscribe(std::uint64_t connId, unsigned channels, std::optional<std::int64_t> resumeFrom,
     std::int64_t nowNs, std::int64_t frameUserId)
 {
     Conn *c = conn(connId);
     if (nullptr == c || c->closing)
     {
+        return;
+    }
+    if (c->anonymous)
+    {
+        // the I/O side refuses every other channel and a resume; whatever reaches here, only `engine` is taken
+        const unsigned added = channels & channel::ENGINE & ~c->subscribed;
+        c->subscribed |= channels & channel::ENGINE;
+        enqueue(*c, text("{\"type\":\"subscribed\",\"channels\":" + channelsJson(c->subscribed) + "}"));
+        if (0 != added && m_engineStatus)
+        {
+            enqueue(*c, m_engineStatus, ENGINE_FRAME_KEY);
+        }
         return;
     }
 #ifdef GW_NC_ROUTE_BY_FRAME_USER
@@ -1248,6 +1292,14 @@ void StreamCore::enqueue(Conn &c, Text frame, std::int64_t key)
         return;
     }
     const std::int64_t before = c.queuedMessages + c.out->unwrittenMessages();
+#ifdef GW_NC_ANON_USER_BOUND
+    // test-only control: an anonymous connection is held to the signed-in bound
+    const std::int64_t boundMessages = m_settings.wsQueueMessages;
+    const std::int64_t boundBytes = m_settings.wsQueueBytes;
+#else
+    const std::int64_t boundMessages = c.anonymous ? m_settings.anonQueueMessages : m_settings.wsQueueMessages;
+    const std::int64_t boundBytes = c.anonymous ? m_settings.anonQueueBytes : m_settings.wsQueueBytes;
+#endif
     if (0 != key)
     {
         const auto f = c.orderFrameAt.find(key);
@@ -1286,8 +1338,8 @@ void StreamCore::enqueue(Conn &c, Text frame, std::int64_t key)
     // The byte test leaves out the largest frame handed over since the connection was last empty: a frame larger than
     // the byte bound on its own (a large snapshot) still goes out, with the frames that follow it inside the bound (it
     // could never be sent otherwise); the bound is on what waits behind it.
-    const bool overBytes = c.queuedBytes + c.out->unwrittenBytes() - c.largestFrameBytes > m_settings.wsQueueBytes;
-    if (messages > m_settings.wsQueueMessages || overBytes)
+    const bool overBytes = c.queuedBytes + c.out->unwrittenBytes() - c.largestFrameBytes > boundBytes;
+    if (messages > boundMessages || overBytes)
     {
         m_stats.closedAtBound.fetch_add(1, std::memory_order_relaxed);
         closeConn(c, close_code::RESYNC, "RESYNC");
@@ -1295,6 +1347,8 @@ void StreamCore::enqueue(Conn &c, Text frame, std::int64_t key)
     }
 #else
     (void)before;
+    (void)boundMessages;
+    (void)boundBytes;
 #endif
     if (direct)
     {

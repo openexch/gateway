@@ -27,6 +27,17 @@
 // upgrade; a first-frame credential that fails closes 1008 (1013 when the users store cannot answer). The principal
 // decides the user: a "userId" key anywhere in any client frame closes the connection 4003.
 //
+// Anonymous (a signed-out viewer of the engine status): a connection with no header credential whose first frame is
+// exactly {"op":"subscribe","channels":["engine"]} (no resume) opens with no user instead of closing 1008. It receives
+// `subscribed`, the newest `engine` frame and every later one, and every `election` frame; nothing of any user and no
+// core query. On it `ping`, `unsubscribe` and a subscribe of `engine` alone are taken; a subscribe naming orders, fills
+// or balances, a resume and an `auth` op are answered `error` VALIDATION, and subscribe or unsubscribe ops above
+// 1/s (burst 4) `error` RATE_LIMITED (both stream_ws_anon_refused_total{reason="op"}); its pings are answered on the
+// I/O side (pong with eventSeq null) and never take a command ring slot;
+// a userId key still closes 4003; the idle rule is the same. At most STREAM_ANON_MAX_CONNECTIONS such connections, a
+// share of STREAM_MAX_CONNECTIONS: above it the first frame is answered with a close 1013
+// (stream_ws_anon_refused_total{reason="capacity"}). Neither counts as an auth failure.
+//
 // Client frames: {"op":"subscribe","channels":[...],"resume":{"eventSeq":N}?}, {"op":"unsubscribe","channels":[...]},
 // {"op":"ping"}; anything else (an unknown op, an unknown key, a bad channel) is an `error` frame, code VALIDATION. A
 // frame above STREAM_WS_MAX_MESSAGE_BYTES closes 1009. Every accepted op goes to the duty thread through the bounded
@@ -57,6 +68,7 @@ struct StreamCommand
     Kind kind = Kind::NONE;
     std::uint64_t connId = 0;
     std::int64_t userId = 0;
+    bool anonymous = false; // OPEN: a connection with no user (engine status only; StreamCore::openAnonymous)
     std::shared_ptr<Outlet> outlet;
     unsigned channels = 0;
     bool hasResume = false;
@@ -72,6 +84,11 @@ struct WsServerSettings
     std::uint16_t port = 0;
     int ioThreads = 2;
     std::int64_t maxConnections = 2000;
+    std::int64_t anonMaxConnections = 500; // anonymous connections, inside maxConnections
+    // subscribe and unsubscribe ops one anonymous connection may put on the command ring (a protocol bound: a viewer
+    // subscribes once; pings are answered on the I/O side)
+    std::int64_t anonOpsPerSecond = 1;
+    std::int64_t anonOpsBurst = 4;
     std::int64_t authTimeoutMs = 5000;
     std::int64_t pingMs = 15'000;
     std::int64_t idleMs = 60'000;
@@ -91,6 +108,9 @@ struct WsCounters
     std::atomic<std::uint64_t> refused{ 0 };        // closed at accept above STREAM_MAX_CONNECTIONS
     std::atomic<std::uint64_t> httpRefused{ 0 };    // answered over HTTP without an upgrade
     std::atomic<std::uint64_t> authFailed{ 0 };
+    std::atomic<std::int64_t> anonConnections{ 0 };       // anonymous connections held (stream_ws_anon_connections)
+    std::atomic<std::uint64_t> anonRefusedCapacity{ 0 };  // anonymous first frames closed 1013 above the anonymous cap
+    std::atomic<std::uint64_t> anonRefusedOps{ 0 };       // ops refused on an anonymous connection (error VALIDATION)
     std::atomic<std::uint64_t> opsRefused{ 0 };     // client ops refused because the command ring was full
     std::atomic<std::uint64_t> framesSent{ 0 };     // frames written to clients (stream_ws_frames_sent_total)
     std::array<std::atomic<std::uint64_t>, COUNTED_CLOSE_CODES.size() + 1> closed{}; // by COUNTED_CLOSE_CODES, then other
