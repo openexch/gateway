@@ -693,6 +693,8 @@ one of:
 3. No credential header: the upgrade is accepted and the first client frame must be
    `{"op":"auth","token":"<token>"}` within `STREAM_WS_AUTH_TIMEOUT_MS` (5000). No frame confirms success; a failure
    closes the connection.
+4. No credential at all, for the engine status only: no credential header and the first frame exactly
+   `{"op":"subscribe","channels":["engine"]}` (no `resume`). See 5.8.
 
 The subprotocol and the first frame carry a bearer token (demo, JWT or dev). An API key travels only in `X-API-Key`.
 A header credential that fails is answered over HTTP before the upgrade: 401 `UNAUTHORIZED`, 429 `RATE_LIMITED`,
@@ -707,7 +709,8 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==
 Sec-WebSocket-Protocol: bearer, q3W0mB8x...
 ```
 
-At most `STREAM_MAX_CONNECTIONS` (2000) connections per instance; above that the socket is closed at accept.
+At most `STREAM_MAX_CONNECTIONS` (2000) connections per instance; above that the socket is closed at accept. Of
+those, at most `STREAM_ANON_MAX_CONNECTIONS` (500) may be anonymous (5.8).
 
 ### 5.2 Client frames
 
@@ -715,7 +718,7 @@ Text frames of one JSON object, at most `STREAM_WS_MAX_MESSAGE_BYTES` (65536).
 
 | Frame | Notes |
 |---|---|
-| `{"op":"subscribe","channels":["orders","fills","balances"],"resume":{"eventSeq":88211}}` | `channels` a non-empty list; `resume` optional (5.5) |
+| `{"op":"subscribe","channels":["orders","fills","balances"],"resume":{"eventSeq":88211}}` | `channels` a non-empty list of `orders`, `fills`, `balances`, `engine`; `resume` optional (5.5) |
 | `{"op":"unsubscribe","channels":["balances"]}` | |
 | `{"op":"ping"}` | answered with `pong` |
 
@@ -735,12 +738,12 @@ Every server frame has `type`. Ids and money follow section 1; `eventSeq` is a J
 | `order` | `{"type":"order","eventSeq":88212,"event":"FILL","order":Order}` | every order event of the user; `event` is the core event kind |
 | `fill` | `{"type":"fill","eventSeq":88212,"fill":{"tradeId":"500231","orderId":"1042","marketId":"1","side":"BUY","price":"65000.5","quantity":"0.004","maker":null,"executedAt":1763373601200}}` | one per `FILL` event with a trade (`tradeId` above 0; a `FILL` without one goes out as an `order` frame only); never coalesced; `maker` is `null` on the stream (it is set in history) |
 | `balance` | `{"type":"balance","assetId":"2","asset":"USD","available":"9349.995","locked":"650.005"}` | each change of one of the user's balances |
-| `admission` | `{"type":"admission","marketId":"0","gate":"SUSPENDED","reasons":["ADMIN"],"circuitBreaker":false}` | to every connection, subscribed or not |
+| `admission` | `{"type":"admission","marketId":"0","gate":"SUSPENDED","reasons":["ADMIN"],"circuitBreaker":false}` | to every signed-in connection, subscribed or not |
 | `heartbeat` | `{"type":"heartbeat","eventSeq":88230}` | every `STREAM_HEARTBEAT_MS` (5000) to connections with `orders` or `fills` active |
 | `pong` | `{"type":"pong","eventSeq":88230}` | answer to `ping`; `eventSeq` is `null` while no event channel is live or a resume is pending |
 | `resync` | `{"type":"resync","reason":"EVENT_GAP"}` | the stream cannot continue the sequence (5.5) |
-| `error` | `{"type":"error","code":"VALIDATION","error":"unknown channel (orders, fills, balances)"}` | a refused client frame; codes `VALIDATION`, `OVERLOADED`, `FEATURE_DISABLED` |
-| `engine` | `{"type":"engine","core":{...},"matchingEngine":{...},"bridge":{...},"stream":{...}}` | on connect and on change, at most once per `STREAM_ENGINE_FRAME_MIN_MS` (1000); display telemetry, not user data |
+| `error` | `{"type":"error","code":"VALIDATION","error":"unknown channel (orders, fills, balances, engine)"}` | a refused client frame; codes `VALIDATION`, `OVERLOADED`, `FEATURE_DISABLED` |
+| `engine` | `{"type":"engine","core":{...},"matchingEngine":{...},"bridge":{...},"stream":{...}}` | on connect and on change, at most once per `STREAM_ENGINE_FRAME_MIN_MS` (1000); display telemetry, not user data. A signed-in connection gets it whatever its channels; an anonymous one while it holds `engine` |
 | `election` | `{"type":"election","cluster":"core","phase":"start",...}` | a leader election seen by the engine poller (`phase` `start` or `end`) |
 
 Order rows in an `order` frame carry `hold.remaining` and no `displayQuantity`, `expiresAt` or `budget`. Rows in an
@@ -820,11 +823,32 @@ connection is closed with code 4001 (`RESYNC`): nothing is dropped silently. Rec
 |---|---|
 | 1001 | idle (`STREAM_WS_IDLE_MS`) |
 | 1003 | a binary frame (text frames only) |
-| 1008 | first-frame auth failed (`UNAUTHORIZED`), timed out (`AUTH_TIMEOUT`), or the first frame was not `{"op":"auth","token":"..."}` |
+| 1008 | first-frame auth failed (`UNAUTHORIZED`), timed out (`AUTH_TIMEOUT`), or the first frame was neither `{"op":"auth","token":"..."}` nor the anonymous `{"op":"subscribe","channels":["engine"]}` |
 | 1009 | a client frame above `STREAM_WS_MAX_MESSAGE_BYTES` |
-| 1013 | first-frame auth could not be checked (`AUTH_UNAVAILABLE`), or the stream could not open the connection (`OVERLOADED`) |
+| 1013 | first-frame auth could not be checked (`AUTH_UNAVAILABLE`), the stream could not open the connection (`OVERLOADED`), or the anonymous connections are at `STREAM_ANON_MAX_CONNECTIONS` (`ANON_CAPACITY`) |
 | 4001 | `RESYNC`: the outbound bound was reached (5.6) |
 | 4003 | a client frame named a user |
+
+### 5.8 Anonymous engine status
+
+A signed-out viewer can follow the engine status. With no credential header, a first frame of exactly
+`{"op":"subscribe","channels":["engine"]}` (no `resume`) opens the connection with no user. It is answered
+`{"type":"subscribed","channels":["engine"]}`, then the newest `engine` frame, then every later `engine` frame and every
+`election` frame. Nothing else is sent to it: no `snapshot`, `order`, `fill`, `balance`, `admission` or `heartbeat`,
+and the stream asks the core nothing for it.
+
+On an anonymous connection `ping` and `unsubscribe` are taken (after unsubscribing `engine` no engine or election frame
+follows until it is subscribed again); `pong` carries `"eventSeq":null`. A `subscribe` naming `orders`, `fills` or
+`balances`, a `resume`, and an `auth` op are answered `error` with code `VALIDATION` and the connection stays open; to
+sign in, open a new connection with a credential. `subscribe` and `unsubscribe` ops above 1 per second (burst 4) are
+answered `error` with code `RATE_LIMITED`. A `userId` key closes 4003 and the idle rule is the same as for any connection.
+
+At most `STREAM_ANON_MAX_CONNECTIONS` (500) anonymous connections per instance, a share of `STREAM_MAX_CONNECTIONS`
+that must be below it; above it the first frame is answered with a close 1013 `ANON_CAPACITY`. An anonymous connection
+has its own outbound bound, `STREAM_ANON_WS_QUEUE_MESSAGES` (8) and `STREAM_ANON_WS_QUEUE_BYTES` (65536), with the
+4001 close of 5.6 at the bound (queued `engine` frames coalesce to the newest). Neither an anonymous open nor a refusal
+counts as an auth failure; `/metrics` shows `stream_ws_anon_connections` and
+`stream_ws_anon_refused_total{reason="capacity"|"op"}`.
 
 ## 6. Rate and size settings a client can hit
 
@@ -854,6 +878,8 @@ connection is closed with code 4001 (`RESYNC`): nothing is dropped silently. Rec
 | `STREAM_USER_LINGER_MS` | 30000 | a reconnect inside it is served from the stream's cache |
 | `STREAM_QUERY_RATE`, `STREAM_QUERY_BURST` | 50/s, 10 | core reads per stream instance (snapshots, balances) |
 | `STREAM_MAX_CONNECTIONS` | 2000 | WebSocket connections per instance |
+| `STREAM_ANON_MAX_CONNECTIONS` | 500 | anonymous (engine status only) connections, inside `STREAM_MAX_CONNECTIONS` and below it; above, the first frame is closed 1013 |
+| `STREAM_ANON_WS_QUEUE_MESSAGES`, `STREAM_ANON_WS_QUEUE_BYTES` | 8, 65536 | an anonymous connection's outbound bound; 4001 close |
 
 Rates are written `<n>/s` or `<n>/min`.
 

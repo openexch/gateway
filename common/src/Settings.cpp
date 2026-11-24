@@ -65,7 +65,11 @@
 //   STREAM_ENGINE_POLL_TIMEOUT_MS 500 (one request's deadline; a node that misses it is unreachable for that round),
 //   STREAM_ENGINE_FRAME_MIN_MS 1000 (the rate cap of the engine frame: a changed frame waits until the last one is this
 //   old), STREAM_ENGINE_MAX_BODY_BYTES 1048576 (a node's answer above it counts as no answer).
-//   Pairs: STREAM_READY_STALE_MS above STREAM_HEAD_PROBE_MS, STREAM_WS_PING_MS below STREAM_WS_IDLE_MS.
+//   STREAM_ANON_MAX_CONNECTIONS 500 (signed-out connections that receive the engine status only; a share of
+//   STREAM_MAX_CONNECTIONS, so it must be below it), STREAM_ANON_WS_QUEUE_MESSAGES 8, STREAM_ANON_WS_QUEUE_BYTES 65536
+//   (the outbound bound of such a connection: 4001 at the bound).
+//   Pairs: STREAM_READY_STALE_MS above STREAM_HEAD_PROBE_MS, STREAM_WS_PING_MS below STREAM_WS_IDLE_MS,
+//   STREAM_ANON_MAX_CONNECTIONS below STREAM_MAX_CONNECTIONS.
 
 namespace openexchange { namespace gateway {
 
@@ -1041,6 +1045,9 @@ ParseResult<StreamSettings> parseStreamSettings(const Environment &env, const rt
     s.heartbeatMs = r.positive("STREAM_HEARTBEAT_MS", s.heartbeatMs);
     s.wsQueueMessages = r.positive("STREAM_WS_QUEUE_MESSAGES", s.wsQueueMessages);
     s.wsQueueBytes = r.positive("STREAM_WS_QUEUE_BYTES", s.wsQueueBytes);
+    s.anonMaxConnections = r.positive("STREAM_ANON_MAX_CONNECTIONS", s.anonMaxConnections);
+    s.anonQueueMessages = r.positive("STREAM_ANON_WS_QUEUE_MESSAGES", s.anonQueueMessages);
+    s.anonQueueBytes = r.positive("STREAM_ANON_WS_QUEUE_BYTES", s.anonQueueBytes);
     s.wsAuthTimeoutMs = r.positive("STREAM_WS_AUTH_TIMEOUT_MS", s.wsAuthTimeoutMs);
     s.wsPingMs = r.positive("STREAM_WS_PING_MS", s.wsPingMs);
     s.wsIdleMs = r.positive("STREAM_WS_IDLE_MS", s.wsIdleMs);
@@ -1056,6 +1063,12 @@ ParseResult<StreamSettings> parseStreamSettings(const Environment &env, const rt
         // process would flap not ready between two probes
         r.problem("STREAM_READY_STALE_MS (" + std::to_string(s.readyStaleMs) + ") must be above "
             "STREAM_HEAD_PROBE_MS (" + std::to_string(s.headProbeMs) + ")");
+    }
+    if (s.anonMaxConnections >= s.common.maxConnections)
+    {
+        // anonymous viewers hold a share of the connections, never all of them: signed-in users keep the rest
+        r.problem("STREAM_ANON_MAX_CONNECTIONS (" + std::to_string(s.anonMaxConnections) + ") must be below "
+            "STREAM_MAX_CONNECTIONS (" + std::to_string(s.common.maxConnections) + ")");
     }
     if (s.wsPingMs >= s.wsIdleMs)
     {

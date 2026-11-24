@@ -692,7 +692,7 @@ TEST(md_readiness_expected_set)
     // market 3 only: 1 and 2 are still no_snapshot
     rig.egress(JAVA_BOOK_SNAPSHOT_20x20);
     s = rig.status();
-    CHECK(MdBookState::NO_SNAPSHOT == mdBookState(s.mdMarkets[0], s.mdLastHeartbeatNs, rig.now, bounds));
+    CHECK(MdBookState::NO_SNAPSHOT == mdBookState(s.mdMarkets[0], s.mdLastMeFrameNs, rig.now, bounds));
     CHECK(!failing(marketDataBookConditions(s, rig.now, bounds)).empty());
     rig.egress(snapshot(1, 10, 1, { { 100'000'000, 1, 1 } }, {}));
     rig.egress(snapshot(2, 0x77, 1, {}, {})); // a versioned empty book
@@ -703,8 +703,8 @@ TEST(md_readiness_expected_set)
     rig.egress(JAVA_CLUSTER_HEARTBEAT_V12);
     rig.core.doWork(rig.now);
     s = rig.status();
-    CHECK(MdBookState::STALE == mdBookState(s.mdMarkets[0], s.mdLastHeartbeatNs, rig.now, bounds));
-    CHECK(MdBookState::FRESH == mdBookState(s.mdMarkets[1], s.mdLastHeartbeatNs, rig.now, bounds));
+    CHECK(MdBookState::STALE == mdBookState(s.mdMarkets[0], s.mdLastMeFrameNs, rig.now, bounds));
+    CHECK(MdBookState::FRESH == mdBookState(s.mdMarkets[1], s.mdLastMeFrameNs, rig.now, bounds));
     CHECK(2 == rig.stats.booksStale.load());
     // the full /ready names the trade path this build does not have
     const auto all = failing(marketDataReadyConditions(s, rig.now, bounds));
@@ -713,6 +713,37 @@ TEST(md_readiness_expected_set)
     rig.now += 11'000 * MS;
     s = rig.status();
     CHECK(!failing(marketDataSessionConditions(s, rig.now, bounds)).empty());
+}
+
+// Liveness under traffic: the ME sends a ClusterHeartbeat only after a second with no egress to any session, so while
+// the market trades the heartbeats stop and the book frames are the liveness. Thirty seconds of book frames and no
+// heartbeat (three times MD_EGRESS_STALE_MS) keep me_session, and an empty book stays fresh on them; then nothing at all
+// for the stale time clears me_session.
+TEST(md_readiness_book_frames_are_liveness)
+{
+    Rig rig;
+    MarketDataReadyBounds bounds{ 10'000, 15'000 };
+    rig.core.onSessionUp(rig.now);
+    rig.egress(JAVA_CLUSTER_HEARTBEAT_V12);
+    rig.egress(snapshot(2, 0x77, 1, {}, {})); // an empty book, quiet from here on
+    for (int i = 0; i < 30; ++i)
+    {
+        rig.now += 1000 * MS;
+        rig.egress(snapshot(1, 100 + i, 1, { { 100'000'000, 1, 1 } }, {}));
+        rig.egress(snapshot(3, 200 + i, 1, { { 100'000'000, 1, 1 } }, {}));
+        rig.core.doWork(rig.now);
+    }
+    Status s = rig.status();
+    CHECK(1 == rig.stats.heartbeats.load() && rig.now - s.mdLastHeartbeatNs > bounds.egressStaleMs * MS);
+    CHECK_MSG(failing(marketDataSessionConditions(s, rig.now, bounds)).empty(),
+        "me_session lost under traffic with no heartbeat");
+    CHECK_MSG(failing(marketDataBookConditions(s, rig.now, bounds)).empty(), "the empty book turned stale under traffic");
+    // a book frame of an ended term is no liveness
+    rig.now += 11'000 * MS;
+    rig.egress(snapshot(1, 500, 1, { { 100'000'000, 1, 1 } }, {}), 1, 2);
+    s = rig.status();
+    CHECK_MSG(!failing(marketDataSessionConditions(s, rig.now, bounds)).empty(),
+        "me_session held with no frame of the session for the stale time");
 }
 
 // ME egress paused with the session kept open: no book frame and no heartbeat for the stale time clears book_fresh and

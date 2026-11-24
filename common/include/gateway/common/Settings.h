@@ -205,6 +205,9 @@ struct StreamSettings
     std::int64_t heartbeatMs = 5000;
     std::int64_t wsQueueMessages = 256;
     std::int64_t wsQueueBytes = 1'048'576;
+    std::int64_t anonMaxConnections = 500;  // anonymous (engine status only) connections, below <P>_MAX_CONNECTIONS
+    std::int64_t anonQueueMessages = 8;     // an anonymous connection's outbound bound
+    std::int64_t anonQueueBytes = 65'536;
     std::int64_t wsAuthTimeoutMs = 5000;
     std::int64_t wsPingMs = 15'000;
     std::int64_t wsIdleMs = 60'000;

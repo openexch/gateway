@@ -642,6 +642,17 @@ public:
         return clients.size() - 1;
     }
 
+    // a signed-out connection (engine status only)
+    std::size_t connectAnonymous()
+    {
+        auto out = std::make_shared<FakeOutlet>();
+        const std::uint64_t id = ++nextConn;
+        core.openAnonymous(id, out, now);
+        clients.emplace_back(out);
+        connIds.push_back(id);
+        return clients.size() - 1;
+    }
+
     void disconnect(std::size_t client)
     {
         clients[client].out->isClosed = true;

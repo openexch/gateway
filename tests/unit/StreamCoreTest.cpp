@@ -683,3 +683,117 @@ TEST(stream_channels_and_admission)
     rig.step(2);
     CHECK(0 == rig.clients[c].orderFrames);
 }
+
+// Anonymous connections (a signed-out viewer of the engine status): `subscribed` with the engine channel, then the
+// newest engine frame and every later engine and election frame; nothing of any user (no order, fill, balance,
+// admission or heartbeat frame, no snapshot), no core query, no user entry, and an overrun skips them.
+TEST(stream_anonymous_engine_only)
+{
+    st::StreamCoreSettings s = settings();
+    s.heartbeatMs = 1; // a heartbeat every cycle: none may reach the anonymous connection
+    Rig rig(s);
+    rig.start();
+    rig.core.onEngineStatus(std::make_shared<const std::string>("{\"type\":\"engine\",\"v\":1}"));
+    const std::uint64_t queriesBefore = rig.core.stats().snapshotQueries.load() + rig.core.stats().balanceQueries.load();
+    const std::size_t anon = rig.connectAnonymous();
+    const std::size_t user = rig.connect(31, ch::ORDERS | ch::FILLS | ch::BALANCES);
+    rig.step(3);
+    const Client &a = rig.clients[anon];
+    CHECK_MSG(a.out->frames.size() >= 2 && a.out->frames[0] == "{\"type\":\"subscribed\",\"channels\":[\"engine\"]}",
+        "the first frame of an anonymous connection is subscribed [engine]: " +
+            (a.out->frames.empty() ? std::string("none") : a.out->frames[0]));
+    CHECK_MSG(a.out->frames.size() >= 2 && a.out->frames[1] == "{\"type\":\"engine\",\"v\":1}",
+        "the newest engine frame follows subscribed");
+    // user traffic, admission, an election and a new status
+    const std::int64_t o = rig.fake.create(31);
+    rig.fake.fill(o, SCALE);
+    wire::AdmissionState adm;
+    adm.marketId = 0;
+    adm.gateState = money::GateState::SUSPENDED;
+    rig.core.onAdmission(adm);
+    rig.core.onEngineEvent(std::make_shared<const std::string>("{\"type\":\"election\",\"phase\":\"start\"}"));
+    rig.core.onEngineStatus(std::make_shared<const std::string>("{\"type\":\"engine\",\"v\":2}"));
+    rig.step(3);
+    CHECK_MSG(2 == a.count("engine") && 1 == a.count("election"), "engine and election frames reach the anonymous "
+        "connection: " + std::to_string(a.count("engine")) + " engine, " + std::to_string(a.count("election")) + " election");
+    for (const std::string &t : a.types)
+    {
+        CHECK_MSG("engine" == t || "election" == t || "subscribed" == t || "pong" == t,
+            "an anonymous connection received a '" + t + "' frame");
+    }
+    CHECK(1 == rig.clients[user].count("admission") && rig.clients[user].orderFrames > 0);
+    CHECK_MSG(rig.core.stats().snapshotQueries.load() + rig.core.stats().balanceQueries.load() - queriesBefore == 2,
+        "the anonymous connection asked the core (only the signed-in user's snapshot and balance read are expected)");
+    rig.step(25); // past one sweep: the users gauge is current
+    CHECK_MSG(1 == rig.core.stats().users.load() && 2 == rig.core.stats().connections.load(),
+        "an anonymous connection has no user entry: " + std::to_string(rig.core.stats().users.load()) + " users");
+    // a subscribe that names user channels takes only engine (the I/O side refuses it first); ping answers null
+    rig.core.subscribe(rig.connIds[anon], ch::ORDERS | ch::FILLS | ch::BALANCES | ch::ENGINE, std::int64_t{ 0 }, rig.now);
+    rig.core.ping(rig.connIds[anon]);
+    rig.fake.create(31);
+    rig.step(2);
+    CHECK(0 == a.orderFrames && 0 == a.snapshots && 0 == a.balanceSnapshots && a.fills.empty());
+    CHECK_MSG(a.out->frames.size() >= 2 &&
+            a.out->frames[a.out->frames.size() - 2] == "{\"type\":\"subscribed\",\"channels\":[\"engine\"]}" &&
+            a.out->frames.back() == "{\"type\":\"pong\",\"eventSeq\":null}",
+        "anonymous subscribe keeps engine only, pong carries no eventSeq: " + a.out->frames.back());
+    // an overrun resyncs the signed-in connection and passes the anonymous one by
+    rig.fake.ringCapacity = 4;
+    rig.fake.dropLive = true;
+    for (int i = 0; i < 10; ++i)
+    {
+        rig.fake.create(31);
+    }
+    rig.fake.dropLive = false;
+    rig.fake.create(31);
+    rig.step(10);
+    CHECK(1 == rig.clients[user].resyncs.size());
+    CHECK(a.resyncs.empty() && !a.out->isClosed);
+    // unsubscribe engine: no engine frame after it
+    rig.core.unsubscribe(rig.connIds[anon], ch::ENGINE);
+    rig.step(1);
+    const std::size_t engines = a.count("engine");
+    rig.core.onEngineStatus(std::make_shared<const std::string>("{\"type\":\"engine\",\"v\":3}"));
+    rig.core.onEngineEvent(std::make_shared<const std::string>("{\"type\":\"election\",\"phase\":\"end\"}"));
+    rig.step(2);
+    CHECK(engines == a.count("engine") && 1 == a.count("election"));
+    CHECK(a.out->frames.back() != "{\"type\":\"engine\",\"v\":3}");
+    // subscribing engine again sends the newest frame at once
+    rig.core.subscribe(rig.connIds[anon], ch::ENGINE, std::nullopt, rig.now);
+    rig.step(1);
+    CHECK(a.out->frames.back() == "{\"type\":\"engine\",\"v\":3}");
+    // gone: removed without a user entry to touch
+    rig.disconnect(anon);
+    rig.step(2);
+    CHECK(1 == rig.core.connectionCount());
+}
+
+// A slow anonymous client is closed 4001 at its own (small) bound; a signed-in client on the same core is not slowed.
+TEST(stream_anonymous_slow_client_bound)
+{
+    st::StreamCoreSettings s = settings();
+    s.anonQueueMessages = 4;
+    Rig rig(s);
+    rig.start();
+    const std::size_t anon = rig.connectAnonymous();
+    const std::size_t user = rig.connect(41, ch::ORDERS);
+    rig.step(3);
+    rig.clients[anon].out->paused = true;
+    rig.clients[anon].out->capacity = 2;
+    for (int i = 0; i < 3; ++i)
+    {
+        rig.core.onEngineStatus(std::make_shared<const std::string>("{\"type\":\"engine\",\"v\":" + std::to_string(i) + "}"));
+    }
+    rig.step(1);
+    CHECK_MSG(!rig.clients[anon].out->isClosed, "engine frames coalesce: a burst of status frames stays below the bound");
+    for (int i = 0; i < 8; ++i)
+    {
+        rig.core.onEngineEvent(std::make_shared<const std::string>("{\"type\":\"election\",\"phase\":\"start\"}"));
+        rig.fake.create(41);
+    }
+    rig.step(3);
+    CHECK_MSG(rig.clients[anon].out->isClosed && st::close_code::RESYNC == rig.clients[anon].out->closeCode,
+        "a slow anonymous client is closed 4001 at its bound");
+    CHECK_MSG(8 == rig.clients[user].orderFrames && 8 == rig.clients[user].count("election"),
+        "the signed-in client got every frame: " + std::to_string(rig.clients[user].orderFrames) + " order frames");
+}

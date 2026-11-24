@@ -39,10 +39,13 @@
 //   beat_fresh          the last beat this copy committed is younger than HISTORY_PROJECTOR_READY_LAG_MS
 // oe-marketdata /ready, all of:
 //   driver_connected    as above
-//   me_session          an ME leader session is open and a ClusterHeartbeat arrived within MD_EGRESS_STALE_MS
+//   me_session          an ME leader session is open and an ME frame of it arrived within MD_EGRESS_STALE_MS: a
+//                       ClusterHeartbeat, or any order-schema frame of the session's term (the ME sends a heartbeat only
+//                       after a second with no egress to any session, so under traffic the book frames are the
+//                       liveness and the heartbeats stop)
 //   book_fresh          every market of MD_EXPECTED_MARKETS (never "the markets seen so far") has a snapshot of this ME
 //                       session, an OK ladder, and either a book frame younger than MD_BOOK_STALE_MS or no level on
-//                       either side with a fresh heartbeat (an emptied book does not turn stale by being quiet)
+//                       either side with a fresh ME frame (an emptied book does not turn stale by being quiet)
 //   journal_attached    a journal source is attached (the follower is FOLLOWING)
 //   journal_fresh       its stall verdicts are clean within two MD_SOURCE_PROBE_MS and no record read waits on the
 //                       market history longer than MD_HISTORY_STALE_MS
@@ -108,11 +111,12 @@ enum class MdBookState : std::uint8_t
     FRESH,
     NO_SNAPSHOT, // no snapshot in this ME session
     BROKEN,      // the ladder is not OK (a chain break, or emptied by an unversioned snapshot)
-    STALE        // OK, but no book frame within MD_BOOK_STALE_MS while it has levels (or no fresh heartbeat while empty)
+    STALE        // OK, but no book frame within MD_BOOK_STALE_MS while it has levels (or no fresh ME frame while empty)
 };
 const char *nameOf(MdBookState state) noexcept;
-bool mdHeartbeatFresh(std::int64_t lastHeartbeatNs, std::int64_t nowNs, const MarketDataReadyBounds &bounds) noexcept;
-MdBookState mdBookState(const MdMarketStatus &market, std::int64_t lastHeartbeatNs, std::int64_t nowNs,
+// The ME session's liveness: its last frame (Status::mdLastMeFrameNs) is younger than MD_EGRESS_STALE_MS.
+bool mdEgressFresh(std::int64_t lastMeFrameNs, std::int64_t nowNs, const MarketDataReadyBounds &bounds) noexcept;
+MdBookState mdBookState(const MdMarketStatus &market, std::int64_t lastMeFrameNs, std::int64_t nowNs,
     const MarketDataReadyBounds &bounds) noexcept;
 
 struct Condition

@@ -67,9 +67,17 @@
 // and every new one after, before and after it subscribes, like `admission`; a queued older one is replaced (key
 // ENGINE_FRAME_KEY, never an orderId). `election` frames go to every connection, never coalesced.
 //
+// Anonymous connections (openAnonymous: a signed-out viewer of the engine status). Such a connection has no user: no
+// User entry, no cache, no core query, no order, fill, balance, admission or heartbeat frame. It gets the `engine`
+// frames (the newest at open, every new one after) and the `election` frames while it holds the `engine` channel, and
+// its outbound queue has a bound of its own (`anonQueueMessages`, `anonQueueBytes`, the same 4001 close at the bound).
+// A signed-in connection may name the `engine` channel too; it changes nothing for it (engine frames reach every
+// signed-in connection, as before).
+//
 // Test-only controls (never in a published build; tests/CMakeLists.txt names the failure text each must produce):
 // GW_NC_STITCH_INCLUSIVE, GW_NC_SINGLE_PAGE_ASOF, GW_NC_NO_REPLAY, GW_NC_NO_HEARTBEAT, GW_NC_BALANCE_REPLY_LAST,
-// GW_NC_NO_RESNAPSHOT_PACING, GW_NC_UNBOUNDED_QUEUE, GW_NC_ROUTE_BY_FRAME_USER, GW_NC_COALESCE_FILLS.
+// GW_NC_NO_RESNAPSHOT_PACING, GW_NC_UNBOUNDED_QUEUE, GW_NC_ROUTE_BY_FRAME_USER, GW_NC_COALESCE_FILLS,
+// GW_NC_ANON_USER_BOUND.
 
 namespace openexchange { namespace gateway { namespace stream {
 
@@ -77,6 +85,7 @@ namespace channel {
 inline constexpr unsigned ORDERS = 1u;
 inline constexpr unsigned FILLS = 2u;
 inline constexpr unsigned BALANCES = 4u;
+inline constexpr unsigned ENGINE = 8u; // the engine status frames (the only channel of an anonymous connection)
 }
 
 // The coalescing key of the engine frame in a connection's queue (orderIds are positive).
@@ -131,6 +140,8 @@ struct StreamCoreSettings
     std::int64_t heartbeatMs = 5000;
     std::int64_t wsQueueMessages = 256;
     std::int64_t wsQueueBytes = 1'048'576;
+    std::int64_t anonQueueMessages = 8;   // the outbound bound of an anonymous connection
+    std::int64_t anonQueueBytes = 65'536;
     bool balanceStream = true;
 };
 
@@ -185,6 +196,8 @@ public:
 
     // ---- connections (the I/O side through the command ring)
     void open(std::uint64_t connId, std::int64_t userId, std::shared_ptr<Outlet> outlet, std::int64_t nowNs);
+    // A connection with no user, subscribed to `engine` only: answered `subscribed` and the newest engine frame.
+    void openAnonymous(std::uint64_t connId, std::shared_ptr<Outlet> outlet, std::int64_t nowNs);
     // `frameUserId`: the userId a client frame named (0 = none); only the test-only control GW_NC_ROUTE_BY_FRAME_USER
     // reads it (the I/O side closes such a connection 4003 before it gets here).
     void subscribe(std::uint64_t connId, unsigned channels, std::optional<std::int64_t> resumeFrom, std::int64_t nowNs,
@@ -224,7 +237,8 @@ private:
     struct Conn
     {
         std::uint64_t id = 0;
-        std::int64_t userId = 0;
+        std::int64_t userId = 0;     // 0 on an anonymous connection (no User entry)
+        bool anonymous = false;
         std::uint64_t openOrder = 0; // arrival order (oldest first for re-snapshots)
         std::shared_ptr<Outlet> out;
         unsigned subscribed = 0;

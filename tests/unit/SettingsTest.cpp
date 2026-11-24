@@ -581,7 +581,8 @@ TEST(every_setting_is_recorded_with_its_source)
              "STREAM_QUERY_BURST", "STREAM_USER_LINGER_MS", "STREAM_HEAD_PROBE_MS", "STREAM_READY_STALE_MS",
              "STREAM_HEARTBEAT_MS", "STREAM_WS_QUEUE_MESSAGES", "STREAM_WS_QUEUE_BYTES", "STREAM_WS_AUTH_TIMEOUT_MS",
              "STREAM_WS_PING_MS", "STREAM_WS_IDLE_MS", "STREAM_DUTY_WATCHDOG_MS", "STREAM_STOP_TIMEOUT_MS",
-             "STREAM_RECONNECT_DELAY_MS", "STREAM_REGISTER_RESEND_MS" })
+             "STREAM_RECONNECT_DELAY_MS", "STREAM_REGISTER_RESEND_MS", "STREAM_ANON_MAX_CONNECTIONS",
+             "STREAM_ANON_WS_QUEUE_MESSAGES", "STREAM_ANON_WS_QUEUE_BYTES" })
     {
         CHECK_MSG(nullptr != recordOf(s, key), std::string(key) + " is not recorded");
     }
@@ -612,6 +613,29 @@ TEST(rate_and_list_helpers)
     CHECK(splitList("a,b").has_value() && 2 == splitList("a,b")->size());
     CHECK(!splitList("a,,b").has_value());
     CHECK(!splitList("").has_value());
+}
+
+// The anonymous (engine status only) connections: a cap with a default, a share of STREAM_MAX_CONNECTIONS (at or above
+// it the boot is refused), and the small outbound bound of such a connection.
+TEST(stream_anonymous_settings)
+{
+    const auto d = st(streamEnv());
+    CHECK_MSG(d.ok(), joined(d.errors));
+    CHECK(500 == d.settings.anonMaxConnections);
+    CHECK(8 == d.settings.anonQueueMessages);
+    CHECK(65'536 == d.settings.anonQueueBytes);
+    const auto r = st(with(streamEnv(), { { "STREAM_ANON_MAX_CONNECTIONS", "10" }, { "STREAM_ANON_WS_QUEUE_MESSAGES", "4" },
+                                          { "STREAM_ANON_WS_QUEUE_BYTES", "4096" } }));
+    CHECK_MSG(r.ok(), joined(r.errors));
+    CHECK(10 == r.settings.anonMaxConnections && 4 == r.settings.anonQueueMessages && 4096 == r.settings.anonQueueBytes);
+    onlyProblem(st(with(streamEnv(), { { "STREAM_ANON_MAX_CONNECTIONS", "0" } })), "STREAM_ANON_MAX_CONNECTIONS");
+    onlyProblem(st(with(streamEnv(), { { "STREAM_ANON_WS_QUEUE_MESSAGES", "x" } })), "STREAM_ANON_WS_QUEUE_MESSAGES");
+    onlyProblem(st(with(streamEnv(), { { "STREAM_ANON_MAX_CONNECTIONS", "2000" } })), "STREAM_ANON_MAX_CONNECTIONS",
+        "must be below STREAM_MAX_CONNECTIONS");
+    onlyProblem(st(with(streamEnv(), { { "STREAM_MAX_CONNECTIONS", "100" } })), "STREAM_ANON_MAX_CONNECTIONS",
+        "must be below STREAM_MAX_CONNECTIONS (100)");
+    const auto small = st(with(streamEnv(), { { "STREAM_MAX_CONNECTIONS", "100" }, { "STREAM_ANON_MAX_CONNECTIONS", "99" } }));
+    CHECK_MSG(small.ok(), joined(small.errors));
 }
 
 // The engine status feed's settings: node endpoint lists (unset = no node polled, that block all null), the poll, its

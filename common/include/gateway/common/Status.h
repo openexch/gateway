@@ -67,6 +67,8 @@ struct Status
     // oe-marketdata: the ME session and the books (the duty thread), the WebSocket side (the admin thread copies it in)
     bool mdSessionUp = false;              // an ME leader session is open
     std::int64_t mdLastHeartbeatNs = -1;   // monotonic ns of the last ClusterHeartbeat of this session; -1 = none
+    std::int64_t mdLastMeFrameNs = -1;     // monotonic ns of the last ME frame of this session (heartbeat or any
+                                           // order-schema frame of its term): the me_session liveness; -1 = none
     std::int64_t mdMeEpoch = 0;            // the meEpoch of the last heartbeat (0 = none yet)
     std::array<MdMarketStatus, MD_MARKET_SLOTS> mdMarkets{};
     bool mdClientsServed = true;           // no frame waits for a client longer than MD_SEND_STALL_MS

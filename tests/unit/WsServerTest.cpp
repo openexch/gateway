@@ -1,6 +1,6 @@
 // T0 rows of oe-stream's WebSocket edge, the binding: the three credential paths, never a query parameter, one
 // credential per connection, the first-frame timeout, a userId in a client frame closes 4003, and no frame of another
-// user reaches a connection. The real WsServer on a loopback port, dev principals, and a duty thread driving StreamCore
+// user reaches a connection; the anonymous engine-only connection: its handshake, its refusals, its cap and counters. The real WsServer on a loopback port, dev principals, and a duty thread driving StreamCore
 // over the model core of StreamRig.h.
 
 #include <sys/socket.h>
@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -39,7 +40,7 @@ namespace {
 class Edge
 {
 public:
-    Edge() :
+    explicit Edge(std::int64_t anonMaxConnections = 500) :
         auth(authSettings(), AuthMaterial{}, nullptr, nullptr), ring(1024), core(settings(), fake, [this] { return config; })
     {
         config = std::make_shared<gs::CoreConfig>();
@@ -50,6 +51,7 @@ public:
         s.pingMs = 60'000; // no ping during a case: a quiet connection's read times out
         s.idleMs = 5000;
         s.maxMessageBytes = 4096;
+        s.anonMaxConnections = anonMaxConnections;
         server = std::make_unique<st::WsServer>(s, auth, ring);
         std::string error;
         if (!server->bind(error))
@@ -88,6 +90,20 @@ public:
 
     std::uint16_t port() const { return server->boundPort(); }
 
+    void engine(const std::string &frame, bool election = false)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        const auto text = std::make_shared<const std::string>(frame);
+        if (election)
+        {
+            core.onEngineEvent(text);
+        }
+        else
+        {
+            core.onEngineStatus(text);
+        }
+    }
+
     Authenticator auth;
     st::CommandRing ring;
     FakeCore fake;
@@ -108,7 +124,16 @@ private:
                 {
                     switch (c.kind)
                     {
-                        case st::StreamCommand::Kind::OPEN: core.open(c.connId, c.userId, c.outlet, now); break;
+                        case st::StreamCommand::Kind::OPEN:
+                            if (c.anonymous)
+                            {
+                                core.openAnonymous(c.connId, c.outlet, now);
+                            }
+                            else
+                            {
+                                core.open(c.connId, c.userId, c.outlet, now);
+                            }
+                            break;
                         case st::StreamCommand::Kind::SUBSCRIBE:
                             core.subscribe(c.connId, c.channels,
                                 c.hasResume ? std::optional<std::int64_t>(c.resumeFrom) : std::nullopt, now, c.frameUserId);
@@ -375,4 +400,263 @@ TEST(ws_frames_sent_counted)
     const std::uint64_t sent = edge.server->counters().framesSent.load() - before;
     CHECK_MSG(received >= 5 && sent >= received,
         "frames sent not counted: " + std::to_string(sent) + " counted, " + std::to_string(received) + " received");
+}
+
+namespace {
+
+constexpr const char *ANON_SUBSCRIBE = R"({"op":"subscribe","channels":["engine"]})";
+
+// the next frame as an object (nullopt when closed or timed out)
+std::optional<json::object> nextObject(WsClient &c)
+{
+    auto f = c.next();
+    if (!f)
+    {
+        return std::nullopt;
+    }
+    return json::parse(*f).as_object();
+}
+
+bool waitFor(const std::function<bool()> &done, int ms = 2000)
+{
+    const auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    while (std::chrono::steady_clock::now() < end)
+    {
+        if (done())
+        {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return done();
+}
+
+}
+
+// A connection with no credential whose first frame subscribes to `engine` opens anonymously: `subscribed` [engine],
+// then the newest engine frame, then every later engine and election frame; no frame of any user. Every other op that
+// would reach user data is an error VALIDATION (counted as an anonymous refusal, never as an auth failure).
+TEST(ws_anonymous_engine_subscription)
+{
+    Edge edge;
+    edge.engine(R"({"type":"engine","v":1})");
+    const std::uint64_t authFailedBefore = edge.server->counters().authFailed.load();
+    WsClient a;
+    CHECK(a.connect(edge.port()));
+    a.send(ANON_SUBSCRIBE);
+    auto f = nextObject(a);
+    CHECK_MSG(f && "subscribed" == f->at("type").as_string() && 1 == f->at("channels").as_array().size() &&
+            "engine" == f->at("channels").as_array()[0].as_string(),
+        "the anonymous first frame is answered subscribed [engine]");
+    f = nextObject(a);
+    CHECK_MSG(f && "engine" == f->at("type").as_string() && 1 == f->at("v").as_int64(), "the newest engine frame follows");
+    CHECK(waitFor([&] { return 1 == edge.server->counters().anonConnections.load(); }));
+
+    // a signed-in user's traffic never reaches it; engine and election frames do
+    WsClient u;
+    CHECK(u.connect(edge.port(), { { "Authorization", "Bearer dev:801" } }));
+    u.send(R"({"op":"subscribe","channels":["orders","fills","engine"]})");
+    auto us = u.until("subscribed");
+    CHECK_MSG(us && 3 == us->at("channels").as_array().size(), "a signed-in connection may name engine too");
+    CHECK(u.until("snapshot").has_value());
+    edge.withCore([](FakeCore &core) { core.create(801); });
+    CHECK(u.until("order").has_value());
+    edge.engine(R"({"type":"election","phase":"start"})", true);
+    edge.engine(R"({"type":"engine","v":2})");
+    f = nextObject(a);
+    CHECK_MSG(f && "election" == f->at("type").as_string(), "an election frame reaches the anonymous connection");
+    f = nextObject(a);
+    CHECK_MSG(f && "engine" == f->at("type").as_string() && 2 == f->at("v").as_int64(), "a new engine frame follows");
+    CHECK(u.until("election").has_value());
+
+    // refusals: user channels, resume, auth
+    for (const char *op : { R"({"op":"subscribe","channels":["orders"]})", R"({"op":"subscribe","channels":["fills"]})",
+             R"({"op":"subscribe","channels":["balances","engine"]})",
+             R"({"op":"subscribe","channels":["engine"],"resume":{"eventSeq":0}})", R"({"op":"auth","token":"dev:802"})" })
+    {
+        a.send(op);
+        f = nextObject(a);
+        CHECK_MSG(f && "error" == f->at("type").as_string() && "VALIDATION" == f->at("code").as_string(),
+            std::string("refused with error VALIDATION: ") + op);
+    }
+    CHECK_MSG(5 == edge.server->counters().anonRefusedOps.load(),
+        "anonymous refusals counted: " + std::to_string(edge.server->counters().anonRefusedOps.load()));
+    // ping and unsubscribe are taken; nothing of a user arrived in between
+    a.send(R"({"op":"ping"})");
+    f = nextObject(a);
+    CHECK_MSG(f && "pong" == f->at("type").as_string() && f->at("eventSeq").is_null(), "ping answered, no eventSeq");
+    a.send(R"({"op":"unsubscribe","channels":["engine"]})");
+    f = nextObject(a);
+    CHECK_MSG(f && "subscribed" == f->at("type").as_string() && f->at("channels").as_array().empty(),
+        "unsubscribe answered subscribed []");
+    edge.engine(R"({"type":"engine","v":3})");
+    a.send(R"({"op":"ping"})");
+    f = nextObject(a);
+    CHECK_MSG(f && "pong" == f->at("type").as_string(), "no engine frame after unsubscribe");
+    CHECK_MSG(edge.server->counters().authFailed.load() == authFailedBefore, "an anonymous connection counted as an "
+        "auth failure");
+    // a userId key still closes 4003
+    a.send(R"({"op":"ping","userId":801})");
+    while (a.next().has_value())
+    {
+    }
+    CHECK_MSG(4003 == a.closeCode, "a userId on an anonymous connection closes 4003, got " + std::to_string(a.closeCode));
+    CHECK(waitFor([&] { return 0 == edge.server->counters().anonConnections.load(); }));
+}
+
+// The anonymous cap: above STREAM_ANON_MAX_CONNECTIONS the first frame is closed 1013 and counted (capacity), not as
+// an auth failure; a closed anonymous connection frees its slot; a signed-in connection is not held to the cap.
+TEST(ws_anonymous_cap)
+{
+    Edge edge(2);
+    std::vector<std::unique_ptr<WsClient>> held;
+    for (int i = 0; i < 2; ++i)
+    {
+        held.push_back(std::make_unique<WsClient>());
+        CHECK(held.back()->connect(edge.port()));
+        held.back()->send(ANON_SUBSCRIBE);
+        CHECK(held.back()->until("subscribed").has_value());
+    }
+    CHECK(2 == edge.server->counters().anonConnections.load());
+    {
+        WsClient over;
+        CHECK(over.connect(edge.port()));
+        over.send(ANON_SUBSCRIBE);
+        while (over.next().has_value())
+        {
+        }
+        CHECK_MSG(1013 == over.closeCode, "above the anonymous cap: 1013, got " + std::to_string(over.closeCode));
+    }
+    CHECK(1 == edge.server->counters().anonRefusedCapacity.load());
+    CHECK(0 == edge.server->counters().authFailed.load());
+    {
+        WsClient signedIn;
+        CHECK(signedIn.connect(edge.port(), { { "Authorization", "Bearer dev:811" } }));
+        signedIn.send(R"({"op":"ping"})");
+        CHECK_MSG(signedIn.until("pong").has_value(), "a signed-in connection is not held to the anonymous cap");
+    }
+    held[0]->ws.close(websocket::close_code::normal);
+    held.erase(held.begin());
+    CHECK_MSG(waitFor([&] { return 1 == edge.server->counters().anonConnections.load(); }),
+        "a closed anonymous connection frees its slot: " + std::to_string(edge.server->counters().anonConnections.load()));
+    WsClient again;
+    CHECK(again.connect(edge.port()));
+    again.send(ANON_SUBSCRIBE);
+    CHECK_MSG(again.until("subscribed").has_value(), "a freed slot is taken again");
+}
+
+// Without a credential every other first frame still closes 1008 and counts as an auth failure (a subscribe to a user
+// channel, engine with a resume, an extra key).
+TEST(ws_first_frame_other_than_engine_still_1008)
+{
+    Edge edge;
+    int n = 0;
+    for (const char *first : { R"({"op":"subscribe","channels":["orders"]})",
+             R"({"op":"subscribe","channels":["engine","orders"]})",
+             R"({"op":"subscribe","channels":["engine"],"resume":{"eventSeq":1}})", R"({"op":"ping"})" })
+    {
+        WsClient c;
+        CHECK(c.connect(edge.port()));
+        c.send(first);
+        while (c.next().has_value())
+        {
+        }
+        n++;
+        CHECK_MSG(1008 == c.closeCode, std::string("first frame closes 1008: ") + first + ", got " +
+            std::to_string(c.closeCode));
+    }
+    CHECK(waitFor([&] { return static_cast<std::uint64_t>(n) == edge.server->counters().authFailed.load(); }));
+    CHECK(0 == edge.server->counters().anonConnections.load() && 0 == edge.server->counters().anonRefusedOps.load());
+}
+
+// An anonymous connection's ring ops are bounded: subscribe and unsubscribe above the burst are refused RATE_LIMITED
+// (an anonymous refusal); its pings never reach the command ring and are always answered.
+TEST(ws_anonymous_op_rate)
+{
+    Edge edge;
+    WsClient a;
+    CHECK(a.connect(edge.port()));
+    a.send(ANON_SUBSCRIBE);
+    CHECK(a.until("subscribed").has_value());
+    int taken = 0;
+    int limited = 0;
+    for (int i = 0; i < 8; ++i)
+    {
+        a.send(0 == i % 2 ? R"({"op":"unsubscribe","channels":["engine"]})" : ANON_SUBSCRIBE);
+    }
+    for (int i = 0; i < 8; ++i)
+    {
+        auto f = nextObject(a);
+        if (!f)
+        {
+            break;
+        }
+        const std::string type(f->at("type").as_string());
+        taken += "subscribed" == type ? 1 : 0;
+        limited += "error" == type && "RATE_LIMITED" == f->at("code").as_string() ? 1 : 0;
+    }
+    CHECK_MSG(taken >= 4 && taken <= 5 && 8 == taken + limited, "ops above the burst are refused: " +
+        std::to_string(taken) + " taken, " + std::to_string(limited) + " refused");
+    CHECK(static_cast<std::uint64_t>(limited) == edge.server->counters().anonRefusedOps.load());
+    const std::uint64_t refusedBefore = edge.server->counters().opsRefused.load();
+    for (int i = 0; i < 20; ++i)
+    {
+        a.send(R"({"op":"ping"})");
+    }
+    int pongs = 0;
+    for (int i = 0; i < 20; ++i)
+    {
+        auto f = nextObject(a);
+        pongs += f && "pong" == f->at("type").as_string() && f->at("eventSeq").is_null() ? 1 : 0;
+    }
+    CHECK_MSG(20 == pongs, "every ping of an anonymous connection is answered: " + std::to_string(pongs));
+    CHECK(refusedBefore == edge.server->counters().opsRefused.load());
+}
+
+// A close the server starts while it handles a client frame (4003 a userId, 1013 the anonymous cap, 1008 a bad first
+// frame) releases the connection, and an anonymous slot, once the close handshake is done: well before
+// STREAM_WS_IDLE_MS (5000 here), while the peer keeps its socket open.
+TEST(ws_server_close_frees_the_slot)
+{
+    Edge edge(1);
+    const auto held = [&] { return edge.server->counters().connections.load(); };
+    const auto quickly = [&](const std::function<bool()> &done) { return waitFor(done, 1500); };
+    // 4003 on an anonymous connection
+    WsClient a;
+    CHECK(a.connect(edge.port()));
+    a.send(ANON_SUBSCRIBE);
+    CHECK(a.until("subscribed").has_value());
+    CHECK(1 == edge.server->counters().anonConnections.load());
+    a.send(R"({"op":"ping","userId":5})");
+    while (a.next().has_value())
+    {
+    }
+    CHECK(4003 == a.closeCode);
+    CHECK_MSG(quickly([&] { return 0 == edge.server->counters().anonConnections.load() && 0 == held(); }),
+        "a server close held its connection (4003): " + std::to_string(held()) + " held, " +
+            std::to_string(edge.server->counters().anonConnections.load()) + " anonymous");
+    // 1013 above the anonymous cap (1 here)
+    WsClient first;
+    CHECK(first.connect(edge.port()));
+    first.send(ANON_SUBSCRIBE);
+    CHECK(first.until("subscribed").has_value());
+    WsClient over;
+    CHECK(over.connect(edge.port()));
+    over.send(ANON_SUBSCRIBE);
+    while (over.next().has_value())
+    {
+    }
+    CHECK(1013 == over.closeCode);
+    CHECK_MSG(quickly([&] { return 1 == held(); }), "a server close held its connection (1013): " +
+        std::to_string(held()) + " held");
+    // 1008 a bad first frame
+    WsClient bad;
+    CHECK(bad.connect(edge.port()));
+    bad.send(R"({"op":"ping"})");
+    while (bad.next().has_value())
+    {
+    }
+    CHECK(1008 == bad.closeCode);
+    CHECK_MSG(quickly([&] { return 1 == held(); }), "a server close held its connection (1008): " +
+        std::to_string(held()) + " held");
 }

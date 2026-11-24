@@ -20,6 +20,7 @@
 #include <boost/json.hpp>
 
 #include "gateway/common/Api.h"
+#include "gateway/common/RateLimit.h"
 
 namespace openexchange { namespace gateway { namespace stream {
 
@@ -238,7 +239,14 @@ public:
     {
     }
 
-    ~WsConn() { m_impl.counters.connections.fetch_sub(1, std::memory_order_relaxed); }
+    ~WsConn()
+    {
+        m_impl.counters.connections.fetch_sub(1, std::memory_order_relaxed);
+        if (m_anonymous)
+        {
+            m_impl.counters.anonConnections.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
 
     void start()
     {
@@ -471,6 +479,7 @@ private:
         c.kind = StreamCommand::Kind::OPEN;
         c.connId = m_id;
         c.userId = m_userId;
+        c.anonymous = m_anonymous;
         c.outlet = m_outlet;
         if (!m_impl.commands.tryPush(std::move(c)))
         {
@@ -557,7 +566,7 @@ private:
             return;
         }
         const std::string_view name(op->as_string().data(), op->as_string().size());
-        if (!m_opened && 0 == m_userId)
+        if (!m_opened && 0 == m_userId && !m_anonymous)
         {
             firstFrame(o, name);
             return;
@@ -566,10 +575,22 @@ private:
         {
             return; // the open was refused; the close is under way
         }
+        if (m_anonymous && "auth" == name)
+        {
+            refuseAnonymous("a signed-out connection cannot sign in; open a new connection with a credential");
+            return;
+        }
         if ("ping" == name)
         {
             if (!onlyKeys(o, { "op" }))
             {
+                return;
+            }
+            if (m_anonymous)
+            {
+                // answered here: an anonymous connection follows no event stream (its pong never has an eventSeq), and
+                // its pings never reach the command ring the signed-in connections share
+                ioFrame(std::make_shared<const std::string>("{\"type\":\"pong\",\"eventSeq\":null}"));
                 return;
             }
             StreamCommand c;
@@ -596,20 +617,31 @@ private:
             unsigned channels = 0;
             if (nullptr == ch || !ch->is_array() || ch->as_array().empty())
             {
-                sendError(api::code::VALIDATION, "channels is a non-empty list of orders, fills, balances");
+                sendError(api::code::VALIDATION, "channels is a non-empty list of orders, fills, balances, engine");
                 return;
             }
             for (const json::value &c : ch->as_array())
             {
-                const json::string *s = c.if_string();
-                const unsigned bit = nullptr == s ? 0u : "orders" == *s ? channel::ORDERS : "fills" == *s ? channel::FILLS
-                    : "balances" == *s ? channel::BALANCES : 0u;
+                const unsigned bit = channelBit(c);
                 if (0 == bit)
                 {
-                    sendError(api::code::VALIDATION, "unknown channel (orders, fills, balances)");
+                    sendError(api::code::VALIDATION, "unknown channel (orders, fills, balances, engine)");
                     return;
                 }
                 channels |= bit;
+            }
+            if (m_anonymous && sub && (0 != (channels & ~channel::ENGINE) || nullptr != o.if_contains("resume")))
+            {
+                refuseAnonymous("a signed-out connection receives the engine channel only (no orders, fills, balances "
+                    "or resume)");
+                return;
+            }
+            if (m_anonymous && !m_anonOps->take(monoNs() / 1'000'000).ok)
+            {
+                // the ops an anonymous connection may put on the shared command ring
+                m_impl.counters.anonRefusedOps.fetch_add(1, std::memory_order_relaxed);
+                sendError(api::code::RATE_LIMITED, "too many subscribe and unsubscribe ops on a signed-out connection");
+                return;
             }
             StreamCommand c;
             c.kind = sub ? StreamCommand::Kind::SUBSCRIBE : StreamCommand::Kind::UNSUBSCRIBE;
@@ -659,11 +691,64 @@ private:
         return true;
     }
 
+    static unsigned channelBit(const json::value &v)
+    {
+        const json::string *s = v.if_string();
+        return nullptr == s ? 0u : "orders" == *s ? channel::ORDERS : "fills" == *s ? channel::FILLS
+            : "balances" == *s ? channel::BALANCES : "engine" == *s ? channel::ENGINE : 0u;
+    }
+
+    // {"op":"subscribe","channels":["engine"]}: the engine channel alone (named once or more), no other key
+    static bool anonymousEngineSubscribe(const json::object &o, std::string_view name)
+    {
+        const json::value *ch = o.if_contains("channels");
+        if ("subscribe" != name || o.size() != 2 || nullptr == ch || !ch->is_array() || ch->as_array().empty())
+        {
+            return false;
+        }
+        for (const json::value &c : ch->as_array())
+        {
+            if (channel::ENGINE != channelBit(c))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // A connection with no user: the engine status only, inside its own share of the connections.
+    void openAnonymous()
+    {
+        const std::int64_t held = m_impl.counters.anonConnections.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (held > m_impl.settings.anonMaxConnections)
+        {
+            m_impl.counters.anonConnections.fetch_sub(1, std::memory_order_relaxed);
+            m_impl.counters.anonRefusedCapacity.fetch_add(1, std::memory_order_relaxed);
+            closeWith(1013, "ANON_CAPACITY");
+            return;
+        }
+        m_anonymous = true; // counted until the connection is destroyed
+        m_authDeadlineNs = -1;
+        m_anonOps.emplace(m_impl.settings.anonOpsPerSecond, 1000, m_impl.settings.anonOpsBurst);
+        open();
+    }
+
+    void refuseAnonymous(const std::string &text)
+    {
+        m_impl.counters.anonRefusedOps.fetch_add(1, std::memory_order_relaxed);
+        sendError(api::code::VALIDATION, text);
+    }
+
     void firstFrame(const json::object &o, std::string_view name)
     {
         if (m_authPending)
         {
             return; // one credential: frames before its answer are dropped
+        }
+        if (anonymousEngineSubscribe(o, name))
+        {
+            openAnonymous();
+            return;
         }
         const json::value *token = o.if_contains("token");
         if ("auth" != name || o.size() != 2 || nullptr == token || !token->is_string() || token->as_string().empty())
@@ -710,8 +795,19 @@ private:
         {
             return;
         }
-        if (m_outlet->ioPush(std::make_shared<const std::string>("{\"type\":\"error\",\"code\":\"" + std::string(code) +
-                "\",\"error\":" + api::quote(text) + "}")) && !m_writing)
+        ioFrame(std::make_shared<const std::string>("{\"type\":\"error\",\"code\":\"" + std::string(code) +
+            "\",\"error\":" + api::quote(text) + "}"));
+    }
+
+    // a frame of the I/O side's own, behind what is queued (dropped when the handover is full: the duty side's bound,
+    // which counts it as unwritten, closes such a connection 4001)
+    void ioFrame(Text frame)
+    {
+        if (!m_outlet || m_closing)
+        {
+            return;
+        }
+        if (m_outlet->ioPush(std::move(frame)) && !m_writing)
         {
             writeNext();
         }
@@ -844,8 +940,16 @@ private:
             if (ec)
             {
                 self->hardClose();
+                return;
             }
-            // otherwise the read loop sees the peer's close and finishes
+#ifndef GW_NC_CLOSE_WAITS_FOR_READ
+            // the close handshake is done: the connection (and an anonymous slot) is released now. No read may be
+            // running (a close asked for while a client frame was handled stops the read loop), so this cannot wait
+            // for one; when a read is running it also finishes, and finish() runs once
+            self->finish();
+#endif
+            // test-only control GW_NC_CLOSE_WAITS_FOR_READ: only a running read loop finishes the connection, so a
+            // close started from a client frame holds its slot until the timer's STREAM_WS_IDLE_MS
         });
     }
 
@@ -901,6 +1005,8 @@ private:
     bool m_subprotocol = false;
     std::int64_t m_userId = 0;
     std::int64_t m_frameUserId = 0;
+    bool m_anonymous = false; // counted in anonConnections
+    std::optional<TokenBucketMs> m_anonOps; // subscribe and unsubscribe ops of an anonymous connection
     bool m_upgraded = false;
     bool m_opened = false;
     bool m_authPending = false;

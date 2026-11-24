@@ -28,7 +28,9 @@
 // decoded. Every other frame (24 OrderStatusBatch and 26 TradeExecutionBatch carry user ids) is counted by its
 // template and dropped after the 8-byte message header, before any field is read. A book frame of an ended ME term is
 // dropped (a stopped leader's late egress). A frame of another order-schema version is refused, never decoded by
-// guess. The book ladder is the cluster-tools BookStitcher (markets 1..5, 20 levels a side; a market outside 1..5 is
+// guess. Liveness (readiness me_session, an empty book's freshness): a ClusterHeartbeat, or any order-schema frame of
+// the current term and version, dropped templates included; the ME sends heartbeats only when it sent no egress for a
+// second, so under traffic the other frames carry it. The book ladder is the cluster-tools BookStitcher (markets 1..5, 20 levels a side; a market outside 1..5 is
 // counted foreign by the library). A book frame of a market inside 1..5 and outside MD_EXPECTED_MARKETS is dropped
 // here, before the ladder, and counted foreign the same way: no frame of it reaches a client.
 //
@@ -201,6 +203,7 @@ private:
     bool m_tradesLive = false; // the trade path started and every connection had its fresh initial state
     bool m_sessionUp = false;
     std::int64_t m_lastHeartbeatNs = -1;
+    std::int64_t m_lastMeFrameNs = -1; // the session's liveness (readiness me_session): any ME frame of it
     std::int64_t m_meEpoch = 0;
 };
 
