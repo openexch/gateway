@@ -950,7 +950,7 @@ JSON:
 
 ```json
 {"status":"UP","process":"oe-gateway","version":"...","build":"...","clusterTools":"...",
- "moneySchema":{"version":9,"sha256":"..."},
+ "moneySchema":{"version":10,"sha256":"..."},
  "driver":{"mode":"external","dir":"...","timeoutMs":10000,"reclaimed":false,"connected":true,"conductorHeartbeatAgeMs":12},
  "duty":{"heartbeatAgeMs":1,"watchdogMs":5000,"maxCycleUs":310,"iterations":123456},
  "session":{"connected":true,"registered":true,"epoch":1,"leader":0,"keepaliveAgeMs":420},
