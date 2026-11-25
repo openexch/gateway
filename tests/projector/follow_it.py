@@ -100,6 +100,8 @@ JAVA_OPTS = ["--add-opens", "java.base/jdk.internal.misc=ALL-UNNAMED", "--add-op
 FP = 100_000_000
 GENESIS = 7
 REPLAY_STREAM = 4302
+# A core member's HTTP endpoint: CLUSTER_PORT_BASE + node x CLUSTER_PORT_STRIDE + 6
+NODE_ENDPOINT_OFFSET = 6
 JOURNAL_MTU = 1408            # the recorded IPC publication's MTU (the members' driver default)
 CATCHUP_BOUND_S = 60          # applied_seq reaches the core's head after each fault
 ORPHAN_BOUND_S = 30           # every member's replay count back at its baseline at the end of the replays case
@@ -194,7 +196,7 @@ class Cluster:
         self.drivers = {}
 
     def node_port(self, i):
-        return self.args.port_base + 90 + i
+        return self.args.port_base + 100 * i + NODE_ENDPOINT_OFFSET
 
     def archive(self, i):
         return f"localhost:{self.args.port_base + 100 * i + 1}"

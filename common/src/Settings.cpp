@@ -60,7 +60,8 @@
 //   STREAM_WS_SEND_BUFFER_BYTES unset (the kernel's send buffer of each WebSocket socket; unset leaves the OS default and
 //   its autotuning, which can hold megabytes per connection before a slow reader reaches the outbound queue's bound),
 //   STREAM_CORE_NODE_ENDPOINTS and STREAM_ME_NODE_ENDPOINTS unset (<memberId>@<host>:<port>,...: each core and matching
-//   engine node's own probe endpoint, polled for the engine status feed; unset = that block is all null),
+//   engine node's own HTTP endpoint, CLUSTER_PORT_BASE + nodeId x CLUSTER_PORT_STRIDE + 6, polled for the engine status
+//   feed; unset = that block is all null),
 //   STREAM_ENGINE_POLL_MS 1000 (one round of GET /health and GET /metrics on every configured node),
 //   STREAM_ENGINE_POLL_TIMEOUT_MS 500 (one request's deadline; a node that misses it is unreachable for that round),
 //   STREAM_ENGINE_FRAME_MIN_MS 1000 (the rate cap of the engine frame: a changed frame waits until the last one is this

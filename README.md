@@ -25,6 +25,10 @@ core commit, id, version and sha256. `scripts/fetch-cluster-tools.sh` refuses an
 configure refuses a package built from another commit or carrying another schema. To re-pin:
 `scripts/repin-cluster-tools.sh <40-hex commit>`, review the diff, commit the lock.
 
+SBE schema ids are unique across the repos: `sbe-schema-ids.txt` lists every id in use (the same file in core,
+match, cluster-tools, gateway and tools). The `sbe_schema_ids` test holds the lock's money schema id and every
+hand-written `*_SCHEMA_ID` constant to it; a new constant has to be mapped to its schema in `tests/CMakeLists.txt`.
+
 The lock also pins Boost, OpenSSL and libpq by source tarball and sha256. Build them with
 `scripts/build-deps.sh <cache> <prefix>` and pass `-DGW_DEPS_PREFIX=<prefix>`; configure checks the build stamp
 and the version headers against the lock. `-DGW_PG_TESTS=ON` runs the PostgreSQL tests in docker. A security
@@ -234,7 +238,7 @@ Engine status. Every connection gets an `engine` frame on connect and again on c
 `STREAM_ENGINE_FRAME_MIN_MS` (a held frame goes out as soon as the cap allows), and `election` frames with
 phase `start` and `end`. Values come from each node's own endpoint (`GET /health`, `GET /metrics`), polled
 every `STREAM_ENGINE_POLL_MS` from `STREAM_CORE_NODE_ENDPOINTS` and `STREAM_ME_NODE_ENDPOINTS`
-(`<memberId>@<host>:<port>`, an IPv6 host in brackets); an unset list leaves that block null. A whole round,
+(`<memberId>@<host>:<port>`, an IPv6 host in brackets); the port is the member's HTTP endpoint, `CLUSTER_PORT_BASE + nodeId x CLUSTER_PORT_STRIDE + 6` (with the default stride 0, one member per host, every core member serves 9306 and every matching engine member 9006 under the default bases 9300 and 9000; members sharing a host with stride 100 serve 9306/9406/9506 and 9006/9106/9206); an unset list leaves that block null. A whole round,
 name lookups included, ends by `STREAM_ENGINE_POLL_TIMEOUT_MS`, which must be below the poll interval (boot
 refuses otherwise, exit 78). A node that does not answer is `unreachable` with null values; a follower's row
 always comes from that follower. The leader is the live node (`/health` 200) that reports itself leader.

@@ -46,6 +46,15 @@ SECRET_GATEWAY = "55" * 32
 CORE_KEYS = f"1:ADMIN:{SECRET_ADMIN}::users=*;5:GATEWAY:{SECRET_GATEWAY}::users=*"
 GATEWAY_KEY = f"5:GATEWAY:{SECRET_GATEWAY}"
 ADMIN_KEY = f"1:ADMIN:{SECRET_ADMIN}"
+# A core member's HTTP endpoint (/health, /ready, /metrics): CLUSTER_PORT_BASE + node x CLUSTER_PORT_STRIDE + 6
+NODE_ENDPOINT_OFFSET = 6
+PORT_STRIDE = 100
+
+
+def node_port(base, node):
+    return base + node * PORT_STRIDE + NODE_ENDPOINT_OFFSET
+
+
 JAVA_OPTS = ["--add-opens", "java.base/jdk.internal.misc=ALL-UNNAMED", "--add-opens", "java.base/java.nio=ALL-UNNAMED",
              "--add-opens", "java.base/sun.nio.ch=ALL-UNNAMED", "-Xms128m", "-Xmx512m", "-XX:+UseZGC"]
 FP = 100_000_000  # 10^8: the money scale
@@ -174,7 +183,7 @@ class Cluster:
             os.makedirs(d, exist_ok=True)
             env = dict(os.environ, CLUSTER_NODE=str(i), CLUSTER_ADDRESSES="localhost,localhost,localhost",
                        CLUSTER_PORT_BASE=str(base), CLUSTER_PORT_STRIDE="100", BASE_DIR=d, CORE_AUTH_KEYS=CORE_KEYS,
-                       CORE_NODE_PORT=str(base + 90 + i))
+                       CORE_NODE_PORT=str(node_port(base, i)))
             log = open(os.path.join(self.work, f"core{i}.log"), "w")
             p = subprocess.Popen(["java"] + JAVA_OPTS + [f"-Daeron.dir={self.shm}/core{i}", "-jar", self.args.core_jar],
                                  env=env, stdout=log, stderr=subprocess.STDOUT)
