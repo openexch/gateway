@@ -54,7 +54,7 @@ AdminView view(Role role, const std::vector<SettingRecord> *settings)
     v.version = "dev";
     v.build = "b";
     v.clusterTools = "c";
-    v.moneySchemaVersion = 9;
+    v.moneySchemaVersion = 10;
     v.moneySchemaSha256 = "m";
     v.driverMode = "embedded";
     v.driverDir = "/dev/shm/oe-gateway-1";

@@ -245,7 +245,8 @@ public final class GoldenGateway {
         final CoreConfigReportEncoder report = new CoreConfigReportEncoder().wrapAndApplyHeader(BUF, 0, HEADER)
                 .correlationId(v(t, 0, 1)).configVersion(i(t, 0, 2)).behaviorVersion(4).limitsVersion(i(t, 0, 4))
                 .requestTtlMs(v(t, 0, 5)).requestPerUserCap(i(t, 0, 6)).orderEventRingCapacity(i(t, 0, 7))
-                .gateState(GateState.SUSPENDED).asOfLogPosition(v(t, 0, 10)).genesisId(v(t, 0, 11));
+                .gateState(GateState.SUSPENDED).asOfLogPosition(v(t, 0, 10)).genesisId(v(t, 0, 11))
+                .maxWireVersion(i(t, 0, 12) & 0xFFFF);
         report.gateReasons().clear().admin(true).genesis(true);
         final CoreConfigReportEncoder.MarketsEncoder markets = report.marketsCount(2);
         final String[] symbols = { "BTC-USDT", "ETH-USDT-PERP-01" };

@@ -224,7 +224,7 @@ TEST(wire_golden_corpus_is_the_pinned_core)
             "; dependencies.lock pins " + GW_MONEY_SCHEMA_REF + " (tests/golden/regen.sh)");
     CHECK(GW_MONEY_SCHEMA_ID == MONEY_SCHEMA_ID);
     CHECK(GW_MONEY_SCHEMA_VERSION == MONEY_SCHEMA_VERSION);
-    CHECK(9 == MONEY_SCHEMA_VERSION);
+    CHECK(10 == MONEY_SCHEMA_VERSION);
 }
 
 namespace {
@@ -381,7 +381,8 @@ void replyCases()
             const int t = 118;
             CoreConfigHead head{ v(t, 0, 1), static_cast<std::uint32_t>(i(t, 0, 2)), 4,
                 static_cast<std::uint32_t>(i(t, 0, 4)), v(t, 0, 5), i(t, 0, 6), i(t, 0, 7),
-                money::GateState::SUSPENDED, (1u << 0) | (1u << 5), v(t, 0, 10), v(t, 0, 11), 2, 2 };
+                money::GateState::SUSPENDED, (1u << 0) | (1u << 5), v(t, 0, 10), v(t, 0, 11),
+                static_cast<std::uint16_t>(i(t, 0, 12) & 0xFFFF), 2, 2 };
             bool ok = r.configHead == head && 2 == r.markets.size() && 2 == r.assets.size();
             for (int e = 1; ok && e <= 2; ++e)
             {
@@ -463,6 +464,19 @@ void putI64(std::vector<std::uint8_t> &frame, std::size_t at, std::int64_t value
     }
 }
 
+// Writes a little-endian uint16 at a byte offset of a frame.
+void putU16(std::vector<std::uint8_t> &frame, std::size_t at, std::uint16_t value)
+{
+    frame[at] = static_cast<std::uint8_t>(value);
+    frame[at + 1] = static_cast<std::uint8_t>(value >> 8);
+}
+
+// A little-endian uint16 at a byte offset of a frame.
+std::uint16_t getU16(const std::vector<std::uint8_t> &frame, std::size_t at)
+{
+    return static_cast<std::uint16_t>(frame[at] | (frame[at + 1] << 8));
+}
+
 // The block length a frame's header declares (little-endian u16 at byte 0).
 std::uint16_t getBlockLength(const std::vector<std::uint8_t> &frame)
 {
@@ -479,13 +493,13 @@ bool decodeOnce(const std::vector<std::uint8_t> &frame, Recorder &recorder)
 }
 
 // v9 genesisId: OrderEventsEnd (116) field 6 at block offset 36 of 44, CoreConfigReport (118) field 11 at block offset
-// 49 of 57, right after asOfLogPosition. The golden frames carry the Java encoder's value at exactly that offset, and a
+// 49 of 59, right after asOfLogPosition. The golden frames carry the Java encoder's value at exactly that offset, and a
 // value written there by hand (0, the "no CoreConfig recorded" value, and a negative one) is the value decoded.
 TEST(wire_decodes_genesis_id_from_v9_frames)
 {
     constexpr std::size_t HEADER = 8;
     CHECK(44 == getBlockLength(JAVA_ORDER_EVENTS_END));
-    CHECK(57 == getBlockLength(JAVA_CORE_CONFIG_REPORT));
+    CHECK(59 == getBlockLength(JAVA_CORE_CONFIG_REPORT));
     {
         Recorder r;
         CHECK(decodeOnce(JAVA_ORDER_EVENTS_END, r));
@@ -514,6 +528,33 @@ TEST(wire_decodes_genesis_id_from_v9_frames)
         CHECK(decodeOnce(report, b));
         CHECK_MSG(value == b.configHead.genesisId, "CoreConfigReport genesisId at offset 49: " + std::to_string(value));
         CHECK(v(118, 0, 10) == b.configHead.asOfLogPosition && 2 == b.markets.size() && 2 == b.assets.size());
+    }
+}
+
+// v10 maxWireVersion: CoreConfigReport (118) field 12, uint16 at block offset 57 of 59, right after genesisId. The
+// golden carries the Java encoder's value there, and a value written there by hand (0, "no CoreConfig recorded", the
+// core's floor 10 and its highest valid ceiling 65534) is the value decoded, with genesisId and the groups untouched.
+TEST(wire_decodes_max_wire_version_from_v10_frames)
+{
+    constexpr std::size_t HEADER = 8;
+    CHECK(59 == getBlockLength(JAVA_CORE_CONFIG_REPORT));
+    CHECK(10 == getU16(JAVA_CORE_CONFIG_REPORT, 6));
+    {
+        Recorder r;
+        CHECK(decodeOnce(JAVA_CORE_CONFIG_REPORT, r));
+        CHECK_MSG(static_cast<std::uint16_t>(i(118, 0, 12) & 0xFFFF) == r.configHead.maxWireVersion,
+            "CoreConfigReport maxWireVersion");
+        CHECK(v(118, 0, 11) == r.configHead.genesisId);
+    }
+    for (const std::uint16_t value : { std::uint16_t{ 0 }, std::uint16_t{ 10 }, std::uint16_t{ 65534 } })
+    {
+        std::vector<std::uint8_t> report = JAVA_CORE_CONFIG_REPORT;
+        putU16(report, HEADER + 57, value);
+        Recorder b;
+        CHECK(decodeOnce(report, b));
+        CHECK_MSG(value == b.configHead.maxWireVersion,
+            "CoreConfigReport maxWireVersion at offset 57: " + std::to_string(value));
+        CHECK(v(118, 0, 11) == b.configHead.genesisId && 2 == b.markets.size() && 2 == b.assets.size());
     }
 }
 

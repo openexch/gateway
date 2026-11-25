@@ -83,7 +83,7 @@ exits 70, so the service manager restarts it.
 
 ## Wire
 
-Both binaries speak exactly the money schema `dependencies.lock` pins (id 2, version 9), through the
+Both binaries speak exactly the money schema `dependencies.lock` pins (id 2, version 10), through the
 cluster-tools codecs. Every egress frame is checked before any field is read. A wrong schema, any other
 version, an unknown template, wrong lengths, trailing bytes and unnamed enum values are refused. Refusals
 are counted in `gateway_decode_refused_total` and logged rate-limited (the first, then every 1000th, with
