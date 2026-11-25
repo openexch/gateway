@@ -59,6 +59,16 @@ target_link_libraries(gw_unit_tests PRIVATE oe_gateway_app gw_common)
 target_compile_options(gw_unit_tests PRIVATE ${GW_WARNINGS})
 add_test(NAME unit COMMAND gw_unit_tests)
 
+# One SBE schema id names one wire schema: sbe-schema-ids.txt lists every id in use (the same file in every repo).
+# The lock's money schema id and the hand-written id constants must equal it; a new constant has to be mapped here.
+add_test(NAME sbe_schema_ids
+    COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/scripts/check-sbe-schema-ids.py"
+        --root "${PROJECT_SOURCE_DIR}" --owner gateway
+        --lock-key "dependencies.lock:money_schema_id=com.openexchange.core.infrastructure.generated"
+        --constant "RECORD_SCHEMA_ID=com.openexchange.core.infrastructure.orderjournal.generated")
+add_test(NAME sbe_schema_ids.negative_controls
+    COMMAND Python3::Interpreter -I "${PROJECT_SOURCE_DIR}/scripts/check-sbe-schema-ids.py" --self-test)
+
 # Control for the codec parity row: the codec built with CreateOrder's price and quantity swapped (GW_NC_SWAPPED_FIELD,
 # test-only, never linked into a binary) must fail the golden case and name the template.
 add_executable(gw_wire_nc_swapped_field unit/TestMain.cpp unit/WireGoldenTest.cpp

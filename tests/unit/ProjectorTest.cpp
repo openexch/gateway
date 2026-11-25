@@ -55,7 +55,7 @@ std::map<std::string, std::string> projectorEnv()
         { "HISTORY_PROJECTOR_CLUSTER_MEMBERS", "0=10.0.0.1:9010,1=10.0.0.2:9010,2=10.0.0.3:9010" },
         { "HISTORY_PROJECTOR_CLUSTER_KEY_FILE", keyFile("gateway-key", "9:GATEWAY:" + SECRET_HEX + "\n") },
         { "HISTORY_PROJECTOR_PG_URL", "postgresql://projector:pw@10.0.0.20/history" },
-        { "HISTORY_PROJECTOR_JOURNAL_NODE_ENDPOINTS", "10.0.0.2:9702,10.0.0.3:9703,-" },
+        { "HISTORY_PROJECTOR_JOURNAL_NODE_ENDPOINTS", "10.0.0.2:9306,10.0.0.3:9306,-" },
         { "HISTORY_PROJECTOR_CORE_INGRESS_CHANNEL", "aeron:udp?term-length=4m|mtu=8192" },
         { "HISTORY_PROJECTOR_CORE_RESPONSE_CHANNEL", "aeron:udp?endpoint=10.0.0.9:0|term-length=4m|mtu=8192" },
     };

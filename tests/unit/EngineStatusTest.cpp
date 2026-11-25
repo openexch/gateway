@@ -81,7 +81,7 @@ en::NodeSample silent(const char *why = "connect: Connection refused", const cha
 
 std::vector<en::NodeEndpointSpec> three()
 {
-    return { { 0, "10.0.0.1", 9700 }, { 1, "10.0.0.2", 9701 }, { 2, "10.0.0.3", 9702 } };
+    return { { 0, "10.0.0.1", 9306 }, { 1, "10.0.0.2", 9306 }, { 2, "10.0.0.3", 9306 } };
 }
 
 json::object parsed(const std::string &frame)
@@ -351,7 +351,7 @@ TEST(engine_matching_engine_snapshot_position_and_hash)
             "\nmatch_snapshot_age_seconds 60\nmatch_snapshot_last_log_position " + position +
             "\nmatch_snapshot_state_hash " + hash + "\nmatch_engine_next_journal_seq 151\n";
     };
-    en::ClusterModel me(en::Flavor::MATCHING_ENGINE, { { 0, "10.0.1.1", 9500 }, { 1, "10.0.1.2", 9501 }, { 2, "10.0.1.3", 9502 } });
+    en::ClusterModel me(en::Flavor::MATCHING_ENGINE, { { 0, "10.0.1.1", 9006 }, { 1, "10.0.1.2", 9006 }, { 2, "10.0.1.3", 9006 } });
     me.ingest({ answered(health("LEADER", 7, 500, 500), meMetrics(0, "4096", "3735928559")),
                   answered(health("FOLLOWER", 7, 500, 500), meMetrics(1, "4096", "3735928559")),
                   answered(health("FOLLOWER", 7, 500, 500), meMetrics(2, "4096", "3735928559")) },
@@ -436,7 +436,7 @@ TEST(engine_null_fields)
 
 TEST(engine_matching_engine_block)
 {
-    en::ClusterModel me(en::Flavor::MATCHING_ENGINE, { { 0, "10.0.1.1", 9500 }, { 1, "10.0.1.2", 9501 } });
+    en::ClusterModel me(en::Flavor::MATCHING_ENGINE, { { 0, "10.0.1.1", 9006 }, { 1, "10.0.1.2", 9006 } });
     const std::string meMetrics0 = "match_cluster_role 2\nmatch_member_id 0\nmatch_snapshot_age_seconds 60\n"
                                    "match_engine_next_journal_seq 151\n";
     const std::string meMetrics1 = "match_cluster_role 0\nmatch_member_id 1\nmatch_snapshot_age_seconds -1\n"
@@ -747,7 +747,7 @@ TEST(engine_node_error_names_no_host)
     FakeNode foreign(health("FOLLOWER", 3, 1, 1), coreMetrics(7));
     const std::string secret = "oe-core-secret-host.invalid";
     st::EnginePollerSettings s;
-    s.coreNodes = { { 0, "127.0.0.1", closedPort() }, { 1, secret, 9701 }, { 2, "127.0.0.1", mute.port() },
+    s.coreNodes = { { 0, "127.0.0.1", closedPort() }, { 1, secret, 9306 }, { 2, "127.0.0.1", mute.port() },
         { 3, "127.0.0.1", big.port() }, { 4, "127.0.0.1", foreign.port() } };
     s.timeoutMs = 1500; // long enough for the resolver to fail rather than to time out
     s.frameMinMs = 1;
@@ -838,7 +838,7 @@ TEST(engine_poller_slow_dns_is_bounded)
         return;
     }
     st::EnginePollerSettings s;
-    s.coreNodes = { { 0, "node0.slow.invalid", 9700 }, { 1, "node1.slow.invalid", 9701 } };
+    s.coreNodes = { { 0, "node0.slow.invalid", 9306 }, { 1, "node1.slow.invalid", 9306 } };
     s.pollMs = 1000;
     s.timeoutMs = 200;
     s.frameMinMs = 1;

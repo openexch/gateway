@@ -63,7 +63,7 @@ class EngineWs(stream_it.Ws):
 
 def own_role(args, member):
     """The member's role as its own /metrics says (independent of oe-stream): 2 leader, 0 follower, None no answer."""
-    code, body = stream_it.admin_get(args.port_base + 90 + member, "/metrics")
+    code, body = stream_it.admin_get(session_it.node_port(args.port_base, member), "/metrics")
     if code != 200:
         return None
     for line in body.splitlines():
@@ -74,7 +74,7 @@ def own_role(args, member):
 
 def own_health(args, member):
     """The member's role and term as its own /health says (any status): (role, term) or None when it does not answer."""
-    code, body = stream_it.admin_get(args.port_base + 90 + member, "/health")
+    code, body = stream_it.admin_get(session_it.node_port(args.port_base, member), "/health")
     if code == 0:
         return None
     tokens = dict(t.split("=", 1) for t in body.split() if "=" in t)
@@ -123,7 +123,7 @@ def restart_member(args, cluster, i):
     d = os.path.join(args.work, f"core{i}")
     env = dict(os.environ, CLUSTER_NODE=str(i), CLUSTER_ADDRESSES="localhost,localhost,localhost",
                CLUSTER_PORT_BASE=str(base), CLUSTER_PORT_STRIDE="100", BASE_DIR=d, CORE_AUTH_KEYS=session_it.CORE_KEYS,
-               CORE_NODE_PORT=str(base + 90 + i))
+               CORE_NODE_PORT=str(session_it.node_port(base, i)))
     log = open(os.path.join(args.work, f"core{i}.log"), "a")
     p = subprocess.Popen(["java"] + session_it.JAVA_OPTS + [f"-Daeron.dir={cluster.shm}/core{i}", "-jar", args.core_jar],
                          env=env, stdout=log, stderr=subprocess.STDOUT)
@@ -183,7 +183,7 @@ def run(args, cluster, procs):
     silent = [i for i in range(3) if not wait_until(lambda i=i: own_role(args, i) is not None, 90)]
     if not check(not silent, f"every core node's own /metrics answers (silent: {silent})"):
         return
-    endpoints = ",".join(f"{i}@127.0.0.1:{base + 90 + i}" for i in range(3))
+    endpoints = ",".join(f"{i}@127.0.0.1:{session_it.node_port(base, i)}" for i in range(3))
     st = stream_it.Stream(args, "stream", 93, {
         "STREAM_CORE_NODE_ENDPOINTS": endpoints,
         "STREAM_ENGINE_POLL_MS": str(POLL_MS),

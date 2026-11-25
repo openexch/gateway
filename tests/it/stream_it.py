@@ -706,7 +706,7 @@ def run(args, cluster, procs):
         return
     # every core node's endpoint answers (the leader change and the log-position rows read it); a port taken by another
     # process would otherwise turn those rows vacuous
-    silent = [i for i in range(3) if not wait_until(lambda i=i: admin_get(args.port_base + 90 + i, "/metrics")[0] == 200,
+    silent = [i for i in range(3) if not wait_until(lambda i=i: admin_get(session_it.node_port(args.port_base, i), "/metrics")[0] == 200,
                                                      60)]
     if not check(not silent, f"every core node's /metrics answers (silent: {silent}; is a port of the base taken?)"):
         return
@@ -1082,7 +1082,7 @@ def run(args, cluster, procs):
 
 def leader_of(args, cluster):
     for i in range(3):
-        code, body = admin_get(args.port_base + 90 + i, "/metrics")
+        code, body = admin_get(session_it.node_port(args.port_base, i), "/metrics")
         if code == 200 and re.search(r"^core_cluster_role 2(\.0)?$", body, re.M):
             return i
     return None
@@ -1092,7 +1092,7 @@ def core_log_time(args, member):
     """The member's log position (core_log_position): the commit position as this node applied it."""
     if member is None:
         return None
-    code, body = admin_get(args.port_base + 90 + member, "/metrics")
+    code, body = admin_get(session_it.node_port(args.port_base, member), "/metrics")
     m = re.search(r"^core_log_position (\S+)$", body, re.M)
     return float(m.group(1)) if m else None
 
@@ -1101,7 +1101,7 @@ def core_ceiling_closed(args, cluster):
     total = 0
     found = False
     for i in range(3):
-        code, body = admin_get(args.port_base + 90 + i, "/metrics")
+        code, body = admin_get(session_it.node_port(args.port_base, i), "/metrics")
         m = re.search(r"^core_resumable_sessions_closed_total (\S+)$", body, re.M)
         if m:
             total += float(m.group(1))

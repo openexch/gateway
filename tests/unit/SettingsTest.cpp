@@ -650,8 +650,8 @@ TEST(stream_engine_settings)
     CHECK(500 == d.settings.enginePollTimeoutMs);
     CHECK(1000 == d.settings.engineFrameMinMs);
     CHECK(1'048'576 == d.settings.engineMaxBodyBytes);
-    const auto r = st(with(streamEnv(), { { "STREAM_CORE_NODE_ENDPOINTS", "0@10.0.0.1:9700,1@10.0.0.2:9701,2@node-c:9702" },
-                                          { "STREAM_ME_NODE_ENDPOINTS", "0@10.0.1.1:9500" },
+    const auto r = st(with(streamEnv(), { { "STREAM_CORE_NODE_ENDPOINTS", "0@10.0.0.1:9306,1@10.0.0.2:9306,2@node-c:9306" },
+                                          { "STREAM_ME_NODE_ENDPOINTS", "0@10.0.1.1:9006" },
                                           { "STREAM_ENGINE_POLL_MS", "250" },
                                           { "STREAM_ENGINE_POLL_TIMEOUT_MS", "200" },
                                           { "STREAM_ENGINE_FRAME_MIN_MS", "2000" } }));
@@ -662,13 +662,13 @@ TEST(stream_engine_settings)
     {
         CHECK(0 == r.settings.coreNodeEndpoints[0].memberId);
         CHECK("10.0.0.1" == r.settings.coreNodeEndpoints[0].host);
-        CHECK(9700 == r.settings.coreNodeEndpoints[0].port);
+        CHECK(9306 == r.settings.coreNodeEndpoints[0].port);
         CHECK("node-c" == r.settings.coreNodeEndpoints[2].host);
         CHECK(2 == r.settings.coreNodeEndpoints[2].memberId);
     }
     CHECK(250 == r.settings.enginePollMs);
     CHECK(2000 == r.settings.engineFrameMinMs);
-    for (const std::string bad : { "0@h:0", "0@h:65536", "x@h:1", "-1@h:1", "0@:9700", "0h:9700", "0@h", "0@h:1,", "0@h:1,0@g:2",
+    for (const std::string bad : { "0@h:0", "0@h:65536", "x@h:1", "-1@h:1", "0@:9306", "0h:9306", "0@h", "0@h:1,", "0@h:1,0@g:2",
              "0@h:1,,1@g:2" })
     {
         onlyProblem(st(with(streamEnv(), { { "STREAM_CORE_NODE_ENDPOINTS", bad } })), "STREAM_CORE_NODE_ENDPOINTS");

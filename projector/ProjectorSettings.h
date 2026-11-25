@@ -31,7 +31,7 @@
 //                          the MTU is checked against each recording before a replay
 //   _LOCAL_HOST            required: the routable address replays are sent to (loopback refused with remote sources)
 //   _JOURNAL_NODE_ENDPOINTS required: one entry per archive, in the same order: host:port of that core member's node
-//                          endpoint (its /health and /metrics: the role it reports, its readerReplayBudget and
+//                          endpoint (CLUSTER_PORT_BASE + nodeId x CLUSTER_PORT_STRIDE + 6; its /health and /metrics: the role it reports, its readerReplayBudget and
 //                          core_archive_replays_active), or '-' for a source that is not a core member (a journal
 //                          replica: never the leader, no budget read). Readers avoid the leader with it.
 //   _NODE_POLL_MS 1000, _NODE_POLL_TIMEOUT_MS 500 (below the poll), _NODE_MAX_BODY_BYTES 1048576
