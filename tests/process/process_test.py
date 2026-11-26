@@ -191,6 +191,10 @@ def expect_serving(ctx, role, proc, env, mode):
     p = "GATEWAY" if role == "gateway" else "STREAM"
     check(settings[f"{p}_DRIVER_MODE"] == {"value": mode, "source": "set"}, f"settings: {settings.get(f'{p}_DRIVER_MODE')}")
     check(settings[f"{p}_IO_THREADS"] == {"value": "2", "source": "default"}, "a default is not shown in /health")
+    idle = env.get(f"{p}_IDLE")
+    want_idle = {"value": idle, "source": "set"} if idle else {"value": "backoff", "source": "default"}
+    check(settings[f"{p}_IDLE"] == want_idle, f"settings: {settings.get(f'{p}_IDLE')}")
+    check(health["duty"]["idleMode"] == want_idle["value"], f"/health duty.idleMode {health['duty'].get('idleMode')}")
     check(SECRET not in body, "/health leaks the credential secret")
     status, body = http(port, "/ready")
     check(status == 503, f"/ready {status}: {body}")
@@ -255,11 +259,11 @@ def case_config_bad_values(ctx, role):
     extra = {
         f"{p}_INSTANCE_ID": "gw-1",
         f"{p}_CORE_INGRESS_CHANNEL": "aeron:udp?term-length=4m",
-        f"{p}_IDLE": "spin",
+        f"{p}_IDLE": "busy",
         f"{p}_TYPO_SETTING": "1",
     }
     needles = [f"{p}_INSTANCE_ID must be a positive integer", f"{p}_CORE_INGRESS_CHANNEL must name term-length and mtu",
-               f"{p}_IDLE must be exactly backoff or busy", f"{p}_TYPO_SETTING is not a setting"]
+               f"{p}_IDLE must be exactly busy_spin, backoff or sleep", f"{p}_TYPO_SETTING is not a setting"]
     if role == "gateway":
         # a value only the session's own check refuses (above the client's 1 h bound) is listed in the same pass
         extra["GATEWAY_REQUEST_TIMEOUT_MS"] = "4000000"
@@ -287,7 +291,7 @@ def case_config_auth_files(ctx, role):
     extra = {f"{p}_AUTH_MODES": "api-key,jwt", "GATEWAY_API_KEYS_FILE": missing_keys,
              "GATEWAY_JWT_SECRET_FILE": short_secret, f"{p}_IDLE": "spin"}
     needles = [f"GATEWAY_API_KEYS_FILE: cannot read {missing_keys}", "needs at least 32",
-               f"{p}_IDLE must be exactly backoff or busy"]
+               f"{p}_IDLE must be exactly busy_spin, backoff or sleep"]
     env = ctx.env(role, "embedded", driver_dir=parent, extra=extra)
     proc = ctx.start([ctx.binary("oe-gateway" if role == "gateway" else "oe-stream")], env, f"auth-files-{role}.log")
     code = wait_exit(proc, 10)
@@ -336,6 +340,25 @@ def case_embedded_start_stop(ctx, role):
     stop_clean(proc, f"{role} embedded")
     check(not os.path.exists(driver_dir), f"the embedded driver dir {driver_dir} was left behind")
     shutil.rmtree(parent, ignore_errors=True)
+
+
+def case_embedded_idle_modes(ctx, role):
+    """<P>_IDLE sets the duty thread's policy and the embedded driver's agents: sleep parks 1 ms (Aeron sleep-ns),
+    busy_spin spins (Aeron spin); /health and /metrics show the mode in force."""
+    p = "GATEWAY" if role == "gateway" else "STREAM"
+    metric = "gateway_" if role == "gateway" else "stream_"
+    for mode, strategy in (("sleep", "sleep-ns"), ("busy_spin", "spin")):
+        parent = tmpfs_parent(ctx, f"idle-{mode}-{role}")
+        env = ctx.env(role, "embedded", instance=13, driver_dir=parent, extra={f"{p}_IDLE": mode})
+        proc = ctx.start([ctx.binary("oe-gateway" if role == "gateway" else "oe-stream")], env,
+                         f"idle-{mode}-{role}.log")
+        expect_serving(ctx, role, proc, env, "embedded")
+        out = text_of(proc)
+        check(f"idle {mode} (strategy {strategy})" in out, f"the driver line does not name {mode}/{strategy}:\n{out}")
+        status, body = http(admin_port(env), "/metrics")
+        check(status == 200 and f'{metric}idle_mode{{mode="{mode}"}} 1' in body, f"/metrics idle_mode: {status}")
+        stop_clean(proc, f"{role} embedded idle {mode}")
+        shutil.rmtree(parent, ignore_errors=True)
 
 
 def case_external_start_stop(ctx, role):
@@ -525,6 +548,7 @@ CASES = {}
 for _role in ("gateway", "stream"):
     for _name, _fn in (("config_refused", case_config_refused), ("config_bad_values", case_config_bad_values),
                        ("embedded_start_stop", case_embedded_start_stop),
+                       ("embedded_idle_modes", case_embedded_idle_modes),
                        ("external_start_stop", case_external_start_stop),
                        ("external_without_driver", case_external_without_driver),
                        ("external_aeron_dir_missing", case_external_aeron_dir_missing),

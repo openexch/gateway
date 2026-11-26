@@ -1,11 +1,13 @@
 // Settings of both binaries: required keys, malformed values, every problem in one pass, defaults recorded, secrets
 // redacted, cross-setting rules (driver mode keys, auth modes, treasury lane, binds), unknown names refused.
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <set>
 #include <string>
 
 #include "Check.h"
+#include "gateway/common/ProcessShell.h"
 #include "gateway/common/Settings.h"
 
 using namespace openexchange::gateway;
@@ -449,7 +451,8 @@ TEST(set_but_empty_is_a_problem_not_the_default)
 {
     onlyProblem(gw(with(gatewayEnv(), { { "GATEWAY_CORS_ORIGINS", "" } })), "GATEWAY_CORS_ORIGINS", "set but empty");
     onlyProblem(gw(with(gatewayEnv(), { { "GATEWAY_MAX_BODY_BYTES", "" } })), "GATEWAY_MAX_BODY_BYTES");
-    onlyProblem(gw(with(gatewayEnv(), { { "GATEWAY_IDLE", "" } })), "GATEWAY_IDLE", "set but empty");
+    onlyProblem(gw(with(gatewayEnv(), { { "GATEWAY_IDLE", "" } })), "GATEWAY_IDLE",
+        "must be exactly busy_spin, backoff or sleep");
     onlyProblem(gw(with(gatewayEnv(), { { "GATEWAY_DRIVER_TIMEOUT_MS", "" } })), "GATEWAY_DRIVER_TIMEOUT_MS",
         "set but empty");
     const auto empty = st(with(streamEnv(), { { "STREAM_DRIVER_TIMEOUT_MS", "" } }));
@@ -694,4 +697,71 @@ TEST(stream_engine_settings)
     onlyProblem(st(with(streamEnv(), { { "STREAM_ENGINE_POLL_MS", "250" } })), "STREAM_ENGINE_POLL_TIMEOUT_MS");
     onlyProblem(st(with(streamEnv(), { { "STREAM_ENGINE_POLL_MS", "500" }, { "STREAM_ENGINE_POLL_TIMEOUT_MS", "500" } })),
         "STREAM_ENGINE_POLL_TIMEOUT_MS");
+}
+
+// <P>_IDLE: exactly busy_spin, backoff or sleep (cluster-tools' parser); unset = backoff, recorded as the default; the
+// old `busy`, an unknown word, another case and an empty value are each the one problem, naming the key and the words.
+TEST(idle_mode_gateway_and_stream)
+{
+    const std::vector<std::pair<std::string, std::function<ParseResult<CommonSettings>(
+        const std::map<std::string, std::string> &)>>> roles = {
+        { "GATEWAY_IDLE",
+            [](const std::map<std::string, std::string> &e) {
+                const auto r = gw(e);
+                return ParseResult<CommonSettings>{ r.settings.common, r.errors, r.records };
+            } },
+        { "STREAM_IDLE",
+            [](const std::map<std::string, std::string> &e) {
+                const auto r = st(e);
+                return ParseResult<CommonSettings>{ r.settings.common, r.errors, r.records };
+            } },
+    };
+    for (const auto &[key, parse] : roles)
+    {
+        const auto base = "GATEWAY_IDLE" == key ? gatewayEnv() : streamEnv();
+        const auto unset = parse(base);
+        CHECK_MSG(unset.ok(), key + joined(unset.errors));
+        CHECK_MSG(IdleMode::BACKOFF == unset.settings.idle, key + " unset is not backoff");
+        const SettingRecord *def = recordOf(unset, key);
+        CHECK_MSG(nullptr != def && "backoff" == def->value && "default" == def->source, key + " default not recorded");
+        for (const auto &[word, mode] : std::vector<std::pair<std::string, IdleMode>>{
+                 { "busy_spin", IdleMode::BUSY_SPIN }, { "backoff", IdleMode::BACKOFF }, { "sleep", IdleMode::SLEEP } })
+        {
+            const auto r = parse(with(base, { { key, word } }));
+            CHECK_MSG(r.ok(), key + "=" + word + joined(r.errors));
+            CHECK_MSG(mode == r.settings.idle, key + "=" + word + " parsed to another mode");
+            const SettingRecord *rec = recordOf(r, key);
+            CHECK_MSG(nullptr != rec && word == rec->value && "set" == rec->source, key + "=" + word + " not recorded");
+        }
+        for (const std::string bad : { "busy", "spin", "", "Sleep", " sleep", "backoff ", "busy-spin" })
+        {
+            const auto r = parse(with(base, { { key, bad } }));
+            onlyProblem(r, key, "must be exactly busy_spin, backoff or sleep (unset = backoff), got '" + bad + "'");
+        }
+    }
+}
+
+// The policy the duty thread takes per mode, and the embedded driver's options carrying the same mode.
+TEST(idle_mode_duty_policy_and_embedded_driver)
+{
+    CHECK(rt::FORWARDER_IDLE == dutyIdlePolicy(IdleMode::BACKOFF)); // the policy of every release before the mode
+    const rt::IdlePolicy sleep = dutyIdlePolicy(IdleMode::SLEEP);
+    CHECK(0 == sleep.spins && 0 == sleep.yields && 1'000'000L == sleep.parkNs && !sleep.busySpin);
+    const rt::IdlePolicy spin = dutyIdlePolicy(IdleMode::BUSY_SPIN);
+    CHECK(spin.busySpin && 0 == spin.parkNs);
+    ProcessIdentity id;
+    id.processName = "oe-stream";
+    id.dirPrefix = "oe-stream-";
+    id.instanceKey = "STREAM_INSTANCE_ID";
+    for (const IdleMode mode : { IdleMode::BUSY_SPIN, IdleMode::BACKOFF, IdleMode::SLEEP })
+    {
+        CommonSettings c;
+        c.idle = mode;
+        const rt::EmbeddedDriverOptions o = embeddedDriverOptions(id, c);
+        CHECK_MSG(mode == o.idleMode, std::string("driver options lost the mode ") + rt::idleModeName(mode));
+        CHECK("oe-stream" == o.processName && "oe-stream-" == o.dirPrefix && "STREAM_INSTANCE_ID" == o.instanceKey);
+    }
+    // the default of the options is the default of the setting: an unset <P>_IDLE leaves the driver at Aeron's own
+    CHECK(rt::EmbeddedDriverOptions{}.idleMode == CommonSettings{}.idle);
+    CHECK(std::string("sleep-ns") == rt::driverIdleFor(IdleMode::SLEEP).strategy);
 }

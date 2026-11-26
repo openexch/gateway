@@ -129,6 +129,35 @@ TEST(projector_settings_accepted_with_defaults)
     CHECK(nullptr != archives && "10.0.0.2:8010,10.0.0.3:8010,10.0.0.1:8010" == archives->value);
 }
 
+// HISTORY_PROJECTOR_IDLE: exactly busy_spin, backoff or sleep; unset = backoff; `busy` and any other word refused.
+TEST(projector_settings_idle_mode)
+{
+    const auto unset = parseProjectorSettings(MapEnvironment(projectorEnv()), probe());
+    CHECK(unset.ok() && IdleMode::BACKOFF == unset.settings.common.idle);
+    const SettingRecord *def = recordOf(unset.records, "HISTORY_PROJECTOR_IDLE");
+    CHECK(nullptr != def && "backoff" == def->value && "default" == def->source);
+    for (const auto &[word, mode] : std::vector<std::pair<std::string, IdleMode>>{
+             { "busy_spin", IdleMode::BUSY_SPIN }, { "backoff", IdleMode::BACKOFF }, { "sleep", IdleMode::SLEEP } })
+    {
+        auto env = projectorEnv();
+        env["HISTORY_PROJECTOR_IDLE"] = word;
+        const auto parsed = parseProjectorSettings(MapEnvironment(env), probe());
+        CHECK_MSG(parsed.ok(), word + (parsed.errors.empty() ? "" : ": " + parsed.errors.front()));
+        CHECK_MSG(mode == parsed.settings.common.idle, word);
+        const SettingRecord *rec = recordOf(parsed.records, "HISTORY_PROJECTOR_IDLE");
+        CHECK_MSG(nullptr != rec && word == rec->value && "set" == rec->source, word);
+    }
+    for (const std::string bad : { "busy", "spin", "", "SLEEP" })
+    {
+        auto env = projectorEnv();
+        env["HISTORY_PROJECTOR_IDLE"] = bad;
+        const auto parsed = parseProjectorSettings(MapEnvironment(env), probe());
+        CHECK_MSG(1 == parsed.errors.size(), "HISTORY_PROJECTOR_IDLE=" + bad);
+        CHECK(has(parsed.errors, "HISTORY_PROJECTOR_IDLE must be exactly busy_spin, backoff or sleep (unset = backoff), "
+            "got '" + bad + "'"));
+    }
+}
+
 TEST(projector_settings_required_in_one_pass)
 {
     const auto parsed = parseProjectorSettings(MapEnvironment(), probe());

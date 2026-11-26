@@ -6,6 +6,10 @@
 #include <string>
 #include <vector>
 
+#include "cluster_tools/runtime/EmbeddedDriver.h"
+#include "cluster_tools/runtime/IdleMode.h"
+#include "cluster_tools/runtime/IdleStrategy.h"
+
 #include "gateway/common/Readiness.h"
 #include "gateway/common/Settings.h"
 #include "gateway/common/Status.h"
@@ -119,6 +123,27 @@ struct ProcessInputs
     std::function<std::unique_ptr<DutyWork>(const DutyContext &)> makeDuty; // empty = no duty work (no session)
     std::function<std::unique_ptr<FrontWork>()> makeFront;                  // empty = no public listener in this build
 };
+
+// The duty thread's idle policy for <P>_IDLE: backoff = FORWARDER_IDLE (spin 100, yield 100, park 100 us, the policy
+// of every release before the idle mode), sleep = SLEEP_IDLE (park 1 ms, no spin, no yield), busy_spin =
+// BUSY_SPIN_IDLE (a CPU pause hint per idle iteration, never a yield or a sleep).
+inline cluster_tools::runtime::IdlePolicy dutyIdlePolicy(IdleMode mode) noexcept
+{
+    return cluster_tools::runtime::idlePolicyFor(mode, cluster_tools::runtime::FORWARDER_IDLE);
+}
+
+// The embedded media driver's options of this process: its names, and <P>_IDLE on every agent role (backoff leaves
+// Aeron's default untouched). Used only with <P>_DRIVER_MODE=embedded; an external driver's idle is its own.
+inline cluster_tools::runtime::EmbeddedDriverOptions embeddedDriverOptions(const ProcessIdentity &identity,
+    const CommonSettings &common)
+{
+    cluster_tools::runtime::EmbeddedDriverOptions options;
+    options.processName = identity.processName;
+    options.dirPrefix = identity.dirPrefix;
+    options.instanceKey = identity.instanceKey;
+    options.idleMode = common.idle;
+    return options;
+}
 
 // Runs the process and exits it (std::_Exit with the code); does not return.
 [[noreturn]] void runProcess(const ProcessIdentity &identity, const ProcessInputs &inputs);

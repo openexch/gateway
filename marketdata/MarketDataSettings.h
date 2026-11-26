@@ -58,7 +58,7 @@
 //   the connection gets one ERROR RATE_LIMITED per refused run), MD_TRUSTED_PROXIES none (IP or CIDR list: a peer
 //   inside it is a proxy and the source is read from MD_CLIENT_IP_HEADER, default X-Forwarded-For),
 //   MD_SOURCE_IPV6_PREFIX 64 (an IPv6 source's budget is shared by its /64; 1 to 128);
-//   the process shell's: MD_IO_THREADS 2, MD_IDLE backoff, MD_COMMAND_RING 4096, MD_DUTY_WATCHDOG_MS 5000,
+//   the process shell's: MD_IO_THREADS 2, MD_IDLE busy_spin|backoff|sleep (unset backoff), MD_COMMAND_RING 4096, MD_DUTY_WATCHDOG_MS 5000,
 //   MD_STOP_TIMEOUT_MS 2000, MD_STATUS_INTERVAL_MS 100, MD_EMBEDDED_RETRY_MS 1000 (embedded only);
 //   the ME session's: MD_ME_RECONNECT_MS 1000 (a closed or failed session is replaced after this),
 //   MD_ME_INGRESS_CHANNEL aeron:udp?term-length=64k|mtu=1408 (a full aeron:udp URI naming term-length and mtu; the

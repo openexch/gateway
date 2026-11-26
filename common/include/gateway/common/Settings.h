@@ -10,6 +10,7 @@
 #include "cluster_tools/client/ClientSettings.h"
 #include "cluster_tools/client/Credentials.h"
 #include "cluster_tools/runtime/DirProbe.h"
+#include "cluster_tools/runtime/IdleMode.h"
 
 #include "gateway/common/Environment.h"
 #include "gateway/common/SettingsReader.h"
@@ -36,7 +37,13 @@
 //   <P>_INSTANCE_ID        required: a positive int64; the registration identity and the embedded dir suffix.
 //   GATEWAY_HTTP_BIND / STREAM_WS_BIND, <P>_ADMIN_BIND   required host:port; the admin bind is an IPv4 address and
 //                          never the public bind.
-//   <P>_IO_THREADS 2, <P>_IDLE backoff|busy, <P>_COMMAND_RING 4096, <P>_MAX_CONNECTIONS 2000,
+//   <P>_IDLE               busy_spin | backoff | sleep, unset = backoff (cluster-tools IdleMode.h, one vocabulary for
+//                          the stack): the duty thread's idle policy and the embedded driver's agents. backoff = spin
+//                          100, yield 100, park 100 us (FORWARDER_IDLE), the driver at Aeron's default; sleep = park
+//                          1 ms after an iteration without work, no spin, no yield, the driver's agents sleep 1 ms;
+//                          busy_spin = never yield or sleep (a CPU pause hint), the driver's agents spin. Any other
+//                          value, an empty one included, refuses the start (78); there is no `busy`.
+//   <P>_IO_THREADS 2, <P>_COMMAND_RING 4096, <P>_MAX_CONNECTIONS 2000,
 //   <P>_DUTY_WATCHDOG_MS 5000 (duty heartbeat bound: /health 503 and exit 70), <P>_STOP_TIMEOUT_MS 2000 (every join
 //   and close on the stop path), <P>_STATUS_INTERVAL_MS 100 (the duty thread's Status publish interval),
 //   <P>_EMBEDDED_RETRY_MS 1000 (embedded only, refused with external: the retry spacing of a start starved of storage).
@@ -66,11 +73,8 @@ enum class DriverMode : std::uint8_t
 };
 const char *driverModeName(DriverMode mode) noexcept;
 
-enum class IdleMode : std::uint8_t
-{
-    BACKOFF,
-    BUSY
-};
+// The idle mode is cluster-tools' (busy_spin, backoff, sleep): one vocabulary, one parser.
+using IdleMode = cluster_tools::runtime::IdleMode;
 
 namespace auth_mode {
 inline constexpr unsigned DEMO = 1u;
@@ -247,6 +251,10 @@ ParseResult<StreamSettings> parseStreamSettings(const Environment &env,
 // HISTORY_PROJECTOR_).
 void parseDriverSettings(SettingsReader &r, const std::string &prefix, const cluster_tools::runtime::DirProbe &probe,
     CommonSettings &c);
+// <key> (GATEWAY_IDLE, STREAM_IDLE, HISTORY_PROJECTOR_IDLE, MD_IDLE): exactly busy_spin, backoff or sleep with
+// cluster-tools' parseIdleModeSetting; unset = backoff (recorded "default"); any other value is a problem naming the
+// key and the three words (the start is refused, 78).
+IdleMode readIdleMode(SettingsReader &r, const std::string &key);
 // A core session channel (<P>_CORE_INGRESS_CHANNEL, `response` false; <P>_CORE_RESPONSE_CHANNEL, true) with the rules
 // the gateway binaries apply: a full aeron:udp URI naming term-length and mtu (and the endpoint of a response channel).
 void checkSessionChannel(SettingsReader &r, const std::string &name, const std::string &uri, bool response);

@@ -136,7 +136,7 @@ std::string renderHealth(const AdminView &v, int &status)
         std::to_string(v.driverTimeoutMs) + ",\"reclaimed\":" + b(v.driverReclaimed) + ",\"connected\":" + b(connected) + ",\"conductorHeartbeatAgeMs\":" +
         std::to_string(v.conductorHeartbeatAgeMs) + "}";
     out += ",\"duty\":{\"heartbeatAgeMs\":" + std::to_string(v.heartbeatAgeMs) + ",\"watchdogMs\":" +
-        std::to_string(v.watchdogMs) + ",\"maxCycleUs\":" + std::to_string(s.dutyMaxCycleUs) + ",\"iterations\":" +
+        std::to_string(v.watchdogMs) + ",\"idleMode\":" + q(v.idleMode) + ",\"maxCycleUs\":" + std::to_string(s.dutyMaxCycleUs) + ",\"iterations\":" +
         std::to_string(s.dutyIterations) + "}";
     out += ",\"session\":{\"connected\":" + std::string(b(s.connected)) + ",\"registered\":" + b(s.registered) +
         ",\"epoch\":" + std::to_string(s.sessionEpoch) + ",\"leader\":" + std::to_string(s.leaderMemberId) +
@@ -210,6 +210,8 @@ std::string renderMetrics(const AdminView &v)
         "build_info{version=" + q(v.version) + ",build=" + q(v.build) + ",cluster_tools=" + q(v.clusterTools) +
         ",money_schema_version=\"" + std::to_string(v.moneySchemaVersion) + "\",driver_mode=" + q(v.driverMode) +
         "} 1\n";
+    out += "# HELP " + p + "idle_mode The idle mode in force (<P>_IDLE: busy_spin, backoff or sleep).\n# TYPE " + p +
+        "idle_mode gauge\n" + p + "idle_mode{mode=" + q(v.idleMode) + "} 1\n";
     gauge("up", "1 while the media driver is connected and the duty heartbeat is younger than the watchdog bound.",
         s.driverConnected && v.heartbeatAgeMs < v.watchdogMs ? "1" : "0");
     gauge("driver_connected", "1 once the Aeron client is connected and the process counter registered.",
