@@ -452,7 +452,7 @@ void parseCommon(SettingsReader &r, Role role, const rt::DirProbe &probe, Common
     }
 
     c.ioThreads = r.positive(P + "_IO_THREADS", c.ioThreads);
-    c.idle = 1 == r.choice(P + "_IDLE", { "backoff", "busy" }, 0) ? IdleMode::BUSY : IdleMode::BACKOFF;
+    c.idle = readIdleMode(r, P + "_IDLE");
     c.commandRing = r.positive(P + "_COMMAND_RING", c.commandRing);
     c.maxConnections = r.positive(P + "_MAX_CONNECTIONS", c.maxConnections);
     c.dutyWatchdogMs = r.positive(P + "_DUTY_WATCHDOG_MS", c.dutyWatchdogMs);
@@ -660,6 +660,21 @@ bool isDecimalAmount(const std::string &s)
 void parseDriverSettings(SettingsReader &r, const std::string &prefix, const rt::DirProbe &probe, CommonSettings &c)
 {
     parseDriverSettingsImpl(r, prefix, probe, c);
+}
+
+IdleMode readIdleMode(SettingsReader &r, const std::string &key)
+{
+    const std::optional<std::string> value = r.raw(key);
+    std::string error;
+    const std::optional<IdleMode> mode = rt::parseIdleModeSetting(key.c_str(), value.has_value(), value.value_or(""),
+        error);
+    if (!mode)
+    {
+        r.problem(error);
+        return IdleMode::BACKOFF;
+    }
+    r.record(key, rt::idleModeName(*mode), value ? "set" : "default");
+    return *mode;
 }
 
 void checkSessionChannel(SettingsReader &r, const std::string &name, const std::string &uri, bool response)

@@ -45,6 +45,7 @@ struct AdminView
     std::int64_t nowNs = 0;
     std::int64_t heartbeatAgeMs = 0; // duty heartbeat age, measured at request time
     std::int64_t watchdogMs = 0;
+    std::string idleMode = "backoff"; // <P>_IDLE in force: busy_spin, backoff or sleep
     std::int64_t conductorHeartbeatAgeMs = -1;
     std::uint64_t logDropped = 0;
     std::uint64_t adminServed = 0;

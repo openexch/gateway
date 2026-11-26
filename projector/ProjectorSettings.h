@@ -22,7 +22,7 @@
 //   AERON_DIR / _DRIVER_DIR, _DRIVER_TIMEOUT_MS 10000    by mode, as the gateway binaries
 //   _INSTANCE_ID           required: a positive int64; the embedded driver dir suffix and the process counter key
 //   _ADMIN_BIND            required: host:port (IPv4) of /health, /ready, /metrics
-//   _IDLE backoff|busy, _DUTY_WATCHDOG_MS 10000 (above _ARCHIVE_TIMEOUT_MS), _STOP_TIMEOUT_MS 2000,
+//   _IDLE busy_spin|backoff|sleep (unset backoff), _DUTY_WATCHDOG_MS 10000 (above _ARCHIVE_TIMEOUT_MS), _STOP_TIMEOUT_MS 2000,
 //   _STATUS_INTERVAL_MS 100,
 //   _EMBEDDED_RETRY_MS 1000 (embedded only)
 // The journal sources (the cluster-tools archive reader rules, core order journal profile):

@@ -1045,7 +1045,7 @@ if(GW_TEST_BUILDS)
         endforeach()
     endif()
 
-    set(GW_PROCESS_CASES config_refused config_bad_values config_auth_files embedded_start_stop external_start_stop
+    set(GW_PROCESS_CASES config_refused config_bad_values config_auth_files embedded_start_stop embedded_idle_modes external_start_stop
         external_without_driver external_aeron_dir_missing external_driver_killed embedded_same_instance_refused admin_bind_in_use duty_stall)
     foreach(role gateway stream)
         foreach(case IN LISTS GW_PROCESS_CASES)

@@ -141,6 +141,7 @@ void runProcess(const ProcessIdentity &id, const ProcessInputs &in)
     base.driverMode = driverModeName(c.driverMode);
     base.driverTimeoutMs = c.driverTimeoutMs;
     base.watchdogMs = c.dutyWatchdogMs;
+    base.idleMode = rt::idleModeName(c.idle);
     base.gatewayBounds = in.gatewayBounds;
     base.streamBounds = in.streamBounds;
     base.projectorBounds = in.projectorBounds;
@@ -153,9 +154,7 @@ void runProcess(const ProcessIdentity &id, const ProcessInputs &in)
     rt::EmbeddedDriverOptions embeddedOptions;
     if (DriverMode::EMBEDDED == c.driverMode)
     {
-        embeddedOptions.processName = id.processName;
-        embeddedOptions.dirPrefix = id.dirPrefix;
-        embeddedOptions.instanceKey = id.instanceKey;
+        embeddedOptions = embeddedDriverOptions(id, c); // <P>_IDLE on the driver's agents (backoff: Aeron's default)
         aeronDir = rt::EmbeddedDriver::dirFor(c.driverDir, c.instanceId, embeddedOptions);
     }
     base.driverDir = aeronDir;
@@ -283,7 +282,9 @@ void runProcess(const ProcessIdentity &id, const ProcessInputs &in)
             }
         }
         driverReclaimed.store(driver->reclaimed(), std::memory_order_release);
-        std::fprintf(stderr, "%s: embedded media driver at %s%s\n", id.processName, dir.c_str(),
+        const char *driverIdle = driver->idleStrategyName(3); // SHARED threading: the one agent
+        std::fprintf(stderr, "%s: embedded media driver at %s, idle %s (strategy %s)%s\n", id.processName, dir.c_str(),
+            rt::idleModeName(c.idle), nullptr == driverIdle ? "?" : driverIdle,
             driver->reclaimed() ? " (a stale dir of this instance was reused and cleaned)" : "");
     }
     // a fatal conductor error is _Exit(70), its line classified as the supervisor's conductor exits are (the process
@@ -352,11 +353,12 @@ void runProcess(const ProcessIdentity &id, const ProcessInputs &in)
         front->start();
     }
 
-    const bool busy = IdleMode::BUSY == c.idle;
     const std::int64_t publishIntervalNs = c.statusIntervalMs * 1'000'000LL;
     const int code = supervisor.run(
         [&]() -> int {
-            rt::IdleStrategy idle(rt::FORWARDER_IDLE);
+            // <P>_IDLE: backoff = FORWARDER_IDLE (spin 100, yield 100, park 100 us), sleep = park 1 ms, busy_spin =
+            // a CPU pause hint per idle iteration, never a yield or a sleep
+            rt::IdleStrategy idle(dutyIdlePolicy(c.idle));
             Status status;
             std::int64_t lastPublishNs = 0;
             std::unique_ptr<DutyWork> duty;
@@ -368,8 +370,8 @@ void runProcess(const ProcessIdentity &id, const ProcessInputs &in)
                 context.log = &log;
                 duty = in.makeDuty(context);
             }
-            log.push(rt::LogLevel::INFO, nowNs(), "%s-duty: running%s", id.threadPrefix,
-                duty ? "" : " (no cluster session in this build)");
+            log.push(rt::LogLevel::INFO, nowNs(), "%s-duty: running, idle %s%s", id.threadPrefix,
+                rt::idleModeName(c.idle), duty ? "" : " (no cluster session in this build)");
             int dutyExit = exit_code::CLEAN;
             while (!supervisor.stopRequested.load(std::memory_order_acquire))
             {
@@ -407,10 +409,7 @@ void runProcess(const ProcessIdentity &id, const ProcessInputs &in)
                 {
                     status.dutyMaxCycleUs = cycleUs;
                 }
-                if (!busy)
-                {
-                    idle.idle(work);
-                }
+                idle.idle(work);
             }
             if (duty)
             {

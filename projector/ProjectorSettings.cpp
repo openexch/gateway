@@ -79,7 +79,7 @@ ParseResult<ProjectorSettings> parseProjectorSettings(const Environment &env, co
             }
         }
     }
-    c.idle = 1 == r.choice(X + "IDLE", { "backoff", "busy" }, 0) ? IdleMode::BUSY : IdleMode::BACKOFF;
+    c.idle = readIdleMode(r, X + "IDLE");
     // above the default archive timeout (5000): an archive control call that waits out its timeout on pj-duty leaves
     // the source instead of tripping the watchdog
     c.dutyWatchdogMs = r.positive(X + "DUTY_WATCHDOG_MS", 10'000);

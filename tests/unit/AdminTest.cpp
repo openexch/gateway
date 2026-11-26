@@ -240,6 +240,12 @@ TEST(metrics_carry_the_binary_prefix_and_every_condition)
     CHECK(has(g.body, "\ngateway_session_registered 0\n"));
     CHECK(has(g.body, "gateway_build_info{version=\"dev\""));
     CHECK(!has(g.body, "\nstream_"));
+    // the idle mode in force: a labelled gauge and the duty object of /health
+    CHECK(has(g.body, "\n# TYPE gateway_idle_mode gauge\ngateway_idle_mode{mode=\"backoff\"} 1\n"));
+    AdminView sleeping = view(Role::GATEWAY, &settings);
+    sleeping.idleMode = "sleep";
+    CHECK(has(get(sleeping, "/metrics").body, "\ngateway_idle_mode{mode=\"sleep\"} 1\n"));
+    CHECK(has(get(sleeping, "/health").body, "\"watchdogMs\":5000,\"idleMode\":\"sleep\""));
     // ignored egress templates are their own counter, by template id, apart from decode_refused_total
     AdminView ignoring = view(Role::GATEWAY, &settings);
     ignoring.status.decodeRefused = 2;

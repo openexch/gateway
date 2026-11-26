@@ -57,6 +57,14 @@ dead driver.
 `<P>_RECONNECT_DELAY_MS` (default 1000) spaces session reconnects; `<P>_REGISTER_RESEND_MS` (default 5000)
 resends an unanswered registration.
 
+`GATEWAY_IDLE`, `STREAM_IDLE`, `MD_IDLE` and `HISTORY_PROJECTOR_IDLE` take exactly `busy_spin`, `backoff` or
+`sleep` (unset: `backoff`); any other value refuses the start (78). The mode sets the duty thread's idle policy and,
+with the embedded driver, every agent of the driver: `backoff` spins 100, yields 100, then parks 100 us (the driver at
+Aeron's default), `sleep` parks 1 ms after an iteration without work with no spin and no yield (the driver's agents
+sleep 1 ms), `busy_spin` never yields or sleeps (the driver's agents spin). An external driver's idle strategy is its
+own (cluster-tools `driver-idle-<mode>.properties`). `/health` (`duty.idleMode`) and `/metrics` (`<p>idle_mode`)
+show the mode in force.
+
 In external mode a missing `AERON_DIR` means the driver is not up yet: the process exits 70 after the
 driver timeout so the service manager retries it. Order the unit after `aeronmd` anyway.
 

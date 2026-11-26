@@ -495,7 +495,7 @@ ParseResult<MarketDataSettings> parseMarketDataSettings(const Environment &env, 
 
     // the process shell
     c.ioThreads = positive(r, "MD_IO_THREADS", c.ioThreads);
-    c.idle = 1 == r.choice("MD_IDLE", { "backoff", "busy" }, 0) ? IdleMode::BUSY : IdleMode::BACKOFF;
+    c.idle = readIdleMode(r, "MD_IDLE");
     c.commandRing = positive(r, "MD_COMMAND_RING", c.commandRing);
     c.dutyWatchdogMs = positive(r, "MD_DUTY_WATCHDOG_MS", c.dutyWatchdogMs);
     c.stopTimeoutMs = positive(r, "MD_STOP_TIMEOUT_MS", c.stopTimeoutMs);

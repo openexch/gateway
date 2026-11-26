@@ -399,6 +399,35 @@ TEST(md_settings_defaults)
     CHECK(md(env).settings.meIngress == "0=10.0.0.1:9002,1=10.0.0.2:9002,2=10.0.0.3:9002");
 }
 
+// MD_IDLE: exactly busy_spin, backoff or sleep; unset = backoff; `busy` and any other word refused (invalid setting).
+TEST(md_settings_idle_mode)
+{
+    const auto unset = md(mdEnv());
+    CHECK(unset.ok() && IdleMode::BACKOFF == unset.settings.common.idle);
+    const SettingRecord *def = recordOf(unset.records, "MD_IDLE");
+    CHECK(nullptr != def && "backoff" == def->value && "default" == def->source);
+    for (const auto &[word, mode] : std::vector<std::pair<std::string, IdleMode>>{
+             { "busy_spin", IdleMode::BUSY_SPIN }, { "backoff", IdleMode::BACKOFF }, { "sleep", IdleMode::SLEEP } })
+    {
+        auto env = mdEnv();
+        env["MD_IDLE"] = word;
+        const auto p = md(env);
+        CHECK_MSG(p.ok(), word + joined(p.errors));
+        CHECK_MSG(mode == p.settings.common.idle, word);
+        const SettingRecord *rec = recordOf(p.records, "MD_IDLE");
+        CHECK_MSG(nullptr != rec && word == rec->value && "set" == rec->source, word);
+    }
+    for (const std::string bad : { "busy", "spin", "", "Backoff" })
+    {
+        auto env = mdEnv();
+        env["MD_IDLE"] = bad;
+        const auto p = md(env);
+        CHECK_MSG(1 == p.errors.size(), "MD_IDLE=" + bad + joined(p.errors));
+        CHECK_MSG(hasLine(p.errors, "invalid setting: MD_IDLE") && std::string::npos != joined(p.errors).find(
+            "must be exactly busy_spin, backoff or sleep (unset = backoff), got '" + bad + "'"), joined(p.errors));
+    }
+}
+
 TEST(md_settings_required_keys)
 {
     const std::vector<std::string> required = { "MD_DRIVER_MODE", "MD_DRIVER_DIR", "MD_INSTANCE_ID",
