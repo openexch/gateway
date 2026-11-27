@@ -25,7 +25,25 @@
 //                                503 cause heartbeat from the truncate until the first beat, never a page, never 404 for
 //                                an order that existed; complete pages after the beat
 //   reader_role_prepared         the schema applied by an owner without CREATEROLE: the reader role absent, a refusal
-//                                naming it; created beforehand, the apply succeeds with the four grants
+//                                naming it; the pruner role absent, a refusal naming it; both created beforehand, the
+//                                apply succeeds with the reader's four grants and the pruner's column, DELETE and
+//                                EXECUTE grants, nothing wider
+//   prune_story                  gateway_history_prune_v1 over a projected story, as a login that is only a member of
+//                                oe_history_pruner: old terminal orders deleted whole (fills, events), oldest first,
+//                                max_orders per call; old open orders and new terminal ones kept whole, a shared trade's
+//                                other fill kept; a second pass deletes nothing; the cursor and up_to_seq; the readers
+//                                see a deleted order as an unknown one; a login outside the role is refused
+//   schema_upgrade               a database written by a version 1 binary (schema step 1 only, rows projected): the
+//                                migrate applies version 2 in place (UPGRADED), the rows and the cursor unchanged, both
+//                                sha256 recorded, the catalog equal to a fresh database's; PRESENT after; a recorded
+//                                sha256 of either step that is not the binary's, a version it does not carry, a record
+//                                with a gap: FOREIGN, nothing applied
+//   prune_concurrent_writer      a delete while a projector transaction is open on the same order (waits, tests it again,
+//                                keeps it) and on another order (does not wait); no deadlock
+//   prune_then_project           apply, prune, apply more, restart, a source read again from the start: the deleted
+//                                orders' records are pruned skips, the rest compare equal, no conflict, no deleted order
+//                                written again, the cursor dense from the deletes on; a missing row of a kept order is
+//                                still a conflict; a rebuild's truncate resets up_to_seq
 //   projection_dense             the story applied in batches of 16: every journalSeq from 1 to applied_seq has its row
 //                                in oe_order_events (the check the fixture's dump makes)
 //   projection_byte_equal        the same story projected into two databases, a moment apart: the canonical dumps of
@@ -214,15 +232,16 @@ struct Rig
         return true;
     }
 
-    // migrate, wait for the lease, load
-    bool start(std::int64_t waitMs = 5000)
+    // migrate (unless `schema` is false: the database holds a schema already, as an older binary left it), wait for
+    // the lease, load
+    bool start(std::int64_t waitMs = 5000, bool schema = true)
     {
         if (!connect())
         {
             return false;
         }
         std::string detail;
-        const SchemaVerdict v = migrate(conn, T, detail);
+        const SchemaVerdict v = schema ? migrate(conn, T, T, detail) : SchemaVerdict::PRESENT;
         if (SchemaVerdict::FAILED == v || SchemaVerdict::FOREIGN == v)
         {
             gwtest::fail(__FILE__, __LINE__, "schema: " + detail);
@@ -1377,7 +1396,7 @@ TEST(reader_role_prepared)
             detail = "connect: " + error;
             return SchemaVerdict::FAILED;
         }
-        return migrate(conn, T, detail);
+        return migrate(conn, T, T, detail);
     };
     {
         std::string detail;
@@ -1392,8 +1411,17 @@ TEST(reader_role_prepared)
     gwtest::sql(admin, "CREATE ROLE oe_history_reader NOLOGIN");
     const std::string url = ownedBy("pj_role_prepared");
     std::string detail;
-    const SchemaVerdict v = apply(url, detail);
-    CHECK_MSG(SchemaVerdict::APPLIED == v, "the apply with the role created beforehand: " + detail);
+    // version 2 names the pruner role: absent and not creatable, the whole apply is refused (version 1 too)
+    CHECK(gwtest::sql(admin, "SELECT count(*) FROM pg_roles WHERE rolname = 'oe_history_pruner'") == "0");
+    SchemaVerdict v = apply(url, detail);
+    CHECK_MSG(SchemaVerdict::FOREIGN == v, "the apply without CREATEROLE and without the pruner role: " + detail);
+    CHECK_MSG(std::string::npos != detail.find("oe_history_pruner") && std::string::npos != detail.find("CREATEROLE"),
+        "the refusal does not name the pruner role: " + detail);
+    CHECK(gwtest::sql(admin, "SELECT count(*) FROM pg_roles WHERE rolname = 'oe_history_pruner'") == "0");
+    std::printf("  refused: %s\n", detail.c_str());
+    gwtest::sql(admin, "CREATE ROLE oe_history_pruner NOLOGIN");
+    v = apply(url, detail);
+    CHECK_MSG(SchemaVerdict::APPLIED == v, "the apply with the roles created beforehand: " + detail);
     const std::string base = gwtest::env("GW_TEST_PG_URL");
     const std::string superUrl = base.substr(0, base.rfind('/') + 1) + "pj_role_prepared";
     const std::string select = gwtest::sql(superUrl, "SELECT coalesce(string_agg(c.relname, ',' ORDER BY c.relname), "
@@ -1406,6 +1434,22 @@ TEST(reader_role_prepared)
         "has_table_privilege('oe_history_reader', c.oid, 'UPDATE') OR has_table_privilege('oe_history_reader', c.oid, "
         "'DELETE') OR has_table_privilege('oe_history_reader', c.oid, 'TRUNCATE'))");
     CHECK_MSG(other == "0", "the reader can write " + other + " relations");
+    // the pruner: EXECUTE on the delete (a SECURITY DEFINER function) and no right on any relation or column
+    const std::string wider = gwtest::sql(superUrl, "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = "
+        "c.relnamespace WHERE n.nspname = 'public' AND (has_table_privilege('oe_history_pruner', c.oid, 'SELECT') OR "
+        "has_table_privilege('oe_history_pruner', c.oid, 'INSERT') OR has_table_privilege('oe_history_pruner', c.oid, "
+        "'UPDATE') OR has_table_privilege('oe_history_pruner', c.oid, 'DELETE') OR "
+        "has_table_privilege('oe_history_pruner', c.oid, 'TRUNCATE'))");
+    CHECK_MSG(wider == "0", "the pruner has rights on " + wider + " relations");
+    const std::string columns = gwtest::sql(superUrl, "SELECT count(*) FROM information_schema.column_privileges WHERE "
+        "grantee = 'oe_history_pruner'");
+    CHECK_MSG(columns == "0", "the pruner holds " + columns + " column privileges");
+    CHECK(gwtest::sql(superUrl, "SELECT prosecdef::text || ':' || array_to_string(proconfig, ';') FROM pg_proc WHERE "
+        "oid = 'gateway_history_prune_v1(bigint,integer)'::regprocedure") == "true:search_path=pg_catalog, public, pg_temp");
+    CHECK(gwtest::sql(superUrl, "SELECT has_function_privilege('oe_history_pruner', "
+        "'gateway_history_prune_v1(bigint,integer)', 'EXECUTE')") == "t");
+    CHECK(gwtest::sql(superUrl, "SELECT has_function_privilege('oe_history_reader', "
+        "'gateway_history_prune_v1(bigint,integer)', 'EXECUTE')") == "f");
 }
 
 namespace {
@@ -1494,4 +1538,565 @@ TEST(projection_byte_equal)
             std::printf("%s dump sha256 %s in both projections\n", r.table, fa.c_str());
         }
     }
+}
+
+namespace {
+
+constexpr std::int64_t OLD_MS = 1'700'000'100'000;   // rec(): updatedAtMs = OLD_MS + seq
+constexpr std::int64_t NEW_MS = 1'800'000'000'000;
+constexpr std::int64_t CUTOFF_MS = 1'700'000'200'000; // above every OLD_MS + seq of these stories, below NEW_MS
+
+JournalRecord at(JournalRecord r, std::int64_t updatedAtMs)
+{
+    r.event.updatedAtMs = updatedAtMs;
+    return r;
+}
+
+// The retention story: old terminal orders of every terminal status (one sharing a trade with an open order), an old
+// open order updated twice, an old partly filled order, a new terminal order.
+std::vector<JournalRecord> pruneStory()
+{
+    std::vector<JournalRecord> s;
+    s.push_back(rec(1, 1, money::EventKind::ACCEPTED, money::OrderStatus::NEW));
+    s.push_back(rec(2, 7, money::EventKind::ACCEPTED, money::OrderStatus::NEW));
+    s.push_back(fill(3, 1, 101, 2'00000000, 2'00000000, Liquidity::TAKER));       // order 1 and order 7 share trade 101
+    s.push_back(fill(4, 7, 101, 2'00000000, 2'00000000, Liquidity::MAKER));       // order 7 stays PARTIALLY_FILLED
+    s.push_back(fill(5, 1, 102, 3'00000000, 5'00000000, Liquidity::TAKER));       // order 1 FILLED
+    s.push_back(rec(6, 2, money::EventKind::ACCEPTED, money::OrderStatus::NEW));   // order 2 stays open
+    s.push_back(rec(7, 3, money::EventKind::ACCEPTED, money::OrderStatus::NEW));
+    s.push_back(rec(8, 3, money::EventKind::CANCELLED, money::OrderStatus::CANCELLED));
+    s.push_back(rec(9, 4, money::EventKind::REJECTED, money::OrderStatus::REJECTED));
+    s.push_back(rec(10, 5, money::EventKind::ACCEPTED, money::OrderStatus::NEW));
+    s.push_back(rec(11, 5, money::EventKind::EXPIRED, money::OrderStatus::EXPIRED));
+    s.push_back(at(rec(12, 6, money::EventKind::ACCEPTED, money::OrderStatus::NEW), NEW_MS));
+    s.push_back(at(rec(13, 6, money::EventKind::CANCELLED, money::OrderStatus::CANCELLED), NEW_MS + 1)); // new terminal
+    s.push_back(rec(14, 2, money::EventKind::REPLACED, money::OrderStatus::NEW));
+    for (auto &r : s)
+    {
+        r = journaled(r);
+    }
+    return s;
+}
+
+bool projectRecords(Rig &rig, const std::vector<JournalRecord> &records)
+{
+    for (const auto &r : records)
+    {
+        rig.push(Item::Kind::APPLY, r);
+    }
+    while (rig.ex.pending())
+    {
+        if (Hold::HELD != rig.commit())
+        {
+            gwtest::fail(__FILE__, __LINE__, "a batch did not commit: " + rig.lastError);
+            return false;
+        }
+    }
+    return true;
+}
+
+// The rows a gateway read statement returns.
+int statementRows(const std::string &url, const history::Statement &s)
+{
+    PgConn c;
+    std::string error;
+    pg::Result r;
+    if (!c.connect(url, T, error) || pg::Exec::OK != c.exec(s.sql, s.params, T, r, error))
+    {
+        gwtest::fail(__FILE__, __LINE__, error);
+        return -1;
+    }
+    return PQntuples(r.get());
+}
+
+// One statement; false with the server's message (a refusal the case expects).
+bool tryStatement(const std::string &url, const std::string &statement, std::string &error)
+{
+    PGconn *c = PQconnectdb(url.c_str());
+    if (CONNECTION_OK != PQstatus(c))
+    {
+        error = PQerrorMessage(c);
+        PQfinish(c);
+        return false;
+    }
+    PGresult *r = PQexec(c, statement.c_str());
+    const ExecStatusType st = PQresultStatus(r);
+    const bool ok = PGRES_COMMAND_OK == st || PGRES_TUPLES_OK == st;
+    error = ok ? "" : PQresultErrorMessage(r);
+    PQclear(r);
+    PQfinish(c);
+    return ok;
+}
+
+// A login of its own that is a member of oe_history_pruner and holds nothing else.
+std::string pruner(const std::string &url, const std::string &role)
+{
+    const std::string admin = gwtest::env("GW_TEST_PG_ADMIN_URL");
+    gwtest::sql(admin, "DROP ROLE IF EXISTS " + role);
+    gwtest::sql(admin, "CREATE ROLE " + role + " LOGIN PASSWORD 'pj-pruner' NOSUPERUSER NOCREATEROLE");
+    gwtest::sql(admin, "GRANT oe_history_pruner TO " + role);
+    return "postgresql://" + role + ":pj-pruner" + url.substr(url.find('@'));
+}
+
+std::string prune(const std::string &url, std::int64_t beforeMs, int maxOrders)
+{
+    return one(url, "SELECT orders_deleted || ',' || fills_deleted || ',' || events_deleted FROM gateway_history_prune_v1(" +
+        std::to_string(beforeMs) + ", " + std::to_string(maxOrders) + ")");
+}
+
+std::string list(const std::string &url, const std::string &sql)
+{
+    return one(url, "SELECT coalesce(string_agg(x::text, ',' ORDER BY x), '') FROM (" + sql + ") t(x)");
+}
+
+// The relations, indexes, triggers, functions and grants of schema public: equal for two databases with the same schema.
+std::string catalogOf(const std::string &url)
+{
+    return one(url, "SELECT md5(concat_ws(E'\\n', "
+        "(SELECT string_agg(table_name || '.' || column_name || ':' || data_type || ':' || is_nullable || ':' || "
+        "coalesce(column_default, ''), ',' ORDER BY table_name, ordinal_position) FROM information_schema.columns WHERE "
+        "table_schema = 'public'), "
+        "(SELECT string_agg(indexname || ':' || indexdef, ',' ORDER BY indexname) FROM pg_indexes WHERE schemaname = "
+        "'public'), "
+        "(SELECT string_agg(conname || ':' || pg_get_constraintdef(oid), ',' ORDER BY conname) FROM pg_constraint WHERE "
+        "connamespace = 'public'::regnamespace), "
+        "(SELECT string_agg(tgname || ':' || pg_get_triggerdef(oid), ',' ORDER BY tgname) FROM pg_trigger WHERE NOT "
+        "tgisinternal), "
+        "(SELECT string_agg(proname || ':' || pg_get_functiondef(oid), ',' ORDER BY proname) FROM pg_proc WHERE "
+        "pronamespace = 'public'::regnamespace), "
+        "(SELECT string_agg(grantee || ':' || table_name || ':' || privilege_type, ',' ORDER BY grantee, table_name, "
+        "privilege_type) FROM information_schema.role_table_grants WHERE grantee LIKE 'oe\\_history\\_%'), "
+        "(SELECT string_agg(grantee || ':' || table_name || '.' || column_name, ',' ORDER BY grantee, table_name, "
+        "column_name) FROM information_schema.column_privileges WHERE grantee LIKE 'oe\\_history\\_%'), "
+        "(SELECT string_agg(viewname || ':' || definition, ',' ORDER BY viewname) FROM pg_views WHERE schemaname = "
+        "'public')))");
+}
+
+SchemaVerdict migrateOnce(const std::string &url, std::string &detail)
+{
+    PgConn conn;
+    PgOptions o;
+    o.url = url;
+    o.statementTimeoutMs = T;
+    std::string error;
+    if (!connectProjection(conn, o, error))
+    {
+        detail = "connect: " + error;
+        return SchemaVerdict::FAILED;
+    }
+    return migrate(conn, T, T, detail);
+}
+
+}
+
+// The delete over a projected story, as a login that holds only the pruner role.
+TEST(prune_story)
+{
+    const std::string url = gwtest::freshDatabase("pj_prune_story");
+    {
+        Rig rig(url, 4);
+        CHECK(rig.start());
+        rig.epoch(EPOCH);
+        CHECK(projectRecords(rig, pruneStory()));
+        rig.release();
+    }
+    checkDense(url, 14, "the retention story");
+    const std::string cursor = one(url, "SELECT applied_seq || ':' || applied_order_id || ':' || epoch FROM "
+        "oe_projection_state");
+    CHECK_MSG(cursor == "14:7:77", "cursor " + cursor);
+    const std::string pr = pruner(url, "pj_pruner");
+    // oldest first (by updated_at_ms), at most max_orders per call; one call deletes an order with all its rows
+    CHECK_MSG(prune(pr, CUTOFF_MS, 2) == "2,2,5", "first call: orders 1 and 3");
+    CHECK(list(url, "SELECT order_id FROM oe_orders") == "2,4,5,6,7");
+    CHECK_MSG(prune(pr, CUTOFF_MS, 2) == "2,0,3", "second call: orders 4 and 5");
+    CHECK_MSG(prune(pr, CUTOFF_MS, 2) == "0,0,0", "nothing older is left");
+    CHECK_MSG(prune(pr, CUTOFF_MS, 1000) == "0,0,0", "a second pass deletes nothing");
+    // what is left: the old open orders whole (2 with both records, 7 with its fill of the shared trade), the new
+    // terminal order whole
+    CHECK(list(url, "SELECT order_id FROM oe_orders") == "2,6,7");
+    CHECK(list(url, "SELECT journal_seq FROM oe_order_events") == "2,4,6,12,13,14");
+    CHECK(list(url, "SELECT trade_id || ':' || order_id FROM oe_fills") == "101:7");
+    CHECK(list(url, "SELECT DISTINCT order_id FROM oe_order_events") == "2,6,7");
+    CHECK(one(url, "SELECT status || ':' || last_event_seq FROM oe_orders WHERE order_id = 2") == "NEW:14");
+    CHECK(one(url, "SELECT status || ':' || last_event_seq FROM oe_orders WHERE order_id = 7") == "PARTIALLY_FILLED:4");
+    // the cursor never moves; up_to_seq is the greatest journal_seq deleted
+    CHECK(one(url, "SELECT applied_seq || ':' || applied_order_id || ':' || epoch FROM oe_projection_state") == cursor);
+    CHECK(one(url, "SELECT up_to_seq FROM oe_projection_pruned") == "11");
+    CHECK(CUTOFF_MS == num(url, "SELECT max_before_ms FROM oe_projection_pruned")); // calls that deleted nothing: no change
+    CHECK(one(url, "SELECT updated_at IS NOT NULL FROM oe_projection_pruned") == "t");
+    // a cutoff above every order deletes the new terminal order too, never the open ones
+    CHECK_MSG(prune(pr, NEW_MS + 2, 1000) == "1,0,2", "the new terminal order once the cutoff passes it");
+    CHECK(list(url, "SELECT order_id FROM oe_orders") == "2,7");
+    CHECK(one(url, "SELECT up_to_seq FROM oe_projection_pruned") == "13");
+    CHECK(NEW_MS + 2 == num(url, "SELECT max_before_ms FROM oe_projection_pruned"));
+    CHECK_MSG(prune(pr, CUTOFF_MS, 1000) == "0,0,0" && NEW_MS + 2 == num(url, "SELECT max_before_ms FROM "
+        "oe_projection_pruned"), "the cutoff watermark never goes down");
+    // the readers: a deleted order has no row in any read relation, like an unknown id; its id is at or below
+    // applied_order_id, so GET /orders/{id} answers 404 (an unknown id at or below it gets the same answer)
+    for (std::int64_t id : { 1, 3, 4, 5, 6 })
+    {
+        CHECK_MSG(rowJson(url, true, 500 + id % 3, id).empty(), "order row of deleted order " + std::to_string(id));
+        CHECK_MSG(rowJson(url, false, 500 + id % 3, id).empty(), "fills of deleted order " + std::to_string(id));
+        CHECK_MSG(0 == statementRows(url, history::trailExistsStatement(500 + id % 3, id)),
+            "trail of deleted order " + std::to_string(id));
+        CHECK(id <= num(url, "SELECT applied_order_id FROM oe_projection_state"));
+    }
+    CHECK(rowJson(url, true, 500, 3).empty() && rowJson(url, true, 999, 999).empty()); // and an id never seen
+    // the gateway's history store: a deleted order answers what an unknown order at or below applied_order_id answers
+    // (another user's order: 404 NOT_FOUND), for the order and for its trail
+    gwtest::sql(url, "UPDATE oe_projection_state SET beat_at = clock_timestamp()"); // the beat is not this case's rule
+    {
+        PgHistorySettings hs;
+        hs.url = url;
+        hs.workers = 1;
+        PgHistoryStore store(hs);
+        const auto deadline = [] {
+            return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count() + 5'000'000'000LL;
+        };
+        auto orderAnswer = [&](std::int64_t user, std::int64_t id) {
+            std::string json;
+            HistoryAsOf asOf;
+            return store.order(0, user, id, json, asOf, deadline(), HistoryExpect{ EPOCH, 0 });
+        };
+        auto trailAnswer = [&](std::int64_t user, std::int64_t id) {
+            HistoryPage page;
+            return store.page(0, history::PageRequest{ history::Kind::TRAIL, user, history::Filter{ 0, "", id },
+                std::nullopt, 50 }, page, deadline(), HistoryExpect{ EPOCH, 0 });
+        };
+        const HistoryAnswer unknown = orderAnswer(999, 2);
+        CHECK_MSG(HistoryStatus::NOT_FOUND == unknown.status, "another user's order");
+        for (std::int64_t id : { 1, 3, 4, 5, 6 })
+        {
+            const HistoryAnswer a = orderAnswer(500 + id % 3, id);
+            CHECK_MSG(a.status == unknown.status && a.cause == unknown.cause, "deleted order " + std::to_string(id));
+            const HistoryAnswer t = trailAnswer(500 + id % 3, id);
+            CHECK_MSG(HistoryStatus::NOT_FOUND == t.status, "trail of deleted order " + std::to_string(id));
+        }
+        CHECK(HistoryStatus::OK == orderAnswer(500 + 2 % 3, 2).status);
+        CHECK(HistoryStatus::OK == trailAnswer(500 + 7 % 3, 7).status);
+    }
+    CHECK(!rowJson(url, true, 500 + 2 % 3, 2).empty() && !rowJson(url, false, 500 + 7 % 3, 7).empty());
+    // a login outside the pruner role is refused by the server
+    const std::string admin = gwtest::env("GW_TEST_PG_ADMIN_URL");
+    gwtest::sql(admin, "DROP ROLE IF EXISTS pj_outsider");
+    gwtest::sql(admin, "CREATE ROLE pj_outsider LOGIN PASSWORD 'pj-pruner' NOSUPERUSER");
+    std::string error;
+    CHECK(!tryStatement("postgresql://pj_outsider:pj-pruner" + url.substr(url.find('@')),
+        "SELECT * FROM gateway_history_prune_v1(" + std::to_string(NEW_MS + 2) + ", 10)", error));
+    CHECK_MSG(std::string::npos != error.find("permission denied"), "outsider: " + error);
+    std::printf("  outsider refused: %s", error.c_str());
+}
+
+
+// A database a version 1 binary wrote, upgraded in place.
+TEST(schema_upgrade)
+{
+    const std::vector<ProjectionSchemaStep> &steps = projectionSchemaSteps();
+    CHECK(2 == steps.size() && 1 == steps[0].version && 2 == steps[1].version);
+    CHECK(std::string(projectionSchemaSha256()) == steps[1].sha256);
+    const std::string url = gwtest::freshDatabase("pj_upgrade");
+    // what a version 1 binary leaves: step 1 applied and recorded, history projected over it
+    gwtest::sql(url, std::string("BEGIN;\n") + steps[0].sql + "\nCREATE TABLE oe_projection_schema (version INTEGER NOT "
+        "NULL PRIMARY KEY, name TEXT NOT NULL, sha256 TEXT NOT NULL);\nCOMMIT;");
+    const std::string v1 = std::string("(1, 'history_projection', '") + steps[0].sha256 + "')";
+    const std::string v2 = std::string("(2, 'history_retention', '") + steps[1].sha256 + "')";
+    auto record = [&](const std::string &rows) {
+        gwtest::sql(url, "DELETE FROM oe_projection_schema; INSERT INTO oe_projection_schema (version, name, sha256) "
+            "VALUES " + rows);
+    };
+    record(v1);
+    const std::vector<JournalRecord> all = story();
+    {
+        Rig rig(url, 16);
+        CHECK(rig.start(5000, false));
+        rig.epoch(EPOCH);
+        CHECK(projectRecords(rig, std::vector<JournalRecord>(all.begin(), all.end() - 2)));
+        rig.release();
+    }
+    const std::int64_t n = static_cast<std::int64_t>(all.size()) - 2;
+    checkDense(url, n, "projected over version 1");
+    CHECK("" == one(url, "SELECT to_regclass('oe_projection_pruned')::text"));
+    auto rowsSha = [&] {
+        return dumpSha(url, "oe_order_events", "journal_seq", true) + dumpSha(url, "oe_orders", "order_id", true) +
+            dumpSha(url, "oe_fills", "trade_id, order_id", true) + one(url, "SELECT applied_seq || ':' || "
+            "applied_log_position || ':' || applied_order_id || ':' || epoch FROM oe_projection_state");
+    };
+    const std::string before = rowsSha();
+    // refusals first, each leaving the database as it was: nothing of version 2 applied
+    struct Refusal
+    {
+        std::string rows;
+        std::string text;
+    };
+    for (const Refusal &r : { Refusal{ "(1, 'history_projection', 'not-this-one')", "version 1 with sha256 not-this-one" },
+             Refusal{ v1 + ", (3, 'future', 'x')", "carries versions 1 to 2 only" },
+             Refusal{ v2, "version 2 without version 1" },
+             Refusal{ v1 + ", (2, 'history_retention', 'not-this-one')", "version 2 with sha256 not-this-one" } })
+    {
+        record(r.rows);
+        std::string detail;
+        const SchemaVerdict v = migrateOnce(url, detail);
+        CHECK_MSG(SchemaVerdict::FOREIGN == v && std::string::npos != detail.find(r.text),
+            std::string("refusal ") + nameOf(v) + ": " + detail + " (expected '" + r.text + "')");
+        CHECK("" == one(url, "SELECT to_regclass('oe_projection_pruned')::text"));
+        CHECK(before == rowsSha());
+        std::printf("  refused: %s\n", detail.c_str());
+    }
+    // the upgrade in place
+    record(v1);
+    std::string detail;
+    SchemaVerdict v = migrateOnce(url, detail);
+    CHECK_MSG(SchemaVerdict::UPGRADED == v, std::string(nameOf(v)) + ": " + detail);
+    std::printf("  %s: %s\n", nameOf(v), detail.c_str());
+    CHECK_MSG(before == rowsSha(), "the rows or the cursor changed in the upgrade");
+    CHECK(one(url, "SELECT string_agg(version || ':' || name || ':' || sha256, ',' ORDER BY version) FROM "
+        "oe_projection_schema") == std::string("1:history_projection:") + steps[0].sha256 + ",2:history_retention:" +
+        steps[1].sha256);
+    CHECK(one(url, "SELECT up_to_seq || ':' || (updated_at IS NULL) FROM oe_projection_pruned") == "0:true");
+    v = migrateOnce(url, detail);
+    CHECK_MSG(SchemaVerdict::PRESENT == v, std::string(nameOf(v)) + ": " + detail);
+    // the same catalog as a database created by this binary
+    const std::string fresh = gwtest::freshDatabase("pj_upgrade_fresh");
+    v = migrateOnce(fresh, detail);
+    CHECK_MSG(SchemaVerdict::APPLIED == v, std::string(nameOf(v)) + ": " + detail);
+    const std::string upgradedCatalog = catalogOf(url);
+    CHECK_MSG(upgradedCatalog == catalogOf(fresh), "the upgraded catalog differs from a fresh one");
+    // the projector goes on from its cursor over the upgraded database
+    {
+        Rig rig(url, 16);
+        CHECK(rig.start());
+        CHECK(n == rig.state.appliedSeq);
+        CHECK(projectRecords(rig, std::vector<JournalRecord>(all.end() - 2, all.end())));
+        rig.release();
+    }
+    checkDense(url, n + 2, "applied after the upgrade");
+    // a rollback to a version 1 binary: it refuses the database while version 2 is recorded; with the version-2 row
+    // deleted it runs (the version 2 objects stay, unused); the next upgrade applies step 2 again over them
+    const std::vector<ProjectionSchemaStep> v1Only(steps.begin(), steps.begin() + 1);
+    auto migrateAs = [&](const std::vector<ProjectionSchemaStep> &carried, std::string &d) {
+        PgConn conn;
+        PgOptions o;
+        o.url = url;
+        o.statementTimeoutMs = T;
+        std::string e;
+        if (!connectProjection(conn, o, e))
+        {
+            d = e;
+            return SchemaVerdict::FAILED;
+        }
+        return migrateSteps(conn, T, T, carried, d);
+    };
+    v = migrateAs(v1Only, detail);
+    CHECK_MSG(SchemaVerdict::FOREIGN == v && std::string::npos != detail.find("carries versions 1 to 1 only"),
+        std::string("a version 1 binary on a version 2 database: ") + nameOf(v) + ": " + detail);
+    gwtest::sql(url, "DELETE FROM oe_projection_schema WHERE version = 2");
+    v = migrateAs(v1Only, detail);
+    CHECK_MSG(SchemaVerdict::PRESENT == v, std::string("the version 1 binary after the row is deleted: ") + nameOf(v));
+    const std::string beforeReupgrade = rowsSha();
+    v = migrateOnce(url, detail);
+    CHECK_MSG(SchemaVerdict::UPGRADED == v, std::string("upgraded again: ") + nameOf(v) + ": " + detail);
+    CHECK_MSG(beforeReupgrade == rowsSha(), "the rows or the cursor changed in the second upgrade");
+    CHECK(catalogOf(url) == upgradedCatalog);
+    CHECK(one(url, "SELECT count(*) FROM oe_projection_pruned") == "1");
+    CHECK(one(url, "SELECT string_agg(version::text, ',' ORDER BY version) FROM oe_projection_schema") == "1,2");
+}
+
+// A delete running while a projector transaction is open: on the same order it waits for the row lock, then tests the
+// order again and keeps it (the projector made it newer); on another order it does not wait. No deadlock either way.
+TEST(prune_concurrent_writer)
+{
+    const std::string url = gwtest::freshDatabase("pj_prune_concurrent");
+    Rig rig(url, 64);
+    CHECK(rig.start());
+    rig.epoch(EPOCH);
+    // orders 1..4 old and cancelled (records 1..8)
+    std::vector<JournalRecord> old;
+    for (std::int64_t q = 1; q <= 8; ++q)
+    {
+        const std::int64_t order = (q + 1) / 2;
+        old.push_back(journaled(1 == q % 2 ? rec(q, order, money::EventKind::ACCEPTED, money::OrderStatus::NEW)
+                                           : rec(q, order, money::EventKind::CANCELLED, money::OrderStatus::CANCELLED)));
+    }
+    CHECK(projectRecords(rig, old));
+    const std::string admin = gwtest::env("GW_TEST_PG_ADMIN_URL");
+    auto pruneWaiting = [&] {
+        return one(admin, "SELECT count(*) FROM pg_stat_activity WHERE query LIKE '%gateway_history_prune_v1%' AND "
+            "wait_event_type = 'Lock' AND pid <> pg_backend_pid()");
+    };
+    // (a) the projector's open transaction holds order 2 (a record that makes it newer); the delete waits on it
+    {
+        std::string result;
+        bool done = false;
+        std::thread prune;
+        rig.push(Item::Kind::APPLY, journaled(at(rec(9, 2, money::EventKind::HOLD_CHANGED, money::OrderStatus::CANCELLED),
+            NEW_MS)));
+        const Hold h = rig.commit({}, [&] {
+            prune = std::thread([&] {
+                result = one(url, "SELECT orders_deleted || ',' || fills_deleted || ',' || events_deleted FROM "
+                    "gateway_history_prune_v1(" + std::to_string(CUTOFF_MS) + ", 100)");
+                done = true;
+            });
+            bool waited = false;
+            for (int i = 0; i < 50 && !waited; ++i)
+            {
+                sleepMs(20);
+                waited = "1" == pruneWaiting();
+            }
+            CHECK_MSG(waited && !done, "the delete did not wait for the projector's open transaction on its order");
+        });
+        CHECK_MSG(Hold::HELD == h, rig.lastError);
+        prune.join();
+        CHECK_MSG(result == "3,0,6", "the delete after the projector committed: " + result);
+        CHECK(list(url, "SELECT order_id FROM oe_orders") == "2");
+        CHECK(list(url, "SELECT journal_seq FROM oe_order_events") == "3,4,9");
+        CHECK(one(url, "SELECT status || ':' || updated_at_ms || ':' || last_event_seq FROM oe_orders") ==
+            "CANCELLED:" + std::to_string(NEW_MS) + ":9");
+    }
+    // (b) the projector's open transaction holds another order (a new one); the delete does not wait
+    {
+        CHECK(projectRecords(rig, { journaled(rec(10, 5, money::EventKind::ACCEPTED, money::OrderStatus::NEW)),
+            journaled(rec(11, 5, money::EventKind::CANCELLED, money::OrderStatus::CANCELLED)) }));
+        std::string result;
+        rig.push(Item::Kind::APPLY, journaled(at(rec(12, 6, money::EventKind::ACCEPTED, money::OrderStatus::NEW), NEW_MS)));
+        const Hold h = rig.commit({}, [&] {
+            const auto t0 = std::chrono::steady_clock::now();
+            result = one(url, "SELECT orders_deleted || ',' || fills_deleted || ',' || events_deleted FROM "
+                "gateway_history_prune_v1(" + std::to_string(CUTOFF_MS) + ", 100)");
+            CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(1500));
+        });
+        CHECK_MSG(Hold::HELD == h, rig.lastError);
+        CHECK_MSG(result == "1,0,2", "the delete beside the projector's open transaction: " + result);
+        CHECK(list(url, "SELECT order_id FROM oe_orders") == "2,6");
+    }
+    CHECK(12 == num(url, "SELECT applied_seq FROM oe_projection_state"));
+    rig.release();
+}
+
+// The projector over pruned history: apply, prune, apply more, restart, a source read again from the start.
+TEST(prune_then_project)
+{
+    const std::string url = gwtest::freshDatabase("pj_prune_project");
+    // orders 1..50 old and cancelled (records 1..100), orders 51..55 old and open (101..105); later orders 56..62 new
+    // and cancelled (106..119), order 51 replaced (120), then 121..122
+    std::vector<JournalRecord> all;
+    std::int64_t q = 0;
+    for (std::int64_t o = 1; o <= 50; ++o)
+    {
+        all.push_back(rec(++q, o, money::EventKind::ACCEPTED, money::OrderStatus::NEW));
+        all.push_back(rec(++q, o, money::EventKind::CANCELLED, money::OrderStatus::CANCELLED));
+    }
+    for (std::int64_t o = 51; o <= 55; ++o)
+    {
+        all.push_back(rec(++q, o, money::EventKind::ACCEPTED, money::OrderStatus::NEW));
+    }
+    // a new record of `order` at the next sequence, stamped NEW_MS + its sequence
+    auto newer = [&](std::int64_t order, money::EventKind::Value kind, money::OrderStatus::Value status) {
+        ++q;
+        all.push_back(at(rec(q, order, kind, status), NEW_MS + q));
+    };
+    for (std::int64_t o = 56; o <= 62; ++o)
+    {
+        newer(o, money::EventKind::ACCEPTED, money::OrderStatus::NEW);
+        newer(o, money::EventKind::CANCELLED, money::OrderStatus::CANCELLED);
+    }
+    newer(51, money::EventKind::REPLACED, money::OrderStatus::NEW);
+    newer(63, money::EventKind::ACCEPTED, money::OrderStatus::NEW);
+    newer(63, money::EventKind::CANCELLED, money::OrderStatus::CANCELLED);
+    for (auto &r : all)
+    {
+        r = journaled(r);
+    }
+    CHECK(122 == static_cast<std::int64_t>(all.size()));
+    auto slice = [&](std::int64_t from, std::int64_t to) {
+        return std::vector<JournalRecord>(all.begin() + (from - 1), all.begin() + to);
+    };
+    {
+        Rig rig(url, 32);
+        CHECK(rig.start());
+        rig.epoch(EPOCH);
+        CHECK(projectRecords(rig, slice(1, 105)));
+        // the delete while this copy holds the lease, between two of its batches
+        int calls = 0;
+        while (prune(url, CUTOFF_MS, 7) != "0,0,0" && ++calls < 100)
+        {
+        }
+        CHECK(8 == calls); // 50 orders, 7 per call
+        CHECK(list(url, "SELECT order_id FROM oe_orders") == "51,52,53,54,55");
+        CHECK(one(url, "SELECT up_to_seq FROM oe_projection_pruned") == "100");
+        CHECK(CUTOFF_MS == num(url, "SELECT max_before_ms FROM oe_projection_pruned"));
+        CHECK(105 == num(url, "SELECT applied_seq FROM oe_projection_state"));
+        CHECK(projectRecords(rig, slice(106, 120)));
+        rig.release();
+    }
+    CHECK(120 == num(url, "SELECT applied_seq FROM oe_projection_state"));
+    CHECK(20 == num(url, "SELECT count(*) FROM oe_order_events"));
+    CHECK(one(url, "SELECT status || ':' || last_event_seq FROM oe_orders WHERE order_id = 51") == "NEW:120");
+    // a restart; the source is read again from its start: every record at or below the cursor is compared
+    Rig rig(url, 64);
+    CHECK(rig.start());
+    CHECK(120 == rig.state.appliedSeq);
+    for (const JournalRecord &r : slice(1, 120))
+    {
+        rig.push(Item::Kind::COMPARE, r);
+    }
+    for (const JournalRecord &r : slice(121, 122))
+    {
+        rig.push(Item::Kind::APPLY, r);
+    }
+    std::uint64_t verified = 0;
+    std::uint64_t equal = 0;
+    std::int64_t applied = 0;
+    while (rig.ex.pending())
+    {
+        CHECK_MSG(Hold::HELD == rig.commit(), rig.lastError);
+        const Results r = rig.ex.collect();
+        verified += r.comparesVerified;
+        equal += r.comparesEqual;
+        applied = std::max(applied, r.appliedSeq);
+        for (const Conflict &c : r.conflicts)
+        {
+            CHECK_MSG(false, "conflict at journalSeq " + std::to_string(c.seq) + " (stored " + c.storedSha256 + ")");
+        }
+    }
+    CHECK_MSG(120 == verified && 20 == equal, "verified " + std::to_string(verified) + ", equal " + std::to_string(equal));
+    CHECK(100 == rig.stats.prunedSkips.load() && 20 == rig.stats.skips.load());
+    CHECK(122 == applied);
+    // no deleted order written again; the rows above the deletes are dense
+    CHECK("0" == one(url, "SELECT count(*) FROM oe_orders WHERE order_id <= 50"));
+    CHECK("0" == one(url, "SELECT count(*) FROM oe_order_events WHERE order_id <= 50"));
+    CHECK("" == one(url, "SELECT string_agg(s::text, ',') FROM generate_series(101, 122) s WHERE NOT EXISTS (SELECT 1 "
+        "FROM oe_order_events e WHERE e.journal_seq = s)"));
+    CHECK(122 == num(url, "SELECT applied_seq FROM oe_projection_state"));
+    // a missing row of an order that is kept is still a conflict, at or below up_to_seq or not
+    gwtest::sql(url, "DELETE FROM oe_order_events WHERE journal_seq = 101"); // order 51's first record (its row: 120)
+    CHECK(one(url, "SELECT up_to_seq FROM oe_projection_pruned") == "101");
+    rig.push(Item::Kind::COMPARE, all[100]);
+    CHECK(Hold::HELD == rig.commit());
+    const Results missing = rig.ex.collect();
+    CHECK_MSG(1 == missing.conflicts.size() && 101 == missing.conflicts.front().seq &&
+        "none stored" == missing.conflicts.front().storedSha256, "a missing row of a kept order was not a conflict");
+    CHECK(100 == rig.stats.prunedSkips.load());
+    // a recent order lost whole (every row gone, below up_to_seq): its records are newer than any delete's cutoff,
+    // so they are conflicts, not pruned skips
+    gwtest::sql(url, "DELETE FROM oe_orders WHERE order_id = 56; DELETE FROM oe_order_events WHERE order_id = 56");
+    CHECK(one(url, "SELECT up_to_seq || ':' || max_before_ms FROM oe_projection_pruned") ==
+        "107:" + std::to_string(CUTOFF_MS));
+    rig.push(Item::Kind::COMPARE, all[105]);
+    rig.push(Item::Kind::COMPARE, all[106]);
+    CHECK(Hold::HELD == rig.commit());
+    const Results lost = rig.ex.collect();
+    CHECK_MSG(2 == lost.conflicts.size() && 106 == lost.conflicts.front().seq && 107 == lost.conflicts.back().seq &&
+        "none stored" == lost.conflicts.front().storedSha256, "a lost recent order was taken for a deleted one");
+    CHECK(100 == rig.stats.prunedSkips.load());
+    // the trigger writes its row by upsert: deleted, it comes back with the next delete (cutoff 0: no pruned skip)
+    gwtest::sql(url, "DELETE FROM oe_projection_pruned");
+    gwtest::sql(url, "DELETE FROM oe_order_events WHERE journal_seq = 108"); // order 57's first record
+    CHECK(one(url, "SELECT up_to_seq || ':' || max_before_ms FROM oe_projection_pruned") == "108:0");
+    // the rebuild's truncate resets the row
+    std::string error;
+    CHECK_MSG(Hold::HELD == rig.lease.rebuild(rig.conn, T, 1000, error), error);
+    CHECK(one(url, "SELECT up_to_seq || ':' || max_before_ms || ':' || (updated_at IS NULL) FROM oe_projection_pruned") ==
+        "0:0:true");
+    rig.release();
 }

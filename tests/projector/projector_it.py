@@ -380,10 +380,13 @@ def case_schema(ctx):
     for p in (a, b):
         check(wait_for(lambda: (health(p) or {}).get("projector", {}).get("schema", {}).get("state")
                        in ("applied", "present"), 20), f"schema not ready:\n{text_of(p)}")
-    with open(os.path.join(ctx.args.source_dir, "sql", "history_projection_v1.sql"), "rb") as f:
-        sha = hashlib.sha256(f.read()).hexdigest()
-    rows = ctx.pg.sql("schema1", "SELECT version || ':' || sha256 FROM oe_projection_schema")
-    check(rows == f"1:{sha}", f"oe_projection_schema: {rows}, expected 1:{sha}")
+    want = []
+    for version in (1, 2):
+        with open(os.path.join(ctx.args.source_dir, "sql", f"history_projection_v{version}.sql"), "rb") as f:
+            want.append(f"{version}:{hashlib.sha256(f.read()).hexdigest()}")
+    rows = ctx.pg.sql("schema1", "SELECT string_agg(version || ':' || sha256, ',' ORDER BY version) FROM "
+                                 "oe_projection_schema")
+    check(rows == ",".join(want), f"oe_projection_schema: {rows}, expected {','.join(want)}")
     states = sorted(health(p)["projector"]["schema"]["state"] for p in (a, b))
     print(f"schema states of the two copies started at once: {states}")
     # the read relations against the read contract's reference DDL, column by column
@@ -412,7 +415,7 @@ def case_schema(ctx):
     stop_clean(a, "copy a")
     stop_clean(b, "copy b")
     # another schema recorded: refused, never applied over
-    ctx.pg.sql("schema1", "UPDATE oe_projection_schema SET sha256 = 'not-this-one'")
+    ctx.pg.sql("schema1", "UPDATE oe_projection_schema SET sha256 = 'not-this-one' WHERE version = 1")
     c = ctx.projector(url, "embedded", 3, "schema-c.log")
     code = wait_exit(c, 20)
     check(code == 78 and "holds something else" in text_of(c) and "not-this-one" in text_of(c),

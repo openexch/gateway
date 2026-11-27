@@ -12,11 +12,18 @@
 // ProjectionStore - the projector's PostgreSQL statements, over one PgConn owned by the writer thread (pj-pg) or by the
 // rebuild command. Nothing here decides money: the projection is history only.
 //
-// Schema: sql/history_projection_v1.sql, embedded at configure time with its sha256. migrate() applies it in one
-// transaction under a transaction-scoped advisory lock (N copies may start at once) and records it in
-// oe_projection_schema; a recorded sha256 that differs from the embedded one, a newer recorded version, or a database
-// whose relations collide with the file's (for example the gateway's reference tables) is FOREIGN: the process refuses
-// to run on it (exit 78), it never retries into it.
+// Schema: the steps sql/history_projection_v1.sql (the base) and sql/history_projection_v2.sql (retention: the
+// indexes, oe_projection_pruned and gateway_history_prune_v1, applied on top of version 1), each embedded at configure
+// time with its own sha256. migrate() reads oe_projection_schema (one row per recorded step: version, name, sha256),
+// then applies the steps the database does not record yet, in order, in one transaction under a transaction-scoped
+// advisory lock (N copies may start at once), and records each one: an empty database gets every step (APPLIED), a
+// database that records version 1 gets version 2 in place (UPGRADED: no truncate, no replay), one that records them
+// all is PRESENT. A recorded sha256 that differs from the binary's file of that version, a recorded version the binary
+// does not carry, a record with a version missing below another, or a database whose relations collide with the
+// files' (for example the gateway's reference tables) is FOREIGN: the process refuses to run on it (exit 78), it never
+// retries into it. The steps' statements run under HISTORY_PROJECTOR_PG_SCHEMA_TIMEOUT_MS (SET LOCAL
+// statement_timeout): an upgrade builds indexes over tables that already hold history, and holds their SHARE locks
+// (writes wait, reads do not) until it commits.
 //
 // The single writer (one database, N projector copies on N hosts):
 //   - takeover: UPDATE oe_projection_state SET writer_token = <new random token>, lease_until = clock_timestamp() +
@@ -47,7 +54,8 @@
 //
 // Rebuild (oe-projector --rebuild): with the lease held, one transaction resets the state row under the fence (epoch,
 // cursor, head, beat_at and the halt cleared) and runs a single TRUNCATE naming every base table; from that commit the
-// heartbeat view has no row, so the gateway answers 503 until the new projection beats.
+// heartbeat view has no row, so the gateway answers 503 until the new projection beats. The truncate of oe_order_events
+// also resets oe_projection_pruned.up_to_seq to 0 (its trigger, sql/history_projection_v2.sql).
 
 namespace openexchange { namespace gateway { namespace projector {
 
@@ -67,18 +75,34 @@ bool connectProjection(PgConn &conn, const PgOptions &options, std::string &erro
 
 enum class SchemaVerdict : std::uint8_t
 {
-    APPLIED, // this call created the schema
-    PRESENT, // the same schema was there
+    APPLIED,  // this call created the schema (every step)
+    UPGRADED, // the database recorded some steps; this call applied the rest in place
+    PRESENT,  // every step was recorded with the binary's sha256
     FOREIGN, // the database holds something else: refuse (78)
     FAILED   // the call failed (connection, timeout): retry
 };
 const char *nameOf(SchemaVerdict v) noexcept;
 
-inline constexpr int PROJECTION_SCHEMA_VERSION = 1;
-const char *projectionSchemaSql() noexcept;
-const char *projectionSchemaSha256() noexcept;
+// One step of the schema, as embedded: version 1 is the base, every later one applies on top of the one before.
+struct ProjectionSchemaStep
+{
+    int version;
+    const char *name;   // the name oe_projection_schema records
+    const char *file;   // the source file, for messages
+    const char *sql;
+    const char *sha256; // of the file
+};
 
-SchemaVerdict migrate(PgConn &conn, std::int64_t timeoutMs, std::string &detail);
+inline constexpr int PROJECTION_SCHEMA_VERSION = 2; // the newest step this binary carries
+const std::vector<ProjectionSchemaStep> &projectionSchemaSteps();
+const char *projectionSchemaSha256() noexcept; // the newest step's
+
+// `timeoutMs` bounds the bookkeeping statements, `schemaTimeoutMs` each step's statements.
+SchemaVerdict migrate(PgConn &conn, std::int64_t timeoutMs, std::int64_t schemaTimeoutMs, std::string &detail);
+// The same rule over `steps` (versions 1..n): migrate() passes the binary's steps; a test passes fewer to act as an
+// older binary (one carrying version 1 only refuses a database that records version 2, as that binary did).
+SchemaVerdict migrateSteps(PgConn &conn, std::int64_t timeoutMs, std::int64_t schemaTimeoutMs,
+    const std::vector<ProjectionSchemaStep> &steps, std::string &detail);
 
 // The state row as a takeover or a renewal read it.
 struct ProjectionState

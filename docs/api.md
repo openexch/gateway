@@ -473,7 +473,8 @@ Errors: 4.1, 4.2, 400 `invalid field` for `marketId`.
 - the caller's row in history: 200 `Order` (history shape) with `asOf` (`{ageMs, stale, eventSeq}`, as on the pages of 4.6); an open order from the core has no `asOf`;
 - no row, and the id is above the highest order id the projection has applied: 503 `HISTORY_UNAVAILABLE` with
   `Retry-After` `GATEWAY_HISTORY_LAG_RETRY_AFTER_MS` (1000): the order may exist and not be projected yet;
-- otherwise 404 `NOT_FOUND` `not found`. An unknown order and another user's order give the same answer.
+- otherwise 404 `NOT_FOUND` `not found`. An unknown order, another user's order and an order removed by history
+  retention (4.6) give the same answer.
 
 Errors: 4.1, 4.2, and the history errors of 4.6.
 
@@ -591,6 +592,10 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMDA3IiwiZXhwIjoxNzYzMzgwM
 - `asOf.ageMs`: history is complete as of this long ago (database clock). `asOf.stale`: `ageMs` above `GATEWAY_HISTORY_STALE_MS` (5000). `asOf.eventSeq`: every event up to it is in the answer.
 - Each history read takes one principal token.
 - Each read has one deadline, `GATEWAY_PG_STATEMENT_TIMEOUT_MS` (2000), counted from when it is queued.
+- Retention: history is kept forever unless the operator configures a retention window. With one, history older than
+  the window is removed: an order whose status is terminal (`FILLED`, `CANCELLED`, `REJECTED`, `EXPIRED`) and whose
+  `updatedAt` is older than the window goes whole, with its fills and its trail. An open order is never removed,
+  however old. The pages then hold fewer rows, and a removed order answers 404 like an unknown one (its trail too).
 
 | Status | code | error | Retry-After |
 |---|---|---|---|
@@ -1018,7 +1023,9 @@ Prometheus text, prefix `gateway_` or `stream_`. Among them: `requests_total{rou
 ## 10. Market data trades (`oe-marketdata`)
 
 The public market data WebSocket of `oe-marketdata` sends trades in `TRADES_BATCH` frames: the recent tape on
-subscribe, then each flush of live trades. Every entry of `trades` has the same shape in both:
+subscribe, then each flush of live trades. Every entry of `trades` has the same shape in both. When the operator
+configures a retention window for the tape, trades older than it are removed from the stored tape (the candles are
+kept).
 
 ```json
 {"tradeId":"105","journalSeq":210,"price":"15002","quantity":"0.05","tradeCount":1,"side":"BUY","timestamp":1700000140000}

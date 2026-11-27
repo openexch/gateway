@@ -265,8 +265,10 @@ class Postgres:
         check(ok, "postgres did not become ready")
         out = subprocess.run(["docker", "port", self.name, "5432/tcp"], check=True, capture_output=True, text=True)
         self.port = out.stdout.strip().splitlines()[0].rsplit(":", 1)[1]
-        # the console's part (B5): the writer role and its database
+        # the console's part (B5): the writer role and its database, and the pruner role the retention file grants to
+        # (the writer has no CREATEROLE)
         self.sql("postgres", f"CREATE ROLE oe_marketdata_writer LOGIN PASSWORD '{self.password}'")
+        self.sql("postgres", "CREATE ROLE oe_history_pruner NOLOGIN")
         self.sql("postgres", "CREATE DATABASE r01_marketdata OWNER oe_marketdata_writer")
         self.url = f"postgresql://127.0.0.1:{self.port}/r01_marketdata"
 

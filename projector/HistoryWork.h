@@ -6,6 +6,7 @@
 #include <functional>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -25,7 +26,12 @@
 //   5. after the fence, the beat of the newest probe the batch carries (the beat rule, ProjectionStore.h).
 // A record at or below the cursor is compared with the stored bytes of its sequence (from the database, or from this
 // batch when that sequence was applied by it): equal is a counted skip, different a payload conflict (the line carries
-// the sequence, the source and both SHA-256 values; nothing of it is written).
+// the sequence, the source and both SHA-256 values; nothing of it is written). A record whose sequence has no stored
+// row is a pruned skip when the retention delete removed its order (sql/history_projection_v2.sql): its sequence is at
+// or below oe_projection_pruned.up_to_seq, its own time (updatedAtMs) is below oe_projection_pruned.max_before_ms (the
+// greatest cutoff a delete ran with: every record of a deleted order is at or below that order's updated_at_ms, the
+// core's log time never decreasing along the journal) and the order it names has no row. It counts as verified, not as equal, and
+// nothing of it is written; any other missing row is a payload conflict ("none stored").
 // A batch ends at HISTORY_PROJECTOR_BATCH_EVENTS records or HISTORY_PROJECTOR_BATCH_MS, whichever comes first; the
 // bookkeeping items (a replay started or ended, the epoch, a halt) end it at once.
 // An uncertain commit (the COMMIT's answer lost) is resolved by reading the cursor again (onWriter): equal to the cursor
@@ -35,7 +41,9 @@
 // Test-only controls (never in a published build): PROJ_NC_CURSOR_OWN_TX commits the cursor before the rows, in a
 // transaction of its own (a crash between the two then leaves the cursor ahead of the rows); PROJ_NC_DROP_ONE
 // acknowledges one record (journalSeq PROJ_NC_DROP_SEQ from the environment, default 2) without writing any of its
-// rows, the cursor moving past it (a hole in oe_order_events).
+// rows, the cursor moving past it (a hole in oe_order_events); PROJ_NC_NO_PRUNED_SKIP compares a deleted order's record
+// like any other (a conflict: no stored bytes); PROJ_NC_PRUNED_ANY_MISSING takes every missing row for a deleted
+// order's; PROJ_NC_PRUNED_NO_TIME_BOUND leaves the record's own time out of the pruned-skip rule.
 
 namespace openexchange { namespace gateway { namespace projector {
 
@@ -47,6 +55,16 @@ bool insertReplay(PgConn &conn, std::int64_t timeoutMs, const ReplayRow &row, st
 bool deleteReplay(PgConn &conn, std::int64_t timeoutMs, const ReplayRow &row, std::string &error);
 bool storedPayloads(PgConn &conn, std::int64_t timeoutMs, const std::vector<std::int64_t> &seqs,
     std::map<std::int64_t, std::string> &out, std::string &error);
+// A compared record with no stored row: its sequence, the order it names and its own time (updatedAtMs).
+struct UnstoredCompare
+{
+    std::int64_t seq = 0;
+    std::int64_t orderId = 0;
+    std::int64_t atMs = 0;
+};
+// Of the records with no stored row: the sequences the retention delete removed (see above).
+bool prunedSequences(PgConn &conn, std::int64_t timeoutMs, const std::vector<UnstoredCompare> &seqs,
+    std::set<std::int64_t> &out, std::string &error);
 bool applyRecord(PgConn &conn, std::int64_t timeoutMs, const JournalRecord &record, std::string &error);
 bool upsertMemo(PgConn &conn, std::int64_t timeoutMs, const MemoRow &row, std::string &error);
 bool writeHalt(PgConn &conn, std::int64_t timeoutMs, const HaltState &halt, std::string &error);
@@ -57,6 +75,7 @@ struct WriterStats
 {
     std::atomic<std::uint64_t> recordsApplied{ 0 };
     std::atomic<std::uint64_t> skips{ 0 };            // compared and equal
+    std::atomic<std::uint64_t> prunedSkips{ 0 };      // at or below the cursor, of an order the retention delete removed
     std::atomic<std::uint64_t> payloadConflicts{ 0 };
     std::atomic<std::uint64_t> replayRows{ 0 };       // replay rows recorded
     std::atomic<std::uint64_t> replayRowsForgotten{ 0 };
@@ -94,6 +113,7 @@ private:
         std::vector<CommittedProof> proofs;
         std::uint64_t compared = 0;
         std::uint64_t equal = 0;
+        std::uint64_t pruned = 0;
         std::vector<Conflict> conflicts;
         std::vector<std::int64_t> replaysRecorded;
         std::vector<std::size_t> appliedFrom;

@@ -1,4 +1,5 @@
 #include "MarketDataSettings.h"
+#include "MarketHistory.h"
 
 #include <algorithm>
 #include <charconv>
@@ -467,6 +468,11 @@ ParseResult<MarketDataSettings> parseMarketDataSettings(const Environment &env, 
     s.commitBatch = positive(r, "MD_COMMIT_BATCH", s.commitBatch);
     s.commitIntervalMs = positive(r, "MD_COMMIT_INTERVAL_MS", s.commitIntervalMs);
     s.recentTrades = positive(r, "MD_RECENT_TRADES", s.recentTrades);
+    if (s.recentTrades > MARKET_TAPE_KEEP_PER_MARKET)
+    {
+        r.problem(std::string(INVALID) + "MD_RECENT_TRADES: at most " + std::to_string(MARKET_TAPE_KEEP_PER_MARKET) +
+            " (the trades of each market the tape's retention delete keeps), got " + std::to_string(s.recentTrades));
+    }
     s.candleHistory = positive(r, "MD_CANDLE_HISTORY", s.candleHistory);
     s.candlesLimitMax = positive(r, "MD_CANDLES_LIMIT_MAX", s.candlesLimitMax);
     s.wsMaxConnections = positive(r, "MD_WS_MAX_CONNECTIONS", s.wsMaxConnections);

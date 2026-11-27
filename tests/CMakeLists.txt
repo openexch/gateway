@@ -477,6 +477,9 @@ set(GW_PROJECTOR_PG_CONTROLS
     "PROJ_NC_BEAT_NO_EPOCH|ProjectionStore.cpp|beat_rule|beat across genesis ids"
     "PROJ_NC_REBUILD_KEEPS_BEAT|ProjectionStore.cpp|rebuild_reads|rebuilding history served as complete"
     "PROJ_NC_DROP_ONE|HistoryWork.cpp|projection_dense|journalSeq missing in projection: 2 [(]applied_seq [0-9]+[)]"
+    "PROJ_NC_NO_PRUNED_SKIP|HistoryWork.cpp|prune_then_project|conflict at journalSeq 1 [(]stored none stored[)]"
+    "PROJ_NC_PRUNED_ANY_MISSING|HistoryWork.cpp|prune_then_project|a missing row of a kept order was not a conflict"
+    "PROJ_NC_PRUNED_NO_TIME_BOUND|HistoryWork.cpp|prune_then_project|a lost recent order was taken for a deleted one"
     "PROJ_NC_WALLCLOCK_COLUMN|ProjectionStore.cpp|projection_byte_equal|projection dump differs: oe_orders .*without the column projected_at the dumps are equal"
     "GW_NC_VIEW_REMAINING_FROM_QUANTITY||read_contract_compat|projected history differs from the read contract"
     "GW_NC_VIEW_COLUMN_RENAMED||read_contract_compat|the gateway's absent"
@@ -503,7 +506,7 @@ endforeach()
 if(GW_PG_TESTS)
     foreach(case apply_story fk_order_first_records crash_points overlap_compare dense_apply one_mapping_from_postgres
             read_contract_compat reference_equivalence beat_rule rebuild_reads reader_role_prepared projection_dense
-            projection_byte_equal)
+            projection_byte_equal prune_story schema_upgrade prune_then_project prune_concurrent_writer)
         add_test(NAME pg.projector.${case} COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/pg/pg_it.py"
             --binary "$<TARGET_FILE:gw_projector_pg_tests>" --image "${GW_PG_TEST_IMAGE}" ${case})
         set_tests_properties(pg.projector.${case} PROPERTIES TIMEOUT 300 LABELS "pg;projector" RUN_SERIAL TRUE)
@@ -647,7 +650,7 @@ foreach(entry IN LISTS GW_MD_PG_CONTROLS)
 endforeach()
 if(GW_PG_TESTS)
     foreach(case md_history_start md_history_exactly_once md_history_another_writer md_candles_batch_splits
-            md_writer_outage md_live_start_and_candles_route)
+            md_writer_outage md_live_start_and_candles_route md_trades_prune)
         add_test(NAME pg.marketdata.${case} COMMAND Python3::Interpreter -I "${CMAKE_CURRENT_SOURCE_DIR}/pg/pg_it.py"
             --binary "$<TARGET_FILE:gw_md_pg_tests>" --image "${GW_PG_TEST_IMAGE}" ${case})
         set_tests_properties(pg.marketdata.${case} PROPERTIES TIMEOUT 300 LABELS "pg;marketdata" RUN_SERIAL TRUE)

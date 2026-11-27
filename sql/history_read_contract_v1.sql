@@ -21,9 +21,10 @@
 --
 -- Orders: the projection writes every order from its creation on (an open order too, updated in place as it changes),
 -- not only terminal ones, so that GET /api/v2/orders/{orderId} can tell "no such order" from "not projected yet" (see
--- applied_order_id below). An order updated while a client walks the pages takes a newer updated_at_ms: if the walk
--- has not reached it yet, it moves above the cursor and that walk never serves it (a walk that starts over from the top
--- does). Rows whose key does not change are served exactly once.
+-- applied_order_id below). A projection may remove an old terminal order whole (its row, its fills, its trail: history
+-- retention); a removed order then reads like an unknown one. An order updated while a client walks the pages takes a
+-- newer updated_at_ms: if the walk has not reached it yet, it moves above the cursor and that walk never serves it (a
+-- walk that starts over from the top does). Rows whose key does not change are served exactly once.
 --
 -- Trail: one row per journal record of an order (every record, from the first; event_seq is the core's eventSeq),
 -- ordered by event_seq and by nothing else: core_log_position is not unique (the FILL records of one trade batch share

@@ -246,6 +246,7 @@ ParseResult<ProjectorSettings> parseProjectorSettings(const Environment &env, co
     s.pgKeepaliveIntervalS = r.positive(X + "PG_KEEPALIVE_INTERVAL_S", s.pgKeepaliveIntervalS);
     s.pgKeepaliveCount = r.positive(X + "PG_KEEPALIVE_COUNT", s.pgKeepaliveCount);
     s.rebuildLockTimeoutMs = r.positive(X + "REBUILD_LOCK_TIMEOUT_MS", s.rebuildLockTimeoutMs);
+    s.pgSchemaTimeoutMs = r.positive(X + "PG_SCHEMA_TIMEOUT_MS", s.pgSchemaTimeoutMs);
 
     // the writer
     s.leaseMs = r.positive(X + "LEASE_MS", s.leaseMs);
@@ -293,6 +294,12 @@ ParseResult<ProjectorSettings> parseProjectorSettings(const Environment &env, co
     }
     above(r, X + "PG_STATEMENT_TIMEOUT_MS", s.pgStatementTimeoutMs, X + "REBUILD_LOCK_TIMEOUT_MS",
         s.rebuildLockTimeoutMs, "the statement timeout would end the rebuild's lock wait first");
+    if (s.pgSchemaTimeoutMs < s.pgStatementTimeoutMs)
+    {
+        r.problem(X + "PG_SCHEMA_TIMEOUT_MS (" + std::to_string(s.pgSchemaTimeoutMs) + ") must be at least " + X +
+            "PG_STATEMENT_TIMEOUT_MS (" + std::to_string(s.pgStatementTimeoutMs) + "): the schema steps would get less "
+            "time than any other statement");
+    }
     if (s.sourceBackoffMaxMs < s.sourceBackoffMs)
     {
         r.problem(X + "SOURCE_BACKOFF_MAX_MS (" + std::to_string(s.sourceBackoffMaxMs) + ") must be at least " + X +

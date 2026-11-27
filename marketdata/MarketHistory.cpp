@@ -291,6 +291,15 @@ StartVerdict startHistory(PgConn &conn, std::int64_t timeoutMs, MdState &state, 
             return StartVerdict::FOREIGN;
         }
     }
+    // the trade tape's retention function, applied on every start (CREATE OR REPLACE): a database an older build wrote
+    // gets it in place
+    if (Exec::OK != conn.exec(MARKET_RETENTION_SQL, {}, timeoutMs, r, error, true))
+    {
+        const bool foreign = 0 == conn.lastSqlState().rfind("42", 0);
+        detail = "sql/market_history_retention_v1.sql: " + error;
+        rollback(conn, timeoutMs);
+        return foreign ? StartVerdict::FOREIGN : StartVerdict::FAILED;
+    }
     // 4. md_state
     if (!readHistoryState(conn, timeoutMs, state, error))
     {
@@ -301,7 +310,7 @@ StartVerdict startHistory(PgConn &conn, std::int64_t timeoutMs, MdState &state, 
         return failed("COMMIT");
     }
     detail = std::string(applied ? "schema version 1 applied" : "schema version 1 present") + " (sha256 " +
-        MARKET_HISTORY_SCHEMA_SHA256 + ")";
+        MARKET_HISTORY_SCHEMA_SHA256 + "), retention function version 1 (sha256 " + MARKET_RETENTION_SHA256 + ")";
     return StartVerdict::READY;
 }
 

@@ -1,7 +1,7 @@
 #include "ProjectionStore.h"
 
 #include <algorithm>
-
+#include <iterator>
 #include <vector>
 
 #include "cluster_tools/runtime/Supervisor.h"
@@ -15,11 +15,13 @@ using pg::Result;
 
 namespace {
 
+const ProjectionSchemaStep PROJECTION_SCHEMA_STEPS[] = {
 #ifdef PROJ_NC_WALLCLOCK_COLUMN
-#include "gateway/projection_schema_nc_wallclock_column.inc" // test build only: the schema plus a wall-clock column
+#include "gateway/projection_schema_nc_wallclock_column.inc" // test build only: version 1 plus a wall-clock column
 #else
 #include "gateway/projection_schema.inc"
 #endif
+};
 
 // pg_advisory_xact_lock key of the schema step: the eight bytes "oeprojsc" as a big-endian int64.
 constexpr const char *SCHEMA_LOCK_KEY = "8026945547655607139";
@@ -76,6 +78,7 @@ const char *nameOf(SchemaVerdict v) noexcept
     switch (v)
     {
         case SchemaVerdict::APPLIED: return "applied";
+        case SchemaVerdict::UPGRADED: return "upgraded";
         case SchemaVerdict::PRESENT: return "present";
         case SchemaVerdict::FOREIGN: return "foreign";
         case SchemaVerdict::FAILED: break;
@@ -94,14 +97,16 @@ const char *nameOf(Hold h) noexcept
     return "failed";
 }
 
-const char *projectionSchemaSql() noexcept
+const std::vector<ProjectionSchemaStep> &projectionSchemaSteps()
 {
-    return PROJECTION_SCHEMA_SQL;
+    static const std::vector<ProjectionSchemaStep> steps(std::begin(PROJECTION_SCHEMA_STEPS),
+        std::end(PROJECTION_SCHEMA_STEPS));
+    return steps;
 }
 
 const char *projectionSchemaSha256() noexcept
 {
-    return PROJECTION_SCHEMA_SHA256;
+    return std::end(PROJECTION_SCHEMA_STEPS)[-1].sha256;
 }
 
 std::string newWriterToken()
@@ -120,15 +125,28 @@ bool connectProjection(PgConn &conn, const PgOptions &o, std::string &error)
             { "keepalives_count", std::to_string(o.keepaliveCount) } });
 }
 
-SchemaVerdict migrate(PgConn &conn, std::int64_t timeoutMs, std::string &detail)
+SchemaVerdict migrate(PgConn &conn, std::int64_t timeoutMs, std::int64_t schemaTimeoutMs, std::string &detail)
 {
+    static_assert(std::size(PROJECTION_SCHEMA_STEPS) == PROJECTION_SCHEMA_VERSION, "one step per version");
+    return migrateSteps(conn, timeoutMs, schemaTimeoutMs, projectionSchemaSteps(), detail);
+}
+
+SchemaVerdict migrateSteps(PgConn &conn, std::int64_t timeoutMs, std::int64_t schemaTimeoutMs,
+    const std::vector<ProjectionSchemaStep> &steps, std::string &detail)
+{
+    const int carried = static_cast<int>(steps.size());
     Result r;
     std::string error;
-    auto failed = [&](const char *step) {
+    auto failed = [&](const std::string &step) {
         const bool foreign = foreignState(conn.lastSqlState());
-        detail = std::string(step) + ": " + error;
+        detail = step + ": " + error;
         rollback(conn, timeoutMs);
         return foreign ? SchemaVerdict::FOREIGN : SchemaVerdict::FAILED;
+    };
+    auto refuse = [&](const std::string &why) {
+        detail = why;
+        rollback(conn, timeoutMs);
+        return SchemaVerdict::FOREIGN;
     };
     if (Exec::OK != conn.exec("BEGIN", {}, timeoutMs, r, error, false))
     {
@@ -149,46 +167,65 @@ SchemaVerdict migrate(PgConn &conn, std::int64_t timeoutMs, std::string &detail)
     {
         return failed("oe_projection_schema");
     }
-    bool present = false;
-    for (int i = 0; i < PQntuples(r.get()); ++i)
+    // the record must be the binary's steps 1..n with their sha256, nothing else
+    const int recorded = PQntuples(r.get());
+    for (int i = 0; i < recorded; ++i)
     {
         const int version = std::stoi(PQgetvalue(r.get(), i, 0));
         const std::string sha = PQgetvalue(r.get(), i, 1);
-        if (PROJECTION_SCHEMA_VERSION != version)
+        if (version > carried)
         {
-            detail = "the database records history projection schema version " + std::to_string(version) +
-                "; this binary carries version " + std::to_string(PROJECTION_SCHEMA_VERSION) + " only";
-            rollback(conn, timeoutMs);
-            return SchemaVerdict::FOREIGN;
+            return refuse("the database records history projection schema version " + std::to_string(version) +
+                "; this binary carries versions 1 to " + std::to_string(carried) + " only");
         }
-        if (sha != PROJECTION_SCHEMA_SHA256)
+        if (version != i + 1)
         {
-            detail = "the database records history projection schema version " + std::to_string(version) +
-                " with sha256 " + sha + "; this binary's sql/history_projection_v1.sql has " + PROJECTION_SCHEMA_SHA256;
-            rollback(conn, timeoutMs);
-            return SchemaVerdict::FOREIGN;
+            return refuse("the database records history projection schema version " + std::to_string(version) +
+                " without version " + std::to_string(i + 1) + ": not a record this binary wrote");
         }
-        present = true;
+        const ProjectionSchemaStep &step = steps[static_cast<std::size_t>(i)];
+        if (sha != step.sha256)
+        {
+            return refuse("the database records history projection schema version " + std::to_string(version) +
+                " with sha256 " + sha + "; this binary's " + step.file + " has " + step.sha256);
+        }
     }
-    if (!present)
+    if (recorded < carried &&
+        Exec::OK != conn.exec("SET LOCAL statement_timeout = " + std::to_string(schemaTimeoutMs), {}, timeoutMs, r,
+            error, false))
     {
-        if (Exec::OK != conn.exec(PROJECTION_SCHEMA_SQL, {}, timeoutMs, r, error, true))
+        return failed("SET LOCAL statement_timeout");
+    }
+    for (int i = recorded; i < carried; ++i)
+    {
+        const ProjectionSchemaStep &step = steps[static_cast<std::size_t>(i)];
+        if (Exec::OK != conn.exec(step.sql, {}, schemaTimeoutMs, r, error, true))
         {
-            return failed("sql/history_projection_v1.sql");
+            return failed(step.file);
         }
-        if (Exec::OK != conn.exec("INSERT INTO oe_projection_schema (version, name, sha256) VALUES ($1, "
-                "'history_projection', $2)", { std::to_string(PROJECTION_SCHEMA_VERSION), PROJECTION_SCHEMA_SHA256 },
-                timeoutMs, r, error, false))
+        if (Exec::OK != conn.exec("INSERT INTO oe_projection_schema (version, name, sha256) VALUES ($1, $2, $3)",
+                { std::to_string(step.version), step.name, step.sha256 }, timeoutMs, r, error, false))
         {
             return failed("oe_projection_schema");
         }
     }
-    if (Exec::OK != conn.exec("COMMIT", {}, timeoutMs, r, error, false))
+    if (Exec::OK != conn.exec("COMMIT", {}, schemaTimeoutMs, r, error, false))
     {
         return failed("COMMIT");
     }
-    detail = present ? "schema version 1 present" : "schema version 1 applied";
-    return present ? SchemaVerdict::PRESENT : SchemaVerdict::APPLIED;
+    const std::string newest = "schema version " + std::to_string(carried);
+    if (recorded == carried)
+    {
+        detail = newest + " present";
+        return SchemaVerdict::PRESENT;
+    }
+    if (0 == recorded)
+    {
+        detail = newest + " applied (versions 1 to " + std::to_string(carried) + ")";
+        return SchemaVerdict::APPLIED;
+    }
+    detail = newest + " applied in place on version " + std::to_string(recorded);
+    return SchemaVerdict::UPGRADED;
 }
 
 WriterLease::Take WriterLease::takeover(PgConn &conn, std::int64_t timeoutMs, ProjectionState &state,
