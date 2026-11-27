@@ -55,6 +55,9 @@
 //   _PG_KEEPALIVE_COUNT 3 (TCP keepalive of the projector's connection)
 //   _REBUILD_LOCK_TIMEOUT_MS 1000   --rebuild: the longest wait for the base tables behind open history reads; past it
 //                          the rebuild changes nothing and exits 75
+//   _PG_SCHEMA_TIMEOUT_MS 600000   the statement timeout of the schema steps at start (an upgrade in place builds
+//                          indexes over the history already stored; the copy is not the writer meanwhile); at least
+//                          _PG_STATEMENT_TIMEOUT_MS
 // The writer:
 //   _LEASE_MS 10000, _LEASE_POLL_MS 1000   the writer lease and the standby's poll
 //   _BATCH_EVENTS 256, _BATCH_MS 50, _QUEUE_EVENTS 4096
@@ -106,6 +109,7 @@ struct ProjectorSettings
     std::int64_t pgKeepaliveIntervalS = 2;
     std::int64_t pgKeepaliveCount = 3;
     std::int64_t rebuildLockTimeoutMs = 1000;
+    std::int64_t pgSchemaTimeoutMs = 600'000;
     std::int64_t leaseMs = 10'000;
     std::int64_t leasePollMs = 1000;
     std::int64_t batchEvents = 256;

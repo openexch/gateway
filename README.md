@@ -166,6 +166,20 @@ and names the role. They are read when `GATEWAY_PG_URL` is set, on `GATEWAY_PG_H
 their own with their own queue (sized by `GATEWAY_PG_QUEUE`), so a history storm never takes a connection from login.
 No order-path request touches PostgreSQL.
 
+History retention. Nothing in this repo deletes history on its own: kept forever by default. When the operator runs
+an age-based retention job, history older than the retention window is removed: `gateway_history_prune_v1(before_ms,
+max_orders)` (`sql/history_projection_v2.sql`) deletes old terminal orders (`FILLED`, `CANCELLED`, `REJECTED`,
+`EXPIRED`, `updatedAt` before the cutoff) whole, with their fills and their trail, and never touches an open order;
+`market_trades_prune_v1(before_ms, max_rows)` (`sql/market_history_retention_v1.sql`) deletes the oldest trades of
+`oe-marketdata`'s tape, market by market, and always keeps the newest 1000 trades of every market however old (the
+cold start reads the newest `MD_RECENT_TRADES`, which may not exceed 1000). A removed order reads like an unknown one:
+`GET /orders/{orderId}` and its trail answer 404, the pages just hold fewer rows. Both functions run as their owner
+(SECURITY DEFINER, fixed search_path) and the role `oe_history_pruner` holds EXECUTE on them and no right on any table,
+so what they do is all a member can do: make the job's login a member (`GRANT oe_history_pruner TO <role>`). The
+schemas create that role when the writer's role has CREATEROLE; otherwise create it first (`CREATE ROLE
+oe_history_pruner NOLOGIN`), or `oe-projector` and `oe-marketdata` refuse to start and name the role. PostgreSQL 14 or
+later (tested with 16.9).
+
 Balance movements. `GET /balances/movements` reads the core money database, never the history projection: the one
 view `gateway_balance_movements_v1` (reference copy `sql/money_read_contract_v1.sql`), which the core projector's
 migration V002 creates with the role `oe_money_reader` (SELECT on that view only). Make the gateway's login role for
@@ -271,7 +285,9 @@ size (default 2000). Each T1 case takes its own block of GW_IT_PORT_SPAN (300) p
 
 ## History projector (`oe-projector`)
 
-`oe-projector` is the history projector, the only binary in this repo that writes a database. It follows the core's order journal from the member archives over the network and writes the relations in `sql/history_projection_v1.sql`. It applies that file at boot under a transaction-scoped advisory lock and records its sha256; a different recorded schema is refused (exit 78). The read relations are views with the exact names and types of `sql/history_read_contract_v1.sql`, so the history reads above keep working.
+`oe-projector` is the history projector, the only binary in this repo that writes a database. It follows the core's order journal from the member archives over the network and writes the relations in `sql/history_projection_v1.sql`; `sql/history_projection_v2.sql` adds, on top of it, what the retention delete needs (its indexes, the function, the pruner role). At boot it applies the versions the database does not record yet, in one transaction under a transaction-scoped advisory lock, and records each one with the sha256 of its file: an empty database gets both, a database that records version 1 gets version 2 in place (no truncate, no replay of the journal). A recorded sha256 that differs from the binary's file, or a version it does not carry, is refused (exit 78). The steps run under `HISTORY_PROJECTOR_PG_SCHEMA_TIMEOUT_MS` (600000): an upgrade builds four indexes over the stored history and creates a trigger on `oe_order_events`, and until it commits the writes to `oe_order_events`, `oe_orders` and `oe_fills` wait (reads do not); the copy is not the writer meanwhile and `/ready` is false. A console set update waits its readiness bound (300 s by default) for each process: an index build that takes longer stops that roll at `oe-projector` with the later processes still on the previous build, while the build goes on; once the projector is ready, run the update again. A build that passes the schema timeout rolls back and the projector tries again after `HISTORY_PROJECTOR_PG_RETRY_MS`, from the start each time: raise the timeout for a database that needs longer. **Rollback.** A binary of the previous set (version 1 only) refuses a database that records version 2 (exit 78). The two ways back: delete the version-2 row (`DELETE FROM oe_projection_schema WHERE version = 2`; the version 2 objects stay, unused, and stop the retention job first: that binary has no pruned-skip rule, so a deleted order's records read again from a journal are conflicts), and a later start of this binary applies version 2 again in place; or recreate the projection and rebuild it, which needs the journal from its first record. Every statement of version 2 can run again over its own result. `/health` shows `schema.state` (`applied`, `upgraded`, `present`). The read relations are views with the exact names and types of `sql/history_read_contract_v1.sql`, so the history reads above keep working.
+
+**Retention.** The retention delete never moves the cursor, and the projector writes only the record after it, so a removed order is never written again. A record at or below the cursor that a source delivers again (a read from the start of a journal) is compared with the stored bytes; one of a removed order has none, and counts as a pruned skip (`prunedSkips`, `projector_pruned_skips_total`) instead of a conflict. Any other missing row is still a conflict.
 
 **Single writer.** N copies run on N hosts. One holds a lease in `oe_projection_state` (`writer_token`, `lease_until`, on the database clock). Every write transaction ends with `UPDATE ... WHERE writer_token = <mine>`; zero rows rolls back and the copy becomes a standby. A standby polls every `HISTORY_PROJECTOR_LEASE_POLL_MS` and holds no replay and no session. A clean stop drops the replays first, then releases the lease.
 

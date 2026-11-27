@@ -493,6 +493,7 @@ TEST(md_settings_invalid_forms)
         { { "MD_PG_PASSWORD_FILE", "relative/path" }, "invalid setting: MD_PG_PASSWORD_FILE" },
         { { "MD_WS_QUEUE_BYTES", "0" }, "invalid setting: MD_WS_QUEUE_BYTES" },
         { { "MD_BOOK_STALE_MS", "15s" }, "invalid setting: MD_BOOK_STALE_MS" },
+        { { "MD_RECENT_TRADES", "1001" }, "invalid setting: MD_RECENT_TRADES: at most 1000" },
         { { "MD_TYPO_SETTING", "1" }, "invalid setting: MD_TYPO_SETTING" },
         { { "MD_JOURNAL_MTU", "100" }, "invalid setting: MD_JOURNAL_MTU" },
         { { "AERON_DIR", "/dev/shm/aeron-host" }, "invalid setting: AERON_DIR" },

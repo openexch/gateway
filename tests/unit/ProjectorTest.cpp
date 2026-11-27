@@ -116,7 +116,8 @@ TEST(projector_settings_accepted_with_defaults)
     for (const char *name : { "HISTORY_PROJECTOR_LEASE_MS", "HISTORY_PROJECTOR_BATCH_EVENTS", "HISTORY_PROJECTOR_QUEUE_EVENTS",
              "HISTORY_PROJECTOR_PG_IDLE_IN_TX_TIMEOUT_MS", "HISTORY_PROJECTOR_SOURCE_BACKOFF_MAX_MS",
              "HISTORY_PROJECTOR_DUTY_WATCHDOG_MS", "HISTORY_PROJECTOR_DRIVER_TIMEOUT_MS",
-             "HISTORY_PROJECTOR_REBUILD_LOCK_TIMEOUT_MS", "HISTORY_PROJECTOR_NODE_FRESH_MS",
+             "HISTORY_PROJECTOR_REBUILD_LOCK_TIMEOUT_MS", "HISTORY_PROJECTOR_PG_SCHEMA_TIMEOUT_MS",
+             "HISTORY_PROJECTOR_NODE_FRESH_MS",
              "HISTORY_PROJECTOR_NODE_FIRST_ROUND_MS", "HISTORY_PROJECTOR_SESSION_MAX_INFLIGHT",
              "HISTORY_PROJECTOR_QUERY_RATE_COUNT", "HISTORY_PROJECTOR_BEAT_CANDIDATES" })
     {
@@ -240,6 +241,17 @@ TEST(projector_settings_timeouts_against_the_lease)
     rebuild["HISTORY_PROJECTOR_REBUILD_LOCK_TIMEOUT_MS"] = "3000";
     CHECK(has(parseProjectorSettings(MapEnvironment(rebuild), probe()).errors,
         "HISTORY_PROJECTOR_PG_STATEMENT_TIMEOUT_MS (3000) must be above HISTORY_PROJECTOR_REBUILD_LOCK_TIMEOUT_MS (3000)"));
+
+    // the schema steps (an upgrade builds indexes): their own bound, never below the statement timeout
+    CHECK(600'000 == parseProjectorSettings(MapEnvironment(projectorEnv()), probe()).settings.pgSchemaTimeoutMs);
+    auto schema = projectorEnv();
+    schema["HISTORY_PROJECTOR_PG_SCHEMA_TIMEOUT_MS"] = "2999";
+    const auto shortSchema = parseProjectorSettings(MapEnvironment(schema), probe());
+    CHECK(has(shortSchema.errors, "HISTORY_PROJECTOR_PG_SCHEMA_TIMEOUT_MS (2999) must be at least "
+        "HISTORY_PROJECTOR_PG_STATEMENT_TIMEOUT_MS (3000)"));
+    CHECK(1 == shortSchema.errors.size());
+    schema["HISTORY_PROJECTOR_PG_SCHEMA_TIMEOUT_MS"] = "3000";
+    CHECK(parseProjectorSettings(MapEnvironment(schema), probe()).ok());
 }
 
 TEST(projector_settings_watchdog_above_the_archive_timeout)

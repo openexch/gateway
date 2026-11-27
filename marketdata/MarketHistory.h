@@ -24,7 +24,10 @@
 //   3. the schema: none of md_state, md_trades, md_candles exists: the file is applied in one transaction under a
 //      transaction-scoped advisory lock; all three exist with the file's columns: present; anything else (some of them,
 //      other columns, another schema_version in md_state) is foreign: exit 78. md_state without its row (a reset
-//      truncated it) gets the row again: an empty history;
+//      truncated it) gets the row again: an empty history; then, in the same transaction and on every start,
+//      sql/market_history_retention_v1.sql (CREATE OR REPLACE of market_trades_prune_v1 and the grants of the role
+//      oe_history_pruner): a database an older build wrote gets the function in place, nothing else changes. Its
+//      failure is FOREIGN for a refusal of the database (the role absent and not creatable: exit 78), FAILED otherwise;
 //   4. md_state is read.
 // One transaction per batch (commitBatch): the trades, the candles they touch (an upsert by the merge rule of
 // Candles.h) and the cursor move from the expected old value to the new one, with the epoch and the first record of an
@@ -42,6 +45,9 @@ inline constexpr const char *LEGACY_DATABASE_TEXT = "this is the legacy market d
 inline constexpr const char *WRITER_LOCK_HELD_TEXT = "market history writer lock is held";
 inline constexpr const char *ANOTHER_WRITER_TEXT = "market history has another writer";
 inline constexpr int MARKET_HISTORY_SCHEMA_VERSION = 1;
+// The newest trades of every market the tape's retention delete never removes, however old
+// (sql/market_history_retention_v1.sql, keep_per_market): MD_RECENT_TRADES (the cold start's read) may not exceed it.
+inline constexpr std::int64_t MARKET_TAPE_KEEP_PER_MARKET = 1000;
 const char *marketHistorySchemaSql() noexcept;
 const char *marketHistorySchemaSha256() noexcept;
 

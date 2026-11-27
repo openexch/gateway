@@ -94,29 +94,43 @@ endforeach()
 file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/gateway/migrations.inc" CONTENT "${_gw_migrations}" @ONLY)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${GW_MIGRATION_FILES})
 
-# The history projection schema (sql/history_projection_v1.sql), embedded with its sha256: oe-projector applies it and
-# the database records the same sha256 (a difference refuses the start).
-set(GW_PROJECTION_SCHEMA_FILE "${CMAKE_CURRENT_SOURCE_DIR}/sql/history_projection_v1.sql")
-file(READ "${GW_PROJECTION_SCHEMA_FILE}" _projection_sql)
-file(SHA256 "${GW_PROJECTION_SCHEMA_FILE}" _projection_sha)
-if(_projection_sql MATCHES "\\)gwsql\"")
-    message(FATAL_ERROR "${GW_PROJECTION_SCHEMA_FILE} contains the embedding delimiter )gwsql\"")
-endif()
-file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/gateway/projection_schema.inc"
-    CONTENT "constexpr const char *PROJECTION_SCHEMA_SQL = R\"gwsql(${_projection_sql})gwsql\";\nconstexpr const char *PROJECTION_SCHEMA_SHA256 = \"${_projection_sha}\";\n"
-    @ONLY)
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${GW_PROJECTION_SCHEMA_FILE}")
-# The schema of the PROJ_NC_WALLCLOCK_COLUMN test build (never published): the same file plus a wall-clock column on
-# oe_orders, pinned by the sha256 of the text it applies, so its database records that sha256 and a published binary
-# refuses to open it.
-set(_projection_sql_nc_wallclock "${_projection_sql}
+# The history projection schema: its steps (sql/history_projection_v<n>.sql, version 1 the base, every later one applied
+# on top of the one before), each embedded with its own sha256. oe-projector applies the steps a database does not
+# record yet and records each one with its sha256; a recorded sha256 that differs from the binary's file refuses the
+# start.
+set(GW_PROJECTION_SCHEMA_STEPS "1|history_projection|sql/history_projection_v1.sql"
+    "2|history_retention|sql/history_projection_v2.sql")
+set(_projection_steps "")
+set(_projection_steps_nc_wallclock "")
+foreach(_step IN LISTS GW_PROJECTION_SCHEMA_STEPS)
+    string(REPLACE "|" ";" _parts "${_step}")
+    list(GET _parts 0 _version)
+    list(GET _parts 1 _name)
+    list(GET _parts 2 _path)
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/${_path}" _sql)
+    file(SHA256 "${CMAKE_CURRENT_SOURCE_DIR}/${_path}" _sha)
+    if(_sql MATCHES "\\)gwsql\"")
+        message(FATAL_ERROR "${_path} contains the embedding delimiter )gwsql\"")
+    endif()
+    string(APPEND _projection_steps "{ ${_version}, \"${_name}\", \"${_path}\", R\"gwsql(${_sql})gwsql\", \"${_sha}\" },\n")
+    # The schema of the PROJ_NC_WALLCLOCK_COLUMN test build (never published): version 1 plus a wall-clock column on
+    # oe_orders, pinned by the sha256 of the text it applies, so its database records that sha256 and a published binary
+    # refuses to open it.
+    if(_version STREQUAL "1")
+        string(APPEND _sql "
 -- test build only (PROJ_NC_WALLCLOCK_COLUMN): a wall-clock column, so two projections of one journal differ
 ALTER TABLE oe_orders ADD COLUMN projected_at TIMESTAMPTZ NOT NULL DEFAULT now();
 ")
-string(SHA256 _projection_sha_nc_wallclock "${_projection_sql_nc_wallclock}")
+        string(SHA256 _sha "${_sql}")
+    endif()
+    string(APPEND _projection_steps_nc_wallclock
+        "{ ${_version}, \"${_name}\", \"${_path}\", R\"gwsql(${_sql})gwsql\", \"${_sha}\" },\n")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${_path}")
+endforeach()
+file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/gateway/projection_schema.inc"
+    CONTENT "${_projection_steps}" @ONLY)
 file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/gateway/projection_schema_nc_wallclock_column.inc"
-    CONTENT "constexpr const char *PROJECTION_SCHEMA_SQL = R\"gwsql(${_projection_sql_nc_wallclock})gwsql\";\nconstexpr const char *PROJECTION_SCHEMA_SHA256 = \"${_projection_sha_nc_wallclock}\";\n"
-    @ONLY)
+    CONTENT "${_projection_steps_nc_wallclock}" @ONLY)
 
 
 # The market history schema (sql/market_history_v1.sql), embedded with its sha256: oe-marketdata applies it to an empty
@@ -127,10 +141,18 @@ file(SHA256 "${GW_MARKET_HISTORY_SCHEMA_FILE}" _market_history_sha)
 if(_market_history_sql MATCHES "\\)gwsql\"")
     message(FATAL_ERROR "${GW_MARKET_HISTORY_SCHEMA_FILE} contains the embedding delimiter )gwsql\"")
 endif()
+# The trade tape's retention function (sql/market_history_retention_v1.sql): applied at every start after the schema
+# (CREATE OR REPLACE), so a database an older build wrote gets it in place.
+set(GW_MARKET_RETENTION_FILE "${CMAKE_CURRENT_SOURCE_DIR}/sql/market_history_retention_v1.sql")
+file(READ "${GW_MARKET_RETENTION_FILE}" _market_retention_sql)
+file(SHA256 "${GW_MARKET_RETENTION_FILE}" _market_retention_sha)
+if(_market_retention_sql MATCHES "\\)gwsql\"")
+    message(FATAL_ERROR "${GW_MARKET_RETENTION_FILE} contains the embedding delimiter )gwsql\"")
+endif()
 file(CONFIGURE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/gateway/market_history_schema.inc"
-    CONTENT "constexpr const char *MARKET_HISTORY_SCHEMA_SQL = R\"gwsql(${_market_history_sql})gwsql\";\nconstexpr const char *MARKET_HISTORY_SCHEMA_SHA256 = \"${_market_history_sha}\";\n"
+    CONTENT "constexpr const char *MARKET_HISTORY_SCHEMA_SQL = R\"gwsql(${_market_history_sql})gwsql\";\nconstexpr const char *MARKET_HISTORY_SCHEMA_SHA256 = \"${_market_history_sha}\";\nconstexpr const char *MARKET_RETENTION_SQL = R\"gwsql(${_market_retention_sql})gwsql\";\nconstexpr const char *MARKET_RETENTION_SHA256 = \"${_market_retention_sha}\";\n"
     @ONLY)
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${GW_MARKET_HISTORY_SCHEMA_FILE}")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${GW_MARKET_HISTORY_SCHEMA_FILE}" "${GW_MARKET_RETENTION_FILE}")
 
 set(GW_WARNINGS -Wall -Wextra -Wpedantic -Werror)
 

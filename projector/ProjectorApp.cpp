@@ -184,6 +184,7 @@ public:
             ",\"foreignEpochRecordings\":" + n(f.foreignEpochRecordings) + ",\"reReads\":" + n(f.reReads) +
             ",\"replaysStarted\":" + n(f.replaysStarted) + ",\"replayStops\":" + n(f.replayStops) +
             ",\"recordsApplied\":" + a(m_stats.recordsApplied) + ",\"skips\":" + a(m_stats.skips) +
+            ",\"prunedSkips\":" + a(m_stats.prunedSkips) +
             ",\"replayRows\":" + a(m_stats.replayRows) + ",\"resets\":" + a(m_stats.resets) +
             ",\"uncertainCommits\":" + a(m_stats.uncertainCommits) + ",\"nodeRounds\":" +
             a(m_parts.nodes->rounds) + ",\"nodeFailures\":" + a(m_parts.nodes->failures) + "}}";
@@ -231,6 +232,8 @@ public:
             std::to_string(m_stats.recordsApplied.load(std::memory_order_relaxed)));
         line("counter", "skips_total", "Records at or below the cursor compared equal with the stored bytes.",
             std::to_string(m_stats.skips.load(std::memory_order_relaxed)));
+        line("counter", "pruned_skips_total", "Records at or below the cursor of an order the retention delete removed "
+            "(not compared: no stored bytes).", std::to_string(m_stats.prunedSkips.load(std::memory_order_relaxed)));
         line("counter", "payload_conflicts_total", "Records that differ from the stored bytes of their sequence.",
             std::to_string(m_stats.payloadConflicts.load(std::memory_order_relaxed)));
         line("counter", "source_switches_total", "Sources left.", std::to_string(f.switches));
@@ -423,7 +426,7 @@ private:
             if (!schemaReady)
             {
                 std::string detail;
-                const SchemaVerdict verdict = projector::migrate(m_conn, t, detail);
+                const SchemaVerdict verdict = projector::migrate(m_conn, t, m_settings.pgSchemaTimeoutMs, detail);
                 if (SchemaVerdict::FOREIGN == verdict)
                 {
                     std::fprintf(stderr, "oe-projector: CRITICAL the projection database holds something else: %s "
@@ -658,7 +661,7 @@ int runRebuild(const ProjectorSettings &s)
         }
         if (!schemaReady)
         {
-            const SchemaVerdict verdict = projector::migrate(conn, t, error);
+            const SchemaVerdict verdict = projector::migrate(conn, t, s.pgSchemaTimeoutMs, error);
             if (SchemaVerdict::FOREIGN == verdict)
             {
                 std::fprintf(stderr, "%s: the projection database holds something else: %s (exit 78)\n", me,

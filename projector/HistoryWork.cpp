@@ -194,6 +194,46 @@ bool storedPayloads(PgConn &conn, std::int64_t timeoutMs, const std::vector<std:
     return true;
 }
 
+bool prunedSequences(PgConn &conn, std::int64_t timeoutMs, const std::vector<UnstoredCompare> &seqs,
+    std::set<std::int64_t> &out, std::string &error)
+{
+    if (seqs.empty())
+    {
+        return true;
+    }
+    std::string seqList = "{";
+    std::string orderList = "{";
+    std::string atList = "{";
+    for (std::size_t i = 0; i < seqs.size(); ++i)
+    {
+        seqList += (i ? "," : "") + std::to_string(seqs[i].seq);
+        orderList += (i ? "," : "") + std::to_string(seqs[i].orderId);
+        atList += (i ? "," : "") + std::to_string(seqs[i].atMs);
+    }
+    seqList += "}";
+    orderList += "}";
+    atList += "}";
+#ifdef PROJ_NC_PRUNED_NO_TIME_BOUND
+    const char *timeBound = ""; // test build only: the record's own time is not compared with the deletes' cutoff
+#else
+    const char *timeBound = " AND s.at_ms < p.max_before_ms";
+#endif
+    Result r;
+    if (Exec::OK != conn.exec(std::string("SELECT s.seq FROM unnest($1::bigint[], $2::bigint[], $3::bigint[]) AS s(seq, "
+            "order_id, at_ms), oe_projection_pruned p WHERE s.seq <= p.up_to_seq") + timeBound + " AND NOT EXISTS "
+            "(SELECT 1 FROM oe_order_events e WHERE e.journal_seq = s.seq) AND NOT EXISTS (SELECT 1 FROM oe_orders o "
+            "WHERE o.order_id = s.order_id)", { seqList, orderList, atList }, timeoutMs, r, error, false))
+    {
+        error = "pruned sequences: " + error;
+        return false;
+    }
+    for (int i = 0; i < PQntuples(r.get()); ++i)
+    {
+        out.insert(std::stoll(PQgetvalue(r.get(), i, 0)));
+    }
+    return true;
+}
+
 bool applyRecord(PgConn &conn, std::int64_t timeoutMs, const JournalRecord &record, std::string &error)
 {
     if (!run(conn, timeoutMs, EVENT_INSERT, params(eventColumns(record)), error, "oe_order_events"))
@@ -350,6 +390,20 @@ bool HistoryWork::write(PgConn &conn, const std::string &, StateAdvance &advance
     {
         return false;
     }
+    // the compared sequences with no stored row: removed with their order by the retention delete, or missing
+    std::vector<store::UnstoredCompare> unstored;
+    for (const Item &i : m_batch)
+    {
+        if (Item::Kind::COMPARE == i.kind && i.record.seq <= m_state.appliedSeq && 0 == stored.count(i.record.seq))
+        {
+            unstored.push_back({ i.record.seq, i.record.event.orderId, i.record.event.updatedAtMs });
+        }
+    }
+    std::set<std::int64_t> pruned;
+    if (!store::prunedSequences(conn, t, unstored, pruned, error))
+    {
+        return false;
+    }
 #ifdef PROJ_NC_CURSOR_OWN_TX
     // test build only: the cursor commits in a transaction of its own, before the rows
     {
@@ -473,6 +527,14 @@ bool HistoryWork::write(PgConn &conn, const std::string &, StateAdvance &advance
                     theirs = "\\x" + hexOf(it->second->record.payload.data(), it->second->record.payload.size());
                 }
                 m_outcome.compared++;
+#if defined(PROJ_NC_NO_PRUNED_SKIP)
+                const bool prunedSkip = false; // test build only: a deleted order's record is a conflict
+#elif defined(PROJ_NC_PRUNED_ANY_MISSING)
+                const bool prunedSkip = !theirs && i.record.seq <= m_state.appliedSeq; // test build only: any missing row
+#else
+                const bool prunedSkip = !theirs && i.record.seq <= m_state.appliedSeq && 0 != pruned.count(i.record.seq);
+#endif
+                m_outcome.pruned += prunedSkip ? 1 : 0;
 #ifdef PROJ_NC_NO_COMPARE
                 (void)mine; // test build only: a duplicate is skipped without the comparison
                 m_outcome.equal++;
@@ -483,9 +545,10 @@ bool HistoryWork::write(PgConn &conn, const std::string &, StateAdvance &advance
                     theirs = mine; // test build only: the dropped record reads as stored, so it never halts a compare
                 }
 #endif
-                if (theirs && *theirs == mine)
+                if (prunedSkip || (theirs && *theirs == mine))
                 {
-                    m_outcome.equal++;
+                    // a pruned skip delivers like an equal compare (the source re-reads history the projection held)
+                    m_outcome.equal += prunedSkip ? 0 : 1;
                     if (m_outcome.comparedFrom.end() ==
                         std::find(m_outcome.comparedFrom.begin(), m_outcome.comparedFrom.end(), i.source))
                     {
@@ -593,6 +656,7 @@ void HistoryWork::committed(const StateAdvance &advance)
     }
     m_stats.recordsApplied.fetch_add(m_outcome.applied, std::memory_order_relaxed);
     m_stats.skips.fetch_add(m_outcome.equal, std::memory_order_relaxed);
+    m_stats.prunedSkips.fetch_add(m_outcome.pruned, std::memory_order_relaxed);
     m_stats.payloadConflicts.fetch_add(m_outcome.conflicts.size(), std::memory_order_relaxed);
     m_stats.replayRows.fetch_add(m_outcome.replaysRecorded.size(), std::memory_order_relaxed);
     for (const Conflict &c : m_outcome.conflicts)
