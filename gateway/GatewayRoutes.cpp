@@ -626,11 +626,11 @@ void GatewayApi::createOrder(const Ex &ex)
             const auto *ack = std::get_if<wire::OrderAck>(&o.reply);
             if (session::OutcomeKind::REPLY != o.kind || nullptr == ack)
             {
-                finish(ex, route, failure(o, Asked::KEYED));
+                finishCore(ex, route, OrderRoute::CREATE, o, failure(o, Asked::KEYED));
                 return;
             }
-            finish(ex, route, api::jsonBody(ack->duplicate ? 200 : 201, "{\"orderId\":" + idJson(ack->orderId) +
-                ",\"status\":" + api::quote(rest::nameOf(ack->status)) + ",\"duplicate\":" +
+            finishCore(ex, route, OrderRoute::CREATE, o, api::jsonBody(ack->duplicate ? 200 : 201, "{\"orderId\":" +
+                idJson(ack->orderId) + ",\"status\":" + api::quote(rest::nameOf(ack->status)) + ",\"duplicate\":" +
                 (ack->duplicate ? "true" : "false") + ",\"marketId\":" + idJson(ack->marketId) + ",\"hold\":{\"assetId\":" +
                 idJson(ack->holdAssetId) + ",\"amount\":" + moneyJson(ack->holdAmount) + "},\"acceptedAt\":" +
                 std::to_string(ack->acceptedAtMs) + ",\"eventSeq\":" + std::to_string(ack->eventSeq) + "}"));
@@ -843,10 +843,10 @@ void GatewayApi::amendOrder(const Ex &ex, std::int64_t orderId)
             const auto *ack = std::get_if<wire::OrderAck>(&o.reply);
             if (session::OutcomeKind::REPLY != o.kind || nullptr == ack)
             {
-                finish(ex, route, failure(o, Asked::KEYED));
+                finishCore(ex, route, OrderRoute::AMEND, o, failure(o, Asked::KEYED));
                 return;
             }
-            finish(ex, route, api::jsonBody(200, "{\"orderId\":" + idJson(ack->orderId) +
+            finishCore(ex, route, OrderRoute::AMEND, o, api::jsonBody(200, "{\"orderId\":" + idJson(ack->orderId) +
                 ",\"status\":\"PENDING_REPLACE\",\"duplicate\":" + (ack->duplicate ? "true" : "false") + "}"));
         });
     });
@@ -892,8 +892,9 @@ void GatewayApi::cancelOrder(const Ex &ex, std::int64_t orderId)
             {
                 if (const auto *ack = std::get_if<wire::OrderAck>(&o.reply))
                 {
-                    finish(ex, route, api::jsonBody(200, "{\"orderId\":" + idJson(ack->orderId) + ",\"status\":" +
-                        api::quote(rest::nameOf(ack->status)) + ",\"duplicate\":" + (ack->duplicate ? "true" : "false") +
+                    finishCore(ex, route, OrderRoute::CANCEL, o, api::jsonBody(200, "{\"orderId\":" +
+                        idJson(ack->orderId) + ",\"status\":" + api::quote(rest::nameOf(ack->status)) +
+                        ",\"duplicate\":" + (ack->duplicate ? "true" : "false") +
                         (reoffered ? ",\"reoffered\":true" : "") + "}"));
                     return;
                 }
@@ -905,7 +906,7 @@ void GatewayApi::cancelOrder(const Ex &ex, std::int64_t orderId)
                 {
                     // offered more than once: the first offer may have closed the order
                     m_cancelReoffered.fetch_add(1, std::memory_order_relaxed);
-                    finish(ex, route, api::jsonBody(200, "{\"orderId\":" + idJson(orderId) +
+                    finishCore(ex, route, OrderRoute::CANCEL, o, api::jsonBody(200, "{\"orderId\":" + idJson(orderId) +
                         ",\"status\":\"NOT_OPEN\",\"duplicate\":true,\"reoffered\":true}"));
                     return;
                 }
@@ -913,7 +914,7 @@ void GatewayApi::cancelOrder(const Ex &ex, std::int64_t orderId)
                 (void)keyed; // test-only control: the re-offer rule off
 #endif
             }
-            finish(ex, route, failure(o, keyed ? Asked::KEYED : Asked::UNKEYED_CANCEL));
+            finishCore(ex, route, OrderRoute::CANCEL, o, failure(o, keyed ? Asked::KEYED : Asked::UNKEYED_CANCEL));
         });
     });
 }

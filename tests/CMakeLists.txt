@@ -52,7 +52,7 @@ endif()
 
 add_executable(gw_unit_tests unit/TestMain.cpp unit/SettingsTest.cpp unit/AdminTest.cpp unit/WireGoldenTest.cpp
     unit/WireRefusalTest.cpp unit/WireClusterToolsGoldenTest.cpp unit/SessionTest.cpp unit/AuthTest.cpp
-    unit/GatewayApiTest.cpp unit/RestTest.cpp unit/RestRoutesTest.cpp unit/HistoryTest.cpp)
+    unit/GatewayApiTest.cpp unit/RestTest.cpp unit/RestRoutesTest.cpp unit/HistoryTest.cpp unit/LatencyHistogramTest.cpp)
 target_include_directories(gw_unit_tests PRIVATE unit golden "${GW_CT_GOLDEN_DIR}" "${GW_CT_FAKE_TRANSPORT_DIR}")
 target_compile_definitions(gw_unit_tests PRIVATE ${GW_WIRE_TEST_DEFINITIONS})
 target_link_libraries(gw_unit_tests PRIVATE oe_gateway_app gw_common)

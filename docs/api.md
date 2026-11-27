@@ -991,6 +991,24 @@ Prometheus text, prefix `gateway_` or `stream_`. Among them: `requests_total{rou
 `ready_condition{name}`; for the stream `resync_total{reason}`, `ws_closed_total{code}`, `ws_closed_at_bound_total`,
 `ws_queue_high_water`, `watermark`, `window_first_seq`, `users_cached`.
 
+Order latency (`oe-gateway`, routes `create`, `cancel` and `amend`; buckets 1, 1.5, 2, 3, 5 and 7 per decade from
+100 µs to 7 s, then 10 s and `+Inf`; all times on one monotonic clock):
+
+- `order_latency_seconds{route,outcome}` (histogram): from the moment the whole request was read to the answer.
+  `outcome="core"` is every request handed to the core session, whatever came back (the reply, a 504, a 503, a 500);
+  `outcome="local"` is a request refused before the core (validation, auth, rate limit, a full command ring). Use
+  `outcome="core"` for the order path's latency: the local refusals are mostly sub-millisecond and would pull it down.
+- `order_stage_seconds{route,stage}` (histogram), only for requests the core replied to: `queue` from the request read
+  to the command taken into the core session (validation, auth and the command ring included), `core` from there to
+  the reply (offers and re-offers included), `local` from the reply to the answer.
+- `order_latency_window_max_seconds{route,outcome}` and `order_stage_window_max_seconds{route,stage}` (gauges): the
+  largest value of the last 10 seconds, kept per one-second slot. A read resets nothing, so any number of scrapers see
+  the same value. A value is in every scrape made in the next 9 seconds or more after it was recorded: with scrapes
+  at most 9 s apart, no spike is missed. With longer scrape intervals a short spike can fall between two scrapes (the
+  histogram still counts it).
+- `order_latency_anomalies_total` (counter): core replies whose timestamps were out of order; no stage is recorded for
+  them. Expected to stay 0.
+
 ## 9. Migration from the OMS v1 API
 
 | OMS v1 | v2 | What changes for a client |
