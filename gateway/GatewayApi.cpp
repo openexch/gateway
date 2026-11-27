@@ -172,7 +172,77 @@ GatewayApi::GatewayApi(ApiDeps deps) :
     }
 }
 
+namespace {
+
+// the order routes of the latency metrics: their index, or -1
+int orderRouteOf(std::string_view route) noexcept
+{
+    if ("orders_create" == route)
+    {
+        return 0;
+    }
+    if ("orders_cancel" == route)
+    {
+        return 1;
+    }
+    if ("orders_amend" == route)
+    {
+        return 2;
+    }
+    return -1;
+}
+
+constexpr const char *ORDER_ROUTE_LABEL[] = { "create", "cancel", "amend" };
+constexpr const char *ORDER_STAGE_LABEL[] = { "queue", "core", "local" };
+
+}
+
 void GatewayApi::finish(const Ex &ex, const char *route, ApiResponse response)
+{
+    if (const int which = orderRouteOf(route); which >= 0)
+    {
+        recordOrder(static_cast<std::size_t>(which), ex->receivedNs(), nullptr, steadyNs());
+    }
+    respondCounted(ex, route, std::move(response));
+}
+
+void GatewayApi::finishCore(const Ex &ex, const char *route, OrderRoute which, const session::Outcome &o,
+    ApiResponse response)
+{
+    recordOrder(static_cast<std::size_t>(which), ex->receivedNs(), &o, steadyNs());
+    respondCounted(ex, route, std::move(response));
+}
+
+// receivedNs (the I/O thread, once the request was read), Outcome::submittedNs (the duty thread, the command taken into
+// the core session) and completedNs (the duty thread, the reply read or the request given up) and nowNs come from the
+// same steady clock. Stages only for a core reply: a command the session refused or never answered has no core span.
+void GatewayApi::recordOrder(std::size_t which, std::int64_t receivedNs, const session::Outcome *o, std::int64_t nowNs)
+{
+    const std::int64_t total = nowNs - receivedNs;
+    if (total < 0)
+    {
+        m_latencyAnomalies.fetch_add(1, std::memory_order_relaxed);
+    }
+    else
+    {
+        m_orderTotal[which][nullptr == o ? 1 : 0].record(total, nowNs);
+    }
+    if (nullptr == o || session::OutcomeKind::REPLY != o->kind)
+    {
+        return;
+    }
+    if (0 == o->submittedNs || receivedNs > o->submittedNs || o->submittedNs > o->completedNs ||
+        o->completedNs > nowNs)
+    {
+        m_latencyAnomalies.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    m_orderStage[which][0].record(o->submittedNs - receivedNs, nowNs);
+    m_orderStage[which][1].record(o->completedNs - o->submittedNs, nowNs);
+    m_orderStage[which][2].record(nowNs - o->completedNs, nowNs);
+}
+
+void GatewayApi::respondCounted(const Ex &ex, const char *route, ApiResponse response)
 {
     if (const auto origin = ex->header("Origin"))
     {
@@ -836,6 +906,55 @@ std::string GatewayApi::metrics(const std::string &p) const
     out += "# HELP " + p + "register_funding_deposits_total Register-funding deposits sent (re-offers inside one register "
         "included).\n# TYPE " + p + "register_funding_deposits_total counter\n" + p + "register_funding_deposits_total " +
         std::to_string(m_fundingDeposits.load(std::memory_order_relaxed)) + "\n";
+    const std::int64_t now = steadyNs();
+    const std::string total = p + "order_latency_seconds";
+    out += "# HELP " + total + " Order requests (route create, cancel, amend) from the request read to the answer. "
+        "outcome core: handed to the core session, every outcome (reply, 504, 503, 500); outcome local: refused before "
+        "the core (validation, auth, rate limit, full command ring).\n# TYPE " + total + " histogram\n";
+    for (std::size_t r = 0; r < ORDER_ROUTES; ++r)
+    {
+        for (std::size_t k = 0; k < 2; ++k)
+        {
+            m_orderTotal[r][k].render(out, total, std::string("route=\"") + ORDER_ROUTE_LABEL[r] + "\",outcome=\"" +
+                (0 == k ? "core" : "local") + "\"");
+        }
+    }
+    const std::string totalMax = p + "order_latency_window_max_seconds";
+    out += "# HELP " + totalMax + " The largest order_latency_seconds of the last 10 s (any number of scrapers; never "
+        "reset by a read).\n# TYPE " + totalMax + " gauge\n";
+    for (std::size_t r = 0; r < ORDER_ROUTES; ++r)
+    {
+        for (std::size_t k = 0; k < 2; ++k)
+        {
+            m_orderTotal[r][k].renderWindowMax(out, totalMax, std::string("route=\"") + ORDER_ROUTE_LABEL[r] +
+                "\",outcome=\"" + (0 == k ? "core" : "local") + "\"", now);
+        }
+    }
+    const std::string stage = p + "order_stage_seconds";
+    out += "# HELP " + stage + " Order requests the core replied to, by stage: queue from the request read to the "
+        "command taken into the core session (validation, auth, the command ring), core from there to the reply "
+        "(offers and re-offers included), local from the reply to the answer.\n# TYPE " + stage + " histogram\n";
+    for (std::size_t r = 0; r < ORDER_ROUTES; ++r)
+    {
+        for (std::size_t k = 0; k < 3; ++k)
+        {
+            m_orderStage[r][k].render(out, stage, std::string("route=\"") + ORDER_ROUTE_LABEL[r] + "\",stage=\"" +
+                ORDER_STAGE_LABEL[k] + "\"");
+        }
+    }
+    const std::string stageMax = p + "order_stage_window_max_seconds";
+    out += "# HELP " + stageMax + " The largest order_stage_seconds of the last 10 s.\n# TYPE " + stageMax + " gauge\n";
+    for (std::size_t r = 0; r < ORDER_ROUTES; ++r)
+    {
+        for (std::size_t k = 0; k < 3; ++k)
+        {
+            m_orderStage[r][k].renderWindowMax(out, stageMax, std::string("route=\"") + ORDER_ROUTE_LABEL[r] +
+                "\",stage=\"" + ORDER_STAGE_LABEL[k] + "\"", now);
+        }
+    }
+    out += "# HELP " + p + "order_latency_anomalies_total Order answers whose timestamps were out of order (no stage "
+        "recorded; a defect).\n# TYPE " + p + "order_latency_anomalies_total counter\n" + p +
+        "order_latency_anomalies_total " + std::to_string(m_latencyAnomalies.load(std::memory_order_relaxed)) + "\n";
     out += "# HELP " + p + "token_stale_served_total Demo tokens served from the cache while the users store could not "
         "answer.\n# TYPE " + p + "token_stale_served_total counter\n" + p + "token_stale_served_total " +
         std::to_string(m_deps.auth->staleServed()) + "\n";

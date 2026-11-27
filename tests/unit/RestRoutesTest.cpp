@@ -1537,3 +1537,153 @@ TEST(routes_balance_movements)
     const HttpResult down = rig.call("GET", "/api/v2/balances/movements", "", as(7));
     CHECK_MSG(503 == down.status && str(body(down), "code") == "MOVEMENTS_UNAVAILABLE", what(down));
 }
+
+namespace {
+
+std::int64_t steadyNowNs()
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// The value of one series line `series` (name and labels exactly as rendered) in a /metrics text; -1 when absent.
+double metricValue(const std::string &text, const std::string &series)
+{
+    const std::string head = series + " ";
+    std::size_t at = 0;
+    while ((at = text.find(head, at)) != std::string::npos)
+    {
+        if (0 == at || '\n' == text[at - 1])
+        {
+            return std::stod(text.substr(at + head.size(), text.find('\n', at) - at - head.size()));
+        }
+        at += head.size();
+    }
+    return -1;
+}
+
+}
+
+// Order latency metrics through the routes: the core answers after 30 ms (the hook stamps submittedNs and completedNs
+// on the steady clock as the session does), so the core stage and the total land above le="0.03"; _count is the number
+// of answered core requests; a request refused before the core is outcome="local" and never in a stage; no anomaly.
+TEST(routes_order_latency_metrics)
+{
+    Rig rig;
+    std::atomic<int> mode{ 0 };
+    rig.core.hook = [&rig, &mode](const session::Command &c) -> std::optional<session::Outcome> {
+        session::Outcome o = 1 == mode.load() ? kindOf(session::OutcomeKind::OUTCOME_UNKNOWN) : rig.core.model(c);
+        o.submittedNs = steadyNowNs();
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        o.completedNs = steadyNowNs();
+        return o;
+    };
+    rig.start();
+    std::string orderId;
+    for (int i = 0; i < 3; ++i)
+    {
+        const HttpResult r = rig.call("POST", "/api/v2/orders", LIMIT_BUY, as(7, ("lat-" + std::to_string(i)).c_str()));
+        CHECK_MSG(201 == r.status, what(r));
+        orderId = str(body(r), "orderId");
+    }
+    HttpResult r = rig.call("PUT", "/api/v2/orders/" + orderId, R"({"price":"101"})", as(7, "lat-amend"));
+    CHECK_MSG(200 == r.status, what(r));
+    r = rig.call("DELETE", "/api/v2/orders/" + orderId, "", as(7));
+    CHECK_MSG(200 == r.status, what(r));
+    mode = 1; // a 504: in the total (outcome core), never in a stage
+    r = rig.call("POST", "/api/v2/orders", LIMIT_BUY, as(7, "lat-504"));
+    CHECK_MSG(504 == r.status, what(r));
+    mode = 0;
+    // refused before the core: no key, no credential, a cancel with a body, a bad path id
+    const std::size_t seenBefore = rig.core.count(wire::tid::CREATE_ORDER) + rig.core.count(wire::tid::CANCEL_ORDER);
+    CHECK(400 == rig.call("POST", "/api/v2/orders", LIMIT_BUY, as(7)).status);
+    CHECK(401 == rig.call("POST", "/api/v2/orders", LIMIT_BUY, Headers{ { "Idempotency-Key", "lat-anon" } }).status);
+    CHECK(400 == rig.call("DELETE", "/api/v2/orders/" + orderId, "{}", as(7)).status);
+    CHECK(400 == rig.call("DELETE", "/api/v2/orders/abc", "", as(7)).status);
+    CHECK(seenBefore == rig.core.count(wire::tid::CREATE_ORDER) + rig.core.count(wire::tid::CANCEL_ORDER));
+
+    const std::string m = rig.api->metrics("gateway_");
+    auto v = [&m](const std::string &series) { return metricValue(m, series); };
+    const std::string total = "gateway_order_latency_seconds";
+    const std::string stage = "gateway_order_stage_seconds";
+    CHECK_MSG(m.find("# TYPE gateway_order_latency_seconds histogram\n") != std::string::npos, m);
+    CHECK_MSG(m.find("# TYPE gateway_order_stage_seconds histogram\n") != std::string::npos, m);
+    CHECK_MSG(m.find("# TYPE gateway_order_latency_window_max_seconds gauge\n") != std::string::npos, m);
+    CHECK_MSG(m.find("# TYPE gateway_order_stage_window_max_seconds gauge\n") != std::string::npos, m);
+    CHECK_MSG(m.find("# TYPE gateway_order_latency_anomalies_total counter\n") != std::string::npos, m);
+    // _count: every answered core request, by route
+    CHECK_MSG(4 == v(total + "_count{route=\"create\",outcome=\"core\"}"), m);
+    CHECK_MSG(1 == v(total + "_count{route=\"amend\",outcome=\"core\"}"), m);
+    CHECK_MSG(1 == v(total + "_count{route=\"cancel\",outcome=\"core\"}"), m);
+    // the refusals: only in outcome local
+    CHECK_MSG(2 == v(total + "_count{route=\"create\",outcome=\"local\"}"), m);
+    CHECK_MSG(2 == v(total + "_count{route=\"cancel\",outcome=\"local\"}"), m);
+    CHECK_MSG(0 == v(total + "_count{route=\"amend\",outcome=\"local\"}"), m);
+    // stages: the replies only (the 504 has none)
+    for (const char *s : { "queue", "core", "local" })
+    {
+        CHECK_MSG(3 == v(stage + "_count{route=\"create\",stage=\"" + s + "\"}"), std::string(s) + "\n" + m);
+        CHECK_MSG(1 == v(stage + "_count{route=\"cancel\",stage=\"" + s + "\"}"), std::string(s) + "\n" + m);
+        CHECK_MSG(1 == v(stage + "_count{route=\"amend\",stage=\"" + s + "\"}"), std::string(s) + "\n" + m);
+    }
+    // the 30 ms core reply: above 30 ms (nothing at or below le 0.03), within 100 ms (a loaded machine's margin)
+    CHECK_MSG(0 == v(stage + "_bucket{route=\"create\",stage=\"core\",le=\"0.03\"}"), m);
+    CHECK_MSG(3 == v(stage + "_bucket{route=\"create\",stage=\"core\",le=\"0.1\"}"), m);
+    CHECK_MSG(0 == v(total + "_bucket{route=\"create\",outcome=\"core\",le=\"0.03\"}"), m);
+    CHECK_MSG(4 == v(total + "_bucket{route=\"create\",outcome=\"core\",le=\"0.1\"}"), m);
+    CHECK_MSG(0 == v(stage + "_bucket{route=\"cancel\",stage=\"core\",le=\"0.03\"}"), m);
+    CHECK_MSG(1 == v(stage + "_bucket{route=\"cancel\",stage=\"core\",le=\"+Inf\"}"), m);
+    CHECK_MSG(v(stage + "_sum{route=\"create\",stage=\"core\"}") >= 0.09, m);
+    // the stages of one request add up to at most its total
+    const double stages = v(stage + "_sum{route=\"amend\",stage=\"queue\"}") +
+        v(stage + "_sum{route=\"amend\",stage=\"core\"}") + v(stage + "_sum{route=\"amend\",stage=\"local\"}");
+    CHECK_MSG(stages <= v(total + "_sum{route=\"amend\",outcome=\"core\"}") + 1e-9, m);
+    // the local refusals are fast and never in a core series: their window maximum is far below the 30 ms core reply
+    CHECK_MSG(v("gateway_order_latency_window_max_seconds{route=\"create\",outcome=\"core\"}") >= 0.03, m);
+    CHECK_MSG(v("gateway_order_stage_window_max_seconds{route=\"create\",stage=\"core\"}") >= 0.03, m);
+    CHECK_MSG(v("gateway_order_stage_window_max_seconds{route=\"create\",stage=\"core\"}") < 0.1, m);
+    CHECK_MSG(v("gateway_order_latency_window_max_seconds{route=\"amend\",outcome=\"local\"}") == 0, m);
+    CHECK_MSG(0 == v("gateway_order_latency_anomalies_total"), m);
+    // other routes are not in the order series
+    CHECK(m.find("route=\"orders_create\",outcome") == std::string::npos);
+}
+
+// A core reply whose timestamps are out of order (or missing) is counted as an anomaly and records no stage; the total
+// is still recorded.
+TEST(routes_order_latency_anomalies)
+{
+    Rig rig;
+    std::atomic<int> mode{ 0 };
+    rig.core.hook = [&rig, &mode](const session::Command &c) -> std::optional<session::Outcome> {
+        session::Outcome o = rig.core.model(c);
+        const std::int64_t now = steadyNowNs();
+        if (1 == mode.load())
+        {
+            o.submittedNs = now;      // completed before it was submitted
+            o.completedNs = now - 1000;
+        }
+        else if (2 == mode.load())
+        {
+            o.submittedNs = 0;        // no submit time on a reply
+            o.completedNs = now;
+        }
+        else
+        {
+            o.submittedNs = now;
+            o.completedNs = now;
+        }
+        return o;
+    };
+    rig.start();
+    mode = 1;
+    CHECK(201 == rig.call("POST", "/api/v2/orders", LIMIT_BUY, as(7, "an-1")).status);
+    mode = 2;
+    CHECK(201 == rig.call("POST", "/api/v2/orders", LIMIT_BUY, as(7, "an-2")).status);
+    mode = 0;
+    CHECK(201 == rig.call("POST", "/api/v2/orders", LIMIT_BUY, as(7, "an-3")).status);
+    const std::string m = rig.api->metrics("gateway_");
+    CHECK_MSG(2 == metricValue(m, "gateway_order_latency_anomalies_total"), m);
+    CHECK_MSG(3 == metricValue(m, "gateway_order_latency_seconds_count{route=\"create\",outcome=\"core\"}"), m);
+    CHECK_MSG(1 == metricValue(m, "gateway_order_stage_seconds_count{route=\"create\",stage=\"core\"}"), m);
+    CHECK_MSG(1 == metricValue(m, "gateway_order_stage_seconds_count{route=\"create\",stage=\"queue\"}"), m);
+}

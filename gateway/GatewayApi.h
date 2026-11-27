@@ -19,6 +19,7 @@
 #include "gateway/common/Authenticator.h"
 #include "gateway/common/History.h"
 #include "gateway/common/HttpServer.h"
+#include "gateway/common/LatencyHistogram.h"
 #include "gateway/common/RateLimit.h"
 #include "gateway/common/SessionParts.h"
 #include "gateway/common/Settings.h"
@@ -158,7 +159,24 @@ public:
 private:
     using Ex = std::shared_ptr<HttpExchange>;
 
+    // Answers and counts the request (requests_total). An answer of an order route (create, cancel, amend) given here
+    // never reached the core session (validation, auth, rate limit, full command ring): it is recorded as
+    // order_latency_seconds{outcome="local"}.
     void finish(const Ex &ex, const char *route, ApiResponse response);
+    // Order latency. finishCore answers an order route from the callback of its core command (the completion thread):
+    // order_latency_seconds{outcome="core"} for every outcome (a reply, 504, 503, 500), and the stages (queue, core,
+    // local) when the core replied and the timestamps are in order (otherwise order_latency_anomalies_total). All on the
+    // calling thread: a clock read, relaxed atomics, no lock.
+    enum class OrderRoute : std::uint8_t
+    {
+        CREATE,
+        CANCEL,
+        AMEND
+    };
+    static constexpr std::size_t ORDER_ROUTES = 3;
+    void finishCore(const Ex &ex, const char *route, OrderRoute which, const session::Outcome &o, ApiResponse response);
+    void recordOrder(std::size_t which, std::int64_t receivedNs, const session::Outcome *o, std::int64_t nowNs);
+    void respondCounted(const Ex &ex, const char *route, ApiResponse response);
     void preflight(const Ex &ex);
     void withPrincipal(const Ex &ex, const char *route, std::function<void(const Principal &)> next);
     bool takeAuthBudget(const Ex &ex, const char *route, RateBucket &global);
@@ -272,6 +290,9 @@ private:
     std::condition_variable m_probeWake;
     bool m_probeStop = false;
     std::thread m_probeThread;
+    LatencyHistogram m_orderTotal[ORDER_ROUTES][2]; // [route][0: outcome core, 1: outcome local]
+    LatencyHistogram m_orderStage[ORDER_ROUTES][3]; // [route][queue, core, local]
+    std::atomic<std::uint64_t> m_latencyAnomalies{ 0 };
     mutable std::mutex m_countMutex;
     std::map<std::pair<std::string, unsigned>, std::uint64_t> m_requests; // (route, status) -> count
     std::map<std::pair<std::string, std::string>, std::uint64_t> m_historyReads; // (query, result) -> count
